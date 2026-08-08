@@ -1,0 +1,27 @@
+{
+  "name": "@patchproof/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "patchproof": "dist/main.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "dist/index.d.ts",
+  "main": "dist/main.js",
+  "dependencies": {
+    "@patchproof/config": "workspace:*",
+    "@patchproof/core": "workspace:*",
+    "@patchproof/report": "workspace:*",
+    "@patchproof/runner": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  }
+}

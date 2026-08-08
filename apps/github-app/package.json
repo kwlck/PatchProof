@@ -1,0 +1,31 @@
+{
+  "name": "@patchproof/github-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "patchproof-github-app": "dist/main.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "dist/index.d.ts",
+  "main": "dist/main.js",
+  "dependencies": {
+    "@patchproof/config": "workspace:*",
+    "@patchproof/cli": "workspace:*",
+    "@patchproof/core": "workspace:*",
+    "@patchproof/github": "workspace:*",
+    "@patchproof/report": "workspace:*",
+    "@patchproof/runner": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "start:webhook": "node dist/main.js",
+    "start:worker": "node dist/worker-main.js"
+  }
+}

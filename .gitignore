@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+work/*
+!work/.gitkeep
+outputs/*
+!outputs/.gitkeep
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+.DS_Store

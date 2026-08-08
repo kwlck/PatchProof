@@ -1,0 +1,6 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "composite": true, "rootDir": "src", "outDir": "dist", "declaration": true },
+  "include": ["src/**/*.ts"],
+  "references": [{ "path": "../core" }, { "path": "../config" }, { "path": "../runner" }]
+}

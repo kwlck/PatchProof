@@ -1,0 +1,18 @@
+version: 1
+name: Fixed parser regression
+scenario:
+  id: parser-regression
+  name: Parser rejects the old malformed token and accepts the fixed token
+  command: [node, scenario.mjs]
+  cwd: .
+  file: scenario.mjs
+  expectedFailure:
+    exitCode: 1
+    reasonPattern: EXPECTED_BUG
+policy:
+  backend: docker
+  network: none
+  timeoutMs: 3000
+  outputBytes: 8192
+redaction:
+  secrets: []

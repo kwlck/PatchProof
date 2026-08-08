@@ -1,0 +1,16 @@
+version: 1
+name: Secret redaction fixture
+scenario:
+  id: redaction
+  name: Output includes a configured secret and must be redacted
+  command: [node, scenario.mjs]
+  file: scenario.mjs
+  expectedFailure:
+    exitCode: 1
+    reasonPattern: EXPECTED_BUG
+policy:
+  backend: local
+  allowUnsafeLocal: true
+  network: none
+redaction:
+  secrets: [fixture-secret-123456789]

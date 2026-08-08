@@ -1,0 +1,17 @@
+version: 1
+name: Head still fails
+scenario:
+  id: head-fails
+  name: Fix did not change the failing behavior
+  command: [node, scenario.mjs]
+  file: scenario.mjs
+  expectedFailure:
+    exitCode: 1
+    reasonPattern: EXPECTED_BUG
+policy:
+  backend: local
+  allowUnsafeLocal: true
+  network: none
+  timeoutMs: 1000
+redaction:
+  secrets: []

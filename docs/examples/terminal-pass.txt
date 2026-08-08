@@ -1,0 +1,11 @@
+PatchProof PASS - The trusted scenario failed on base and passed on head.
+Scenario   Parser rejects the old malformed token and accepts the fixed token (parser-regression)
+Comparison
+  BASE  fail        exit=1       62ms
+  HEAD  pass        exit=0       62ms
+Evidence   schema=1 sha256=4341d958d8423925... artifacts=4
+Policy     backend=local network=none trusted-config=base
+Replay     patchproof replay patchproof.evidence.json --yes --base <base-dir> --head <head-dir>
+Why        The trusted scenario failed on base and passed on head.
+
+work/docs-example/patchproof.evidence.json
