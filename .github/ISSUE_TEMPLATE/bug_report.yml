@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible product defect
+title: 'bug: '
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include secrets or unredacted evidence artifacts.
+  - type: input
+    id: version
+    attributes:
+      label: Version and environment
+      description: Include PatchProof, Node, pnpm, OS, and runner backend.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Exact safe commands and sanitized output.
+    validations:
+      required: true

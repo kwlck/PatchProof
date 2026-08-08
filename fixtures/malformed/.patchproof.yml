@@ -1,0 +1,6 @@
+version: 2
+name: [not a string]
+scenario:
+  command: node scenario.mjs
+  expectedFailure:
+    exitCode: zero

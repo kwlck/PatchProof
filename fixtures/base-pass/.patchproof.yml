@@ -1,0 +1,17 @@
+version: 1
+name: Base unexpectedly passes
+scenario:
+  id: base-pass
+  name: Fixture with no reproducible regression
+  command: [node, scenario.mjs]
+  file: scenario.mjs
+  expectedFailure:
+    exitCode: 1
+    reasonPattern: EXPECTED_BUG
+policy:
+  backend: local
+  allowUnsafeLocal: true
+  network: none
+  timeoutMs: 1000
+redaction:
+  secrets: []

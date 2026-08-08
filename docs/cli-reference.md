@@ -1,0 +1,16 @@
+# CLI reference
+
+`patchproof` emits human output for terminals and stable JSON when `--json` is supplied. It honors `NO_COLOR` and never treats a non-TTY as interactive.
+
+| Command                                | Purpose                                                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `init [dir]`                           | Write a version 1 starter configuration without overwriting an existing file.                                             |
+| `validate <file>`                      | Parse YAML, apply safe defaults, validate semantics, and print diagnostics.                                               |
+| `run <file> --base <dir> --head <dir>` | Run the same trusted scenario against both revisions and write the evidence bundle.                                       |
+| `verify <bundle>`                      | Verify schema, canonical digest, artifact paths/sizes/hashes, and completeness without running code.                      |
+| `replay <bundle>`                      | Show a replay plan; add `--yes --base <dir> --head <dir>` to execute against supplied source directories.                 |
+| `doctor`                               | Report Node, pnpm, Docker, and local SQLite capability. Docker unavailability is a warning, not a local-backend fallback. |
+
+Run exit codes are `0` PASS, `1` FAIL, `2` INCONCLUSIVE or invalid input, `3` POLICY_DENIED, and `4` INFRA_ERROR. `verify` returns `0` only for a valid bundle and `2` otherwise.
+
+The local backend requires both `policy.allowUnsafeLocal: true` and `--allow-unsafe-local`. Fork runs require `--trusted-base <dir>`; the head configuration is never executable authority.

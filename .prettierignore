@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+work
+outputs
+pnpm-lock.yaml
+*.svg

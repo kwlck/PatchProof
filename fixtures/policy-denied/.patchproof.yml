@@ -1,0 +1,15 @@
+version: 1
+name: Unsafe backend denied
+scenario:
+  id: policy-denied
+  name: Local execution without explicit permission
+  command: [node, scenario.mjs]
+  expectedFailure:
+    exitCode: 1
+policy:
+  backend: local
+  allowUnsafeLocal: false
+  allowFork: false
+  network: none
+redaction:
+  secrets: []

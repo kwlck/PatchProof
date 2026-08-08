@@ -1,0 +1,17 @@
+version: 1
+name: Timeout fixture
+scenario:
+  id: timeout
+  name: Scenario exceeds the configured time budget
+  command: [node, scenario.mjs]
+  file: scenario.mjs
+  expectedFailure:
+    exitCode: 1
+policy:
+  backend: local
+  allowUnsafeLocal: true
+  network: none
+  timeoutMs: 100
+  outputBytes: 4096
+redaction:
+  secrets: []

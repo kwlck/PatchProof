@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 160" role="img" aria-labelledby="title desc">
+  <title id="title">PatchProof</title>
+  <desc id="desc">A dark indigo wordmark with a proof check mark.</desc>
+  <rect width="720" height="160" rx="24" fill="#111827"/>
+  <path d="M52 40h58c28 0 46 14 46 38s-18 38-46 38H82v20H52V40Zm30 24v28h26c12 0 18-5 18-14s-6-14-18-14H82Z" fill="#F9FAFB"/>
+  <path d="m186 101 19 18 42-49" fill="none" stroke="#7DD3FC" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="270" y="103" fill="#F9FAFB" font-family="ui-sans-serif,system-ui,sans-serif" font-size="58" font-weight="700" letter-spacing="-2">PatchProof</text>
+  <circle cx="655" cy="80" r="10" fill="#7DD3FC"/>
+</svg>
