@@ -40,7 +40,10 @@ async function runCliFixture() {
     );
   } catch (error) {
     const failure = error;
-    throw new Error(failure.stderr ?? failure.message ?? String(failure));
+    const details = [failure.stderr, failure.stdout, failure.message].filter(
+      (value) => typeof value === 'string' && value.length > 0,
+    );
+    throw new Error(details.join('\n') || String(failure));
   }
 }
 

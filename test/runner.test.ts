@@ -1,10 +1,15 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildDockerCommand, hashKnownLockfile, LocalProcessBackend } from '@patchproof/runner';
+import {
+  buildDockerCommand,
+  hashKnownLockfile,
+  LocalProcessBackend,
+  prepareDockerWorkspace,
+} from '@patchproof/runner';
 
 const policy = {
   backend: 'docker' as const,
@@ -33,6 +38,35 @@ test('dependency identity records a known lockfile or an explicit omission', asy
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Docker workspace preparation opens only the generated workspace tree', async () => {
+  const parent = await mkdtemp(join(tmpdir(), 'patchproof-docker-parent-'));
+  const root = join(parent, 'workspace');
+  try {
+    await mkdir(join(root, 'nested'), { recursive: true });
+    const plainFile = join(root, 'plain.txt');
+    const executableFile = join(root, 'run.sh');
+    await writeFile(plainFile, 'plain\n', 'utf8');
+    await writeFile(executableFile, '#!/bin/sh\n', 'utf8');
+    if (process.platform !== 'win32') {
+      await chmod(parent, 0o700);
+      await chmod(root, 0o700);
+      await chmod(join(root, 'nested'), 0o700);
+      await chmod(plainFile, 0o600);
+      await chmod(executableFile, 0o700);
+    }
+    await prepareDockerWorkspace(root);
+    if (process.platform !== 'win32') {
+      assert.equal((await stat(parent)).mode & 0o777, 0o700);
+      assert.equal((await stat(root)).mode & 0o777, 0o755);
+      assert.equal((await stat(join(root, 'nested'))).mode & 0o777, 0o755);
+      assert.equal((await stat(plainFile)).mode & 0o777, 0o644);
+      assert.equal((await stat(executableFile)).mode & 0o777, 0o755);
+    }
+  } finally {
+    await rm(parent, { recursive: true, force: true });
   }
 });
 

@@ -10,6 +10,7 @@ import {
   copyWorkspaceSafe,
   hashKnownLockfile,
   materializeScenarioFile,
+  prepareDockerWorkspace,
   sourceIdentity,
 } from './workspace.js';
 import type { ExecutionBackend, ExecutionSpec, RevisionRun, TwoRevisionRun } from './types.js';
@@ -100,6 +101,10 @@ export async function runTwoRevisions(
     if (options.config.scenario.file !== undefined) {
       const safeFile = assertSafeRelativePath(options.config.scenario.file, 'scenario.file');
       scenarioFileSha256 = await materializeScenarioFile(baseWork, headWork, safeFile);
+    }
+    if (backend === 'docker') {
+      await prepareDockerWorkspace(baseWork);
+      await prepareDockerWorkspace(headWork);
     }
     const baseSource = await sourceIdentity(basePath, options.baseRef ?? 'base');
     const headSource = await sourceIdentity(headPath, options.headRef ?? 'head');

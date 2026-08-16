@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdir, readdir, readFile, lstat, cp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, lstat, cp, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { basename, join, relative, resolve } from 'node:path';
 
@@ -71,6 +71,37 @@ export async function copyWorkspaceSafe(source: string, destination: string): Pr
   });
   const files: string[] = [];
   await walk(destination, destination, files);
+}
+
+/**
+ * Docker runs as UID 65532. POSIX mkdtemp directories are 0700 by default, so
+ * the directly mounted workspace must be opened explicitly for traversal. The
+ * containing temporary parent remains private and is never changed here.
+ */
+export async function prepareDockerWorkspace(root: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const visit = async (current: string): Promise<void> => {
+    const currentStat = await lstat(current);
+    if (currentStat.isSymbolicLink())
+      throw new Error(`Symbolic links are not allowed in Docker workspace: ${current}`);
+    if (!currentStat.isDirectory())
+      throw new Error(`Docker workspace root is not a directory: ${current}`);
+    await chmod(current, 0o755);
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const full = join(current, entry.name);
+      if (entry.isSymbolicLink())
+        throw new Error(`Symbolic links are not allowed in Docker workspace: ${full}`);
+      if (entry.isDirectory()) {
+        await visit(full);
+      } else if (entry.isFile()) {
+        const fileStat = await lstat(full);
+        if (fileStat.isSymbolicLink())
+          throw new Error(`Symbolic links are not allowed in Docker workspace: ${full}`);
+        await chmod(full, fileStat.mode & 0o111 ? 0o755 : 0o644);
+      }
+    }
+  };
+  await visit(root);
 }
 
 export async function materializeScenarioFile(

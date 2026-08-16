@@ -36,4 +36,6 @@ redaction:
 
 `scenario.command` is an argv array. It is never joined into a shell command. The `file` is copied from the trusted base workspace over the corresponding head path, ensuring the assertion is identical. `expectedFailure.exitCode` is required. `reasonPattern` and `reasonClass` are optional regular expressions over the combined base output; when present, both must match. Use them to avoid treating an unrelated failure as the claimed regression.
 
+`policy.timeoutMs` is a per-revision wall-clock backend limit. For Docker, it includes image resolution and pull, container startup, scenario execution, and shutdown/cleanup. Operators who need a very small scenario budget should provision or cache the image first.
+
 Defaults are conservative: Docker, no network, bounded resources, read-only root, no unsafe local execution, no fork execution, and empty redaction secrets. Policy limits are bounded to the supported runner ranges: timeout up to 24 hours, output up to 1 GiB, memory up to 1 TiB, 256 CPUs, and 1,000,000 PIDs. Unknown keys are warnings; malformed types, unsafe paths, invalid regular expressions, unsafe environment names, unsafe image references, and unsupported versions are errors.
