@@ -3,6 +3,16 @@ import { DatabaseSync } from 'node:sqlite';
 
 export type QueueJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
+export interface QueueLease {
+  owner: string;
+  generation: number;
+}
+
+export interface QueueCleanupCursor {
+  createdAt: string;
+  id: string;
+}
+
 export interface QueueEnqueueRequest {
   repository: string;
   pullRequest: number;
@@ -20,6 +30,7 @@ export interface QueueJob extends Omit<QueueEnqueueRequest, 'headRepository' | '
   status: QueueJobStatus;
   attempts: number;
   maxAttempts: number;
+  leaseGeneration: number;
   leaseOwner?: string;
   leaseExpiresAt?: string;
   lastError?: string;
@@ -33,21 +44,25 @@ export interface QueueJob extends Omit<QueueEnqueueRequest, 'headRepository' | '
 export interface RunQueue {
   enqueue(request: QueueEnqueueRequest, maxAttempts?: number): Promise<QueueJob>;
   claim(workerId: string, leaseMs?: number): Promise<QueueJob | undefined>;
-  heartbeat(jobId: string, workerId: string, leaseMs?: number): Promise<boolean>;
+  heartbeat(jobId: string, lease: QueueLease, leaseMs?: number): Promise<boolean>;
   complete(
     jobId: string,
-    workerId: string,
+    lease: QueueLease,
     result?: { evidencePath?: string; outcome?: string },
   ): Promise<boolean>;
   fail(
     jobId: string,
-    workerId: string,
+    lease: QueueLease,
     error: string,
     retryable: boolean,
   ): Promise<QueueJob | undefined>;
-  acknowledgeFailure(jobId: string): Promise<boolean>;
-  releaseFailure(jobId: string, workerId: string): Promise<boolean>;
+  acknowledgeFailure(jobId: string, lease: QueueLease): Promise<boolean>;
+  releaseFailure(jobId: string, lease: QueueLease): Promise<boolean>;
   cancel(jobId: string, reason: string): Promise<boolean>;
+  listTerminalCleanupCandidates(
+    after: QueueCleanupCursor | undefined,
+    limit: number,
+  ): Promise<QueueCleanupCursor[]>;
   list(): Promise<QueueJob[]>;
   close(): void;
 }
@@ -100,6 +115,7 @@ function rowToJob(row: Record<string, unknown>): QueueJob {
     status: status as QueueJobStatus,
     attempts: requiredNumber('attempts'),
     maxAttempts: requiredNumber('max_attempts'),
+    leaseGeneration: requiredNumber('lease_generation'),
     ...(typeof row.lease_owner === 'string' ? { leaseOwner: row.lease_owner } : {}),
     ...(typeof row.lease_expires_at === 'string' ? { leaseExpiresAt: row.lease_expires_at } : {}),
     ...(typeof row.last_error === 'string' ? { lastError: row.last_error } : {}),
@@ -123,9 +139,38 @@ function assertRequest(request: QueueEnqueueRequest): void {
     throw new Error('Queue head repository must be owner/name');
 }
 
+function assertLease(lease: QueueLease): void {
+  if (
+    lease === undefined ||
+    typeof lease.owner !== 'string' ||
+    lease.owner.length === 0 ||
+    lease.owner.length > 128 ||
+    !Number.isSafeInteger(lease.generation) ||
+    lease.generation < 0
+  )
+    throw new Error('Queue lease is invalid');
+}
+
 export class SqliteQueue implements RunQueue {
   private readonly database: DatabaseSync;
   private readonly clock: () => Date;
+
+  private withImmediateTransaction<T>(operation: (now: Date) => T): T {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const now = this.clock();
+      const result = operation(now);
+      this.database.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        // Preserve the operation error if rollback itself is unavailable.
+      }
+      throw error;
+    }
+  }
 
   public constructor(filename = ':memory:', clock: () => Date = () => new Date()) {
     this.database = new DatabaseSync(filename);
@@ -145,6 +190,7 @@ export class SqliteQueue implements RunQueue {
         status TEXT NOT NULL,
         attempts INTEGER NOT NULL,
         max_attempts INTEGER NOT NULL,
+        lease_generation INTEGER NOT NULL DEFAULT 0,
         lease_owner TEXT,
         lease_expires_at TEXT,
         last_error TEXT,
@@ -158,6 +204,10 @@ export class SqliteQueue implements RunQueue {
         ON patchproof_jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS patchproof_jobs_pr
         ON patchproof_jobs(repository, pull_request, updated_at);
+      CREATE INDEX IF NOT EXISTS patchproof_jobs_cleanup_ready
+        ON patchproof_jobs(created_at, id)
+        WHERE status IN ('succeeded', 'cancelled')
+          AND lease_owner IS NULL AND lease_expires_at IS NULL;
     `);
     for (const column of [
       'ALTER TABLE patchproof_jobs ADD COLUMN head_repository TEXT',
@@ -165,6 +215,7 @@ export class SqliteQueue implements RunQueue {
       'ALTER TABLE patchproof_jobs ADD COLUMN evidence_path TEXT',
       'ALTER TABLE patchproof_jobs ADD COLUMN outcome TEXT',
       'ALTER TABLE patchproof_jobs ADD COLUMN failure_notified INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE patchproof_jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0',
     ]) {
       try {
         this.database.exec(column);
@@ -203,7 +254,7 @@ export class SqliteQueue implements RunQueue {
         .prepare(
           `UPDATE patchproof_jobs
            SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
-               last_error = ?, updated_at = ?
+               lease_generation = lease_generation + 1, last_error = ?, updated_at = ?
            WHERE repository = ? AND pull_request = ?
              AND (head_sha <> ? OR COALESCE(head_repository, repository) <> ?)
              AND status IN ('queued', 'running')`,
@@ -225,6 +276,7 @@ export class SqliteQueue implements RunQueue {
         status: 'queued',
         attempts: 0,
         maxAttempts,
+        leaseGeneration: 0,
         createdAt: now,
         updatedAt: now,
       };
@@ -232,8 +284,8 @@ export class SqliteQueue implements RunQueue {
         .prepare(
           `INSERT INTO patchproof_jobs
           (id, repository, pull_request, base_sha, head_sha, head_repository, fork, reason, status, attempts,
-            max_attempts, lease_owner, lease_expires_at, last_error, evidence_path, outcome, failure_notified, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)`,
+            max_attempts, lease_generation, lease_owner, lease_expires_at, last_error, evidence_path, outcome, failure_notified, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)`,
         )
         .run(
           job.id,
@@ -247,6 +299,7 @@ export class SqliteQueue implements RunQueue {
           job.status,
           job.attempts,
           job.maxAttempts,
+          job.leaseGeneration,
           job.failureNotified ? 1 : 0,
           job.createdAt,
           job.updatedAt,
@@ -263,160 +316,213 @@ export class SqliteQueue implements RunQueue {
     if (!workerId || workerId.length > 128) throw new Error('Queue workerId is invalid');
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 86_400_000)
       throw new Error('Queue leaseMs is invalid');
-    const now = this.clock();
-    const nowText = now.toISOString();
-    const expires = new Date(now.getTime() + leaseMs).toISOString();
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      this.database
-        .prepare(
-          `UPDATE patchproof_jobs
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const nowText = now.toISOString();
+        const expires = new Date(now.getTime() + leaseMs).toISOString();
+        this.database
+          .prepare(
+            `UPDATE patchproof_jobs
            SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
                lease_owner = NULL, lease_expires_at = NULL,
                failure_notified = CASE WHEN attempts >= max_attempts THEN 0 ELSE failure_notified END,
                last_error = CASE WHEN attempts >= max_attempts THEN COALESCE(last_error, 'Lease expired after max attempts') ELSE last_error END,
                updated_at = ?
            WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
-        )
-        .run(nowText, nowText);
-      this.database
-        .prepare(
-          `UPDATE patchproof_jobs
+          )
+          .run(nowText, nowText);
+        this.database
+          .prepare(
+            `UPDATE patchproof_jobs
            SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
            WHERE status = 'failed' AND failure_notified = 0
              AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
-        )
-        .run(nowText, nowText);
-      const row = this.database
-        .prepare(
-          `SELECT * FROM patchproof_jobs WHERE status = 'queued' ORDER BY created_at ASC, id ASC LIMIT 1`,
-        )
-        .get();
-      const terminal =
-        row === undefined
-          ? this.database
-              .prepare(
-                `SELECT * FROM patchproof_jobs
-                 WHERE status = 'failed' AND failure_notified = 0
-                   AND (lease_owner IS NULL OR lease_expires_at IS NULL)
-                 ORDER BY updated_at ASC, id ASC LIMIT 1`,
-              )
-              .get()
-          : undefined;
-      const selected = row ?? terminal;
-      if (selected === undefined) {
-        this.database.exec('COMMIT');
-        return Promise.resolve(undefined);
-      }
-      const id = selected.id;
-      if (typeof id !== 'string') throw new Error('Queue row id is invalid');
-      if (selected.status === 'failed')
-        this.database
-          .prepare(
-            `UPDATE patchproof_jobs
-             SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
-             WHERE id = ? AND status = 'failed' AND failure_notified = 0
-               AND (lease_owner IS NULL OR lease_expires_at IS NULL)`,
           )
-          .run(workerId, expires, nowText, id);
-      else
-        this.database
+          .run(nowText, nowText);
+        const row = this.database
           .prepare(
-            `UPDATE patchproof_jobs
-             SET status = 'running', attempts = attempts + 1, lease_owner = ?,
+            `SELECT * FROM patchproof_jobs WHERE status = 'queued' ORDER BY created_at ASC, id ASC LIMIT 1`,
+          )
+          .get();
+        const terminal =
+          row === undefined
+            ? this.database
+                .prepare(
+                  `SELECT * FROM patchproof_jobs
+                 WHERE status = 'failed' AND failure_notified = 0
+                   AND lease_owner IS NULL AND lease_expires_at IS NULL
+                 ORDER BY updated_at ASC, id ASC LIMIT 1`,
+                )
+                .get()
+            : undefined;
+        const selected = row ?? terminal;
+        if (selected === undefined) {
+          return undefined;
+        }
+        const id = selected.id;
+        if (typeof id !== 'string') throw new Error('Queue row id is invalid');
+        if (selected.status === 'failed')
+          this.database
+            .prepare(
+              `UPDATE patchproof_jobs
+             SET lease_generation = lease_generation + 1,
+                 lease_owner = ?, lease_expires_at = ?, updated_at = ?
+             WHERE id = ? AND status = 'failed' AND failure_notified = 0
+               AND lease_owner IS NULL AND lease_expires_at IS NULL`,
+            )
+            .run(workerId, expires, nowText, id);
+        else
+          this.database
+            .prepare(
+              `UPDATE patchproof_jobs
+             SET status = 'running', attempts = attempts + 1,
+                 lease_generation = lease_generation + 1, lease_owner = ?,
                  lease_expires_at = ?, updated_at = ?
              WHERE id = ? AND status = 'queued'`,
-          )
-          .run(workerId, expires, nowText, id);
-      const claimed = this.database.prepare('SELECT * FROM patchproof_jobs WHERE id = ?').get(id);
-      this.database.exec('COMMIT');
-      return Promise.resolve(claimed === undefined ? undefined : rowToJob(claimed));
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
+            )
+            .run(workerId, expires, nowText, id);
+        const claimed = this.database.prepare('SELECT * FROM patchproof_jobs WHERE id = ?').get(id);
+        return claimed === undefined ? undefined : rowToJob(claimed);
+      }),
+    );
   }
 
-  public heartbeat(jobId: string, workerId: string, leaseMs = 60_000): Promise<boolean> {
+  public heartbeat(jobId: string, lease: QueueLease, leaseMs = 60_000): Promise<boolean> {
+    assertLease(lease);
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 86_400_000)
       throw new Error('Queue leaseMs is invalid');
-    const expires = new Date(this.clock().getTime() + leaseMs).toISOString();
-    const result = this.database
-      .prepare(
-        `UPDATE patchproof_jobs SET lease_expires_at = ?, updated_at = ?
-         WHERE id = ? AND status = 'running' AND lease_owner = ?`,
-      )
-      .run(expires, nowIso(this.clock), jobId, workerId);
-    return Promise.resolve(result.changes === 1);
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const nowText = now.toISOString();
+        const expires = new Date(now.getTime() + leaseMs).toISOString();
+        const result = this.database
+          .prepare(
+            `UPDATE patchproof_jobs SET lease_expires_at = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND lease_generation = ?
+               AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND lease_expires_at > ?
+               AND (status = 'running' OR (status = 'failed' AND failure_notified = 0))`,
+          )
+          .run(expires, nowText, jobId, lease.owner, lease.generation, nowText);
+        return result.changes === 1;
+      }),
+    );
   }
 
   public complete(
     jobId: string,
-    workerId: string,
+    lease: QueueLease,
     completion: { evidencePath?: string; outcome?: string } = {},
   ): Promise<boolean> {
-    const update = this.database
-      .prepare(
-        `UPDATE patchproof_jobs
-         SET status = 'succeeded', lease_owner = NULL, lease_expires_at = NULL,
-             evidence_path = ?, outcome = ?, updated_at = ?
-         WHERE id = ? AND status = 'running' AND lease_owner = ?`,
-      )
-      .run(
-        completion.evidencePath ?? null,
-        completion.outcome ?? null,
-        nowIso(this.clock),
-        jobId,
-        workerId,
-      );
-    return Promise.resolve(update.changes === 1);
+    assertLease(lease);
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const nowText = now.toISOString();
+        const update = this.database
+          .prepare(
+            `UPDATE patchproof_jobs
+             SET status = 'succeeded', lease_owner = NULL, lease_expires_at = NULL,
+                 evidence_path = ?, outcome = ?, updated_at = ?
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_generation = ? AND lease_expires_at IS NOT NULL
+               AND lease_expires_at > ?`,
+          )
+          .run(
+            completion.evidencePath ?? null,
+            completion.outcome ?? null,
+            nowText,
+            jobId,
+            lease.owner,
+            lease.generation,
+            nowText,
+          );
+        return update.changes === 1;
+      }),
+    );
   }
 
   public fail(
     jobId: string,
-    workerId: string,
+    lease: QueueLease,
     error: string,
     retryable: boolean,
   ): Promise<QueueJob | undefined> {
+    assertLease(lease);
     if (!error || error.length > 4096) throw new Error('Queue failure reason is invalid');
-    const row = this.database.prepare('SELECT * FROM patchproof_jobs WHERE id = ?').get(jobId);
-    if (row === undefined) return Promise.resolve(undefined);
-    const job = rowToJob(row);
-    if (job.status !== 'running' || job.leaseOwner !== workerId) return Promise.resolve(undefined);
-    const shouldRetry = retryable && job.attempts < job.maxAttempts;
-    const status: QueueJobStatus = shouldRetry ? 'queued' : 'failed';
-    this.database
-      .prepare(
-        `UPDATE patchproof_jobs
-         SET status = ?, lease_owner = NULL, lease_expires_at = NULL, failure_notified = 0,
-             last_error = ?, updated_at = ?
-         WHERE id = ? AND status = 'running' AND lease_owner = ?`,
-      )
-      .run(status, error, nowIso(this.clock), jobId, workerId);
-    const updated = this.database.prepare('SELECT * FROM patchproof_jobs WHERE id = ?').get(jobId);
-    return Promise.resolve(updated === undefined ? undefined : rowToJob(updated));
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const nowText = now.toISOString();
+        const row = this.database.prepare('SELECT * FROM patchproof_jobs WHERE id = ?').get(jobId);
+        if (row === undefined) return undefined;
+        const job = rowToJob(row);
+        const shouldRetry = retryable && job.attempts < job.maxAttempts;
+        const update = this.database
+          .prepare(
+            `UPDATE patchproof_jobs
+             SET status = ?,
+                 lease_owner = CASE WHEN ? = 'failed' THEN lease_owner ELSE NULL END,
+                 lease_expires_at = CASE WHEN ? = 'failed' THEN lease_expires_at ELSE NULL END,
+                 failure_notified = 0, last_error = ?, updated_at = ?
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_generation = ? AND lease_expires_at IS NOT NULL
+               AND lease_expires_at > ?`,
+          )
+          .run(
+            shouldRetry ? 'queued' : 'failed',
+            shouldRetry ? 'queued' : 'failed',
+            shouldRetry ? 'queued' : 'failed',
+            error,
+            nowText,
+            jobId,
+            lease.owner,
+            lease.generation,
+            nowText,
+          );
+        if (update.changes !== 1) return undefined;
+        const updated = this.database
+          .prepare('SELECT * FROM patchproof_jobs WHERE id = ?')
+          .get(jobId);
+        return updated === undefined ? undefined : rowToJob(updated);
+      }),
+    );
   }
 
-  public acknowledgeFailure(jobId: string): Promise<boolean> {
-    const result = this.database
-      .prepare(
-        `UPDATE patchproof_jobs
-         SET failure_notified = 1, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE id = ? AND status = 'failed' AND failure_notified = 0`,
-      )
-      .run(nowIso(this.clock), jobId);
-    return Promise.resolve(result.changes === 1);
+  public acknowledgeFailure(jobId: string, lease: QueueLease): Promise<boolean> {
+    assertLease(lease);
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const nowText = now.toISOString();
+        const result = this.database
+          .prepare(
+            `UPDATE patchproof_jobs
+             SET failure_notified = 1, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE id = ? AND status = 'failed' AND failure_notified = 0
+               AND lease_owner = ? AND lease_generation = ?
+               AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
+          )
+          .run(nowText, jobId, lease.owner, lease.generation, nowText);
+        return result.changes === 1;
+      }),
+    );
   }
 
-  public releaseFailure(jobId: string, workerId: string): Promise<boolean> {
-    const result = this.database
-      .prepare(
-        `UPDATE patchproof_jobs
-         SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE id = ? AND status = 'failed' AND failure_notified = 0 AND lease_owner = ?`,
-      )
-      .run(nowIso(this.clock), jobId, workerId);
-    return Promise.resolve(result.changes === 1);
+  public releaseFailure(jobId: string, lease: QueueLease): Promise<boolean> {
+    assertLease(lease);
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const nowText = now.toISOString();
+        const result = this.database
+          .prepare(
+            `UPDATE patchproof_jobs
+             SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE id = ? AND status = 'failed' AND failure_notified = 0
+               AND lease_owner = ? AND lease_generation = ?
+               AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
+          )
+          .run(nowText, jobId, lease.owner, lease.generation, nowText);
+        return result.changes === 1;
+      }),
+    );
   }
 
   public cancel(jobId: string, reason: string): Promise<boolean> {
@@ -425,11 +531,50 @@ export class SqliteQueue implements RunQueue {
       .prepare(
         `UPDATE patchproof_jobs
          SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
-             last_error = ?, updated_at = ?
+             lease_generation = lease_generation + 1, last_error = ?, updated_at = ?
          WHERE id = ? AND status IN ('queued', 'running')`,
       )
       .run(reason, nowIso(this.clock), jobId);
     return Promise.resolve(result.changes === 1);
+  }
+
+  public listTerminalCleanupCandidates(
+    after: QueueCleanupCursor | undefined,
+    limit: number,
+  ): Promise<QueueCleanupCursor[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8)
+      throw new Error('Queue cleanup limit is invalid');
+    if (
+      after !== undefined &&
+      (typeof after.createdAt !== 'string' || typeof after.id !== 'string' || after.id.length === 0)
+    )
+      throw new Error('Queue cleanup cursor is invalid');
+    const eligible = `status IN ('succeeded', 'cancelled')
+      AND lease_owner IS NULL AND lease_expires_at IS NULL`;
+    const rows =
+      after === undefined
+        ? this.database
+            .prepare(
+              `SELECT created_at, id FROM patchproof_jobs
+               WHERE ${eligible}
+               ORDER BY created_at ASC, id ASC LIMIT ?`,
+            )
+            .all(limit)
+        : this.database
+            .prepare(
+              `SELECT created_at, id FROM patchproof_jobs
+               WHERE ${eligible}
+                 AND (created_at > ? OR (created_at = ? AND id > ?))
+               ORDER BY created_at ASC, id ASC LIMIT ?`,
+            )
+            .all(after.createdAt, after.createdAt, after.id, limit);
+    return Promise.resolve(
+      rows.map((row) => {
+        if (typeof row.created_at !== 'string' || typeof row.id !== 'string')
+          throw new Error('Queue cleanup row is invalid');
+        return { createdAt: row.created_at, id: row.id };
+      }),
+    );
   }
 
   public list(): Promise<QueueJob[]> {

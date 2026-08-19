@@ -4,9 +4,14 @@ import assert from 'node:assert/strict';
 import { handleWebhook } from '../apps/github-app/dist/webhook.js';
 import { GitHubApiTransport } from '../apps/github-app/dist/github-api.js';
 import { SqliteStateStore } from '../apps/github-app/dist/sqlite.js';
-import { publishRunResult } from '../apps/github-app/dist/publisher.js';
+import { publishRunFailure, publishRunResult } from '../apps/github-app/dist/publisher.js';
 import { computeWebhookSignature, MemoryStateStore } from '@patchproof/github';
 import { createIntegrity, type EvidenceBundle } from '@patchproof/core';
+
+const testPublicationFence = {
+  signal: new AbortController().signal,
+  async assertOwned(): Promise<void> {},
+};
 
 const payload = JSON.stringify({
   action: 'opened',
@@ -274,6 +279,50 @@ test('GitHub transport fetches and validates pull request refs through the least
   }
 });
 
+test('GitHub mutation transport forwards and honors AbortSignal', async () => {
+  const originalFetch = globalThis.fetch;
+  const observed: Array<AbortSignal | undefined> = [];
+  globalThis.fetch = async (_input, init) => {
+    observed.push(init?.signal);
+    if (init?.signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+    return new Response(JSON.stringify({ id: 17, body: 'managed' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  const transport = new GitHubApiTransport('test-token', 'http://github.test');
+  const controller = new AbortController();
+  const payload = {
+    name: 'PatchProof' as const,
+    status: 'completed' as const,
+    conclusion: 'neutral' as const,
+    output: { title: 'title', summary: 'summary', text: 'text' },
+  };
+  try {
+    assert.deepEqual(
+      await transport.createCheck('octo/example', 'a'.repeat(40), payload, {
+        signal: controller.signal,
+      }),
+      { id: 17 },
+    );
+    assert.equal(observed[0], controller.signal);
+    controller.abort();
+    await assert.rejects(
+      () =>
+        transport.createComment(
+          'octo/example',
+          7,
+          { body: 'managed' },
+          { signal: controller.signal },
+        ),
+      /aborted/u,
+    );
+    assert.equal(observed[1], controller.signal);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('completed runs update the same Check and managed comment IDs', async () => {
   const execution = (revision: 'base' | 'head') => ({
     revision,
@@ -368,11 +417,13 @@ test('completed runs update the same Check and managed comment IDs', async () =>
     { repository: 'o/r', pullRequest: 1, headSha: 'h', bundle },
     store,
     github,
+    testPublicationFence,
   );
   await publishRunResult(
     { repository: 'o/r', pullRequest: 1, headSha: 'h', bundle },
     store,
     github,
+    testPublicationFence,
   );
   assert.deepEqual(calls, ['create-check', 'create-comment', 'update-check', 'update-comment']);
 
@@ -403,6 +454,7 @@ test('completed runs update the same Check and managed comment IDs', async () =>
         { repository: 'o/r', pullRequest: 2, headSha: 'h', bundle },
         partialStore,
         partialGithub,
+        testPublicationFence,
       ),
     /temporary comment failure/u,
   );
@@ -410,6 +462,7 @@ test('completed runs update the same Check and managed comment IDs', async () =>
     { repository: 'o/r', pullRequest: 2, headSha: 'h', bundle },
     partialStore,
     partialGithub,
+    testPublicationFence,
   );
   assert.deepEqual(partialCalls, [
     'create-check',
@@ -417,4 +470,209 @@ test('completed runs update the same Check and managed comment IDs', async () =>
     'update-check',
     'create-comment',
   ]);
+});
+
+test('publication fence blocks and fences completed publication mutations', async () => {
+  const unsigned: Omit<EvidenceBundle, 'integrity'> = {
+    schemaVersion: 1,
+    product: { name: 'PatchProof', version: '0.1.0' },
+    bundleId: 'fence-test',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    outcome: 'PASS',
+    verdict: 'fixed',
+    scenario: {
+      id: 'id',
+      name: 'name',
+      command: ['node'],
+      cwd: '.',
+      trustedSource: 'base',
+      expectedFailure: { exitCode: 1 },
+      sha256: 's',
+    },
+    sources: {
+      base: { revision: 'base', ref: 'b', sha256: 'b', kind: 'directory-tree', location: 'b' },
+      head: { revision: 'head', ref: 'h', sha256: 'h', kind: 'directory-tree', location: 'h' },
+    },
+    policy: {
+      backend: 'docker',
+      network: 'none',
+      allowedHosts: [],
+      unsafeLocalProcess: false,
+      fork: false,
+      trustedConfigRevision: 'base',
+      limits: { timeoutMs: 1, outputBytes: 1, memoryMb: 1, cpuCount: 1, pids: 1 },
+    },
+    executions: {
+      base: {
+        revision: 'base',
+        command: ['node'],
+        cwd: '.',
+        environment: {},
+        launcherEnvironment: { omitted: true as const, keys: [], sha256: '0'.repeat(64) },
+        exitCode: 1,
+        timedOut: false,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        durationMs: 1,
+        stdout: { artifactId: 'out', preview: '', truncated: false, sizeBytes: 0 },
+        stderr: { artifactId: 'err', preview: '', truncated: false, sizeBytes: 0 },
+      },
+      head: {
+        revision: 'head',
+        command: ['node'],
+        cwd: '.',
+        environment: {},
+        launcherEnvironment: { omitted: true as const, keys: [], sha256: '0'.repeat(64) },
+        exitCode: 0,
+        timedOut: false,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        durationMs: 1,
+        stdout: { artifactId: 'out', preview: '', truncated: false, sizeBytes: 0 },
+        stderr: { artifactId: 'err', preview: '', truncated: false, sizeBytes: 0 },
+      },
+    },
+    artifacts: [],
+    completeness: { complete: true, checks: { all: true }, missing: [] },
+    replay: {
+      supported: true,
+      baseLocation: 'b',
+      headLocation: 'h',
+      requiresExplicitConfirmation: true,
+      recordedEnvironment: { node: 'v24', platform: 'win32', arch: 'x64' },
+    },
+  };
+  const bundle = { ...unsigned, integrity: createIntegrity(unsigned) };
+  const calls: string[] = [];
+  const github = {
+    async createCheck() {
+      calls.push('check');
+      return { id: 1 };
+    },
+    async updateCheck() {},
+    async createComment() {
+      calls.push('comment');
+      return { id: 2, body: 'managed' };
+    },
+    async updateComment() {},
+  };
+  const rejectedFence = {
+    signal: new AbortController().signal,
+    async assertOwned(): Promise<void> {
+      throw new Error('lease lost');
+    },
+  };
+  const rejectedStore = new MemoryStateStore();
+  await assert.rejects(
+    () =>
+      publishRunResult(
+        { repository: 'o/r', pullRequest: 10, headSha: 'h', bundle },
+        rejectedStore,
+        github,
+        rejectedFence,
+      ),
+    /lease lost/u,
+  );
+  assert.deepEqual(calls, []);
+  assert.equal(await rejectedStore.getRun('o/r', 10), undefined);
+
+  let checkAsserts = 0;
+  let resolveCheck!: () => void;
+  const checkSettled = new Promise<void>((resolve) => {
+    resolveCheck = resolve;
+  });
+  const checkStore = new MemoryStateStore();
+  const checkCalls: string[] = [];
+  const checkFence = {
+    signal: new AbortController().signal,
+    async assertOwned(): Promise<void> {
+      checkAsserts += 1;
+      if (checkAsserts === 3) throw new Error('lease lost after check');
+    },
+  };
+  const checkGithub = {
+    ...github,
+    async createCheck() {
+      checkCalls.push('check');
+      await checkSettled;
+      return { id: 3 };
+    },
+    async createComment() {
+      checkCalls.push('comment');
+      return { id: 4, body: 'managed' };
+    },
+  };
+  const checkPromise = publishRunResult(
+    { repository: 'o/r', pullRequest: 11, headSha: 'h', bundle },
+    checkStore,
+    checkGithub,
+    checkFence,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  resolveCheck();
+  await assert.rejects(() => checkPromise, /lease lost after check/u);
+  assert.deepEqual(checkCalls, ['check']);
+  assert.equal(await checkStore.getRun('o/r', 11), undefined);
+
+  let commentAsserts = 0;
+  let resolveComment!: () => void;
+  const commentSettled = new Promise<void>((resolve) => {
+    resolveComment = resolve;
+  });
+  const commentStore = new MemoryStateStore();
+  const commentCalls: string[] = [];
+  const commentFence = {
+    signal: new AbortController().signal,
+    async assertOwned(): Promise<void> {
+      commentAsserts += 1;
+      if (commentAsserts === 5) throw new Error('lease lost after comment');
+    },
+  };
+  const commentGithub = {
+    ...github,
+    async createCheck() {
+      commentCalls.push('check');
+      return { id: 5 };
+    },
+    async createComment() {
+      commentCalls.push('comment');
+      await commentSettled;
+      return { id: 6, body: 'managed' };
+    },
+  };
+  const commentPromise = publishRunResult(
+    { repository: 'o/r', pullRequest: 12, headSha: 'h', bundle },
+    commentStore,
+    commentGithub,
+    commentFence,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  resolveComment();
+  await assert.rejects(() => commentPromise, /lease lost after comment/u);
+  assert.deepEqual(commentCalls, ['check', 'comment']);
+  assert.deepEqual(await commentStore.getRun('o/r', 12), { checkId: 5 });
+
+  const failureCalls: string[] = [];
+  const failureStore = new MemoryStateStore();
+  const failureGithub = {
+    ...github,
+    async createCheck() {
+      failureCalls.push('check');
+      return { id: 7 };
+    },
+    async createComment() {
+      failureCalls.push('comment');
+      return { id: 8, body: 'managed' };
+    },
+  };
+  await assert.rejects(
+    () =>
+      publishRunFailure(
+        { repository: 'o/r', pullRequest: 13, headSha: 'h', error: 'failure' },
+        failureStore,
+        failureGithub,
+        rejectedFence,
+      ),
+    /lease lost/u,
+  );
+  assert.deepEqual(failureCalls, []);
+  assert.equal(await failureStore.getRun('o/r', 13), undefined);
 });

@@ -3,6 +3,7 @@ import type {
   GitHubTransport,
   PullRequestSnapshot,
   PullRequestCommentPayload,
+  GitHubMutationOptions,
 } from '@patchproof/github';
 
 function repositoryPath(repository: string): string {
@@ -18,7 +19,12 @@ export class GitHubApiTransport implements GitHubTransport {
     private readonly apiBase = 'https://api.github.com',
   ) {}
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    options?: GitHubMutationOptions,
+  ): Promise<T> {
     const response = await fetch(`${this.apiBase}${path}`, {
       method,
       headers: {
@@ -28,6 +34,7 @@ export class GitHubApiTransport implements GitHubTransport {
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(options?.signal === undefined ? {} : { signal: options.signal }),
     });
     if (!response.ok) throw new Error(`GitHub API ${method} ${path} returned ${response.status}`);
     if (response.status === 204) return undefined as T;
@@ -74,11 +81,13 @@ export class GitHubApiTransport implements GitHubTransport {
     repository: string,
     headSha: string,
     payload: CheckRunPayload,
+    options?: GitHubMutationOptions,
   ): Promise<{ id: number }> {
     const result = await this.request<{ id: number }>(
       'POST',
       `/repos/${repositoryPath(repository)}/check-runs`,
       { ...payload, head_sha: headSha },
+      options,
     );
     return { id: result.id };
   }
@@ -87,11 +96,13 @@ export class GitHubApiTransport implements GitHubTransport {
     repository: string,
     checkId: number,
     payload: CheckRunPayload,
+    options?: GitHubMutationOptions,
   ): Promise<void> {
     await this.request(
       'PATCH',
       `/repos/${repositoryPath(repository)}/check-runs/${checkId}`,
       payload,
+      options,
     );
   }
 
@@ -99,11 +110,13 @@ export class GitHubApiTransport implements GitHubTransport {
     repository: string,
     issueNumber: number,
     payload: PullRequestCommentPayload,
+    options?: GitHubMutationOptions,
   ): Promise<{ id: number; body: string }> {
     const result = await this.request<{ id: number; body: string }>(
       'POST',
       `/repos/${repositoryPath(repository)}/issues/${issueNumber}/comments`,
       payload,
+      options,
     );
     return { id: result.id, body: result.body };
   }
@@ -112,11 +125,13 @@ export class GitHubApiTransport implements GitHubTransport {
     repository: string,
     commentId: number,
     payload: PullRequestCommentPayload,
+    options?: GitHubMutationOptions,
   ): Promise<void> {
     await this.request(
       'PATCH',
       `/repos/${repositoryPath(repository)}/issues/comments/${commentId}`,
       payload,
+      options,
     );
   }
 }
