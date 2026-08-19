@@ -15,11 +15,17 @@ export interface PublishRunInput {
   bundle: EvidenceBundle;
 }
 
+export interface PublicationFence {
+  readonly signal: AbortSignal;
+  assertOwned(): Promise<void>;
+}
+
 /** Publishes a completed run through the two managed GitHub surfaces, using persisted IDs for idempotency. */
 export async function publishRunResult(
   input: PublishRunInput,
   store: ManagedStateStore,
   github: GitHubTransport,
+  fence: PublicationFence,
 ): Promise<{ checkId: number; commentId: number }> {
   const checkPayload = buildCheckRunPayload(input.bundle);
   const commentPayload = buildManagedCommentPayload(input.bundle);
@@ -32,14 +38,39 @@ export async function publishRunResult(
       ...(commentId === undefined ? {} : { commentId }),
     });
   };
-  if (checkId === undefined)
-    checkId = (await github.createCheck(input.repository, input.headSha, checkPayload)).id;
-  else await github.updateCheck(input.repository, checkId, checkPayload);
+  await fence.assertOwned();
+  if (checkId === undefined) {
+    await fence.assertOwned();
+    const created = await github.createCheck(input.repository, input.headSha, checkPayload, {
+      signal: fence.signal,
+    });
+    await fence.assertOwned();
+    checkId = created.id;
+  } else {
+    await fence.assertOwned();
+    await github.updateCheck(input.repository, checkId, checkPayload, { signal: fence.signal });
+    await fence.assertOwned();
+  }
   await saveIds();
-  if (commentId === undefined)
-    commentId = (await github.createComment(input.repository, input.pullRequest, commentPayload))
-      .id;
-  else await github.updateComment(input.repository, commentId, commentPayload);
+  if (commentId === undefined) {
+    await fence.assertOwned();
+    const created = await github.createComment(
+      input.repository,
+      input.pullRequest,
+      commentPayload,
+      {
+        signal: fence.signal,
+      },
+    );
+    await fence.assertOwned();
+    commentId = created.id;
+  } else {
+    await fence.assertOwned();
+    await github.updateComment(input.repository, commentId, commentPayload, {
+      signal: fence.signal,
+    });
+    await fence.assertOwned();
+  }
   await saveIds();
   return { checkId, commentId };
 }
@@ -69,6 +100,7 @@ export async function publishRunFailure(
   input: { repository: string; pullRequest: number; headSha: string; error: string },
   store: ManagedStateStore,
   github: GitHubTransport,
+  fence: PublicationFence,
 ): Promise<{ checkId: number; commentId: number }> {
   const checkPayload = infrastructurePayload(input.error);
   const safeError = safeExternalError(input.error);
@@ -96,14 +128,39 @@ export async function publishRunFailure(
       ...(commentId === undefined ? {} : { commentId }),
     });
   };
-  if (checkId === undefined)
-    checkId = (await github.createCheck(input.repository, input.headSha, checkPayload)).id;
-  else await github.updateCheck(input.repository, checkId, checkPayload);
+  await fence.assertOwned();
+  if (checkId === undefined) {
+    await fence.assertOwned();
+    const created = await github.createCheck(input.repository, input.headSha, checkPayload, {
+      signal: fence.signal,
+    });
+    await fence.assertOwned();
+    checkId = created.id;
+  } else {
+    await fence.assertOwned();
+    await github.updateCheck(input.repository, checkId, checkPayload, { signal: fence.signal });
+    await fence.assertOwned();
+  }
   await saveIds();
-  if (commentId === undefined)
-    commentId = (await github.createComment(input.repository, input.pullRequest, commentPayload))
-      .id;
-  else await github.updateComment(input.repository, commentId, commentPayload);
+  if (commentId === undefined) {
+    await fence.assertOwned();
+    const created = await github.createComment(
+      input.repository,
+      input.pullRequest,
+      commentPayload,
+      {
+        signal: fence.signal,
+      },
+    );
+    await fence.assertOwned();
+    commentId = created.id;
+  } else {
+    await fence.assertOwned();
+    await github.updateComment(input.repository, commentId, commentPayload, {
+      signal: fence.signal,
+    });
+    await fence.assertOwned();
+  }
   await saveIds();
   return { checkId, commentId };
 }

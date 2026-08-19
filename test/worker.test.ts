@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import {
   cp,
   lstat,
@@ -10,7 +11,9 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { verifyEvidenceBundle } from '@patchproof/core';
@@ -77,8 +80,100 @@ class Deferred {
   }
 }
 
+async function runQueueCallBehindImmediateLock(
+  filename: string,
+  clock: SharedArrayBuffer,
+  method: string,
+  args: unknown[],
+): Promise<unknown> {
+  const entered = new SharedArrayBuffer(4);
+  const queueModule = pathToFileURL(resolve('apps/github-app/dist/queue.js')).href;
+  const worker = new Worker(
+    `
+      const { parentPort, workerData } = require('node:worker_threads');
+      const { DatabaseSync } = require('node:sqlite');
+      (async () => {
+        const queueModule = await import(workerData.queueModule);
+        const clock = new BigInt64Array(workerData.clock);
+        const queue = new queueModule.SqliteQueue(
+          workerData.filename,
+          () => new Date(Number(Atomics.load(clock, 0))),
+        );
+        parentPort.postMessage({ kind: 'ready' });
+        await new Promise((resolvePromise) => parentPort.once('message', resolvePromise));
+        const probe = new DatabaseSync(workerData.filename);
+        probe.exec('PRAGMA busy_timeout = 0');
+        Atomics.store(new Int32Array(workerData.entered), 0, 1);
+        Atomics.notify(new Int32Array(workerData.entered), 0);
+        let blocked = false;
+        try {
+          probe.exec('BEGIN IMMEDIATE');
+          probe.exec('ROLLBACK');
+        } catch {
+          blocked = true;
+        }
+        probe.close();
+        parentPort.postMessage({ kind: blocked ? 'blocked' : 'not-blocked' });
+        try {
+          const value = await queue[workerData.method](...workerData.args);
+          parentPort.postMessage({ kind: 'result', value });
+        } catch (error) {
+          parentPort.postMessage({
+            kind: 'error',
+            message: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          queue.close();
+        }
+      })().catch((error) => parentPort.postMessage({ kind: 'error', message: String(error) }));
+    `,
+    { eval: true, workerData: { filename, clock, entered, method, args, queueModule } },
+  );
+  const waitFor = (kind: string): Promise<Record<string, unknown>> =>
+    new Promise((resolvePromise, rejectPromise) => {
+      const onMessage = (message: Record<string, unknown>) => {
+        if (message.kind === kind) {
+          worker.off('message', onMessage);
+          resolvePromise(message);
+        } else if (message.kind === 'error' || message.kind === 'not-blocked') {
+          worker.off('message', onMessage);
+          rejectPromise(
+            new Error(
+              message.kind === 'not-blocked'
+                ? 'SQLite lock was not acquired before mutation'
+                : String(message.message),
+            ),
+          );
+        }
+      };
+      worker.on('message', onMessage);
+      worker.once('error', rejectPromise);
+    });
+  try {
+    await waitFor('ready');
+    const lock = new DatabaseSync(filename);
+    lock.exec('PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE');
+    worker.postMessage('go');
+    while (Atomics.load(new Int32Array(entered), 0) !== 1)
+      Atomics.wait(new Int32Array(entered), 0, 0);
+    await waitFor('blocked');
+    const current = Atomics.load(new BigInt64Array(clock), 0);
+    Atomics.store(new BigInt64Array(clock), 0, current + 2_000n);
+    const resultPromise = waitFor('result');
+    lock.exec('COMMIT');
+    const result = await resultPromise;
+    lock.close();
+    return result.value;
+  } finally {
+    await worker.terminate();
+  }
+}
+
 function publicationGithub(calls: string[], failCreateCheck = false) {
   return {
+    async getPullRequest() {
+      throw new Error('unused in worker publication tests');
+    },
     async createCheck() {
       calls.push('create-check');
       if (failCreateCheck) throw new Error('temporary GitHub failure');
@@ -372,7 +467,14 @@ test('SQLite queue persists fork source identity, supersedes work, and reaps sta
   });
   const firstClaim = await queue.claim('worker-a', 1_000);
   assert.equal(firstClaim?.id, first.id);
-  assert.equal(await queue.heartbeat(first.id, 'worker-b', 1_000), false);
+  assert.equal(
+    await queue.heartbeat(
+      first.id,
+      { owner: 'worker-b', generation: firstClaim?.leaseGeneration ?? 0 },
+      1_000,
+    ),
+    false,
+  );
 
   const second = await queue.enqueue({
     repository: 'octo/example',
@@ -394,7 +496,14 @@ test('SQLite queue persists fork source identity, supersedes work, and reaps sta
   assert.equal(reaped?.id, second.id);
   assert.equal(reaped?.attempts, 2);
   assert.equal(await queue.cancel(second.id, 'operator cancelled'), true);
-  assert.equal(await queue.heartbeat(second.id, 'worker-c', 1_000), false);
+  assert.equal(
+    await queue.heartbeat(
+      second.id,
+      { owner: 'worker-c', generation: reaped?.leaseGeneration ?? 0 },
+      1_000,
+    ),
+    false,
+  );
 
   const terminal = await queue.enqueue(
     {
@@ -406,15 +515,263 @@ test('SQLite queue persists fork source identity, supersedes work, and reaps sta
     },
     1,
   );
-  assert.equal((await queue.claim('worker-d', 1_000))?.id, terminal.id);
+  const terminalFirstClaim = await queue.claim('worker-d', 1_000);
+  assert.equal(terminalFirstClaim?.id, terminal.id);
   now = new Date(now.getTime() + 2_000);
   const terminalNotification = await queue.claim('worker-e', 1_000);
   assert.equal(terminalNotification?.id, terminal.id);
   assert.equal(terminalNotification?.status, 'failed');
-  assert.equal(await queue.acknowledgeFailure(terminal.id), true);
+  assert.equal(
+    await queue.acknowledgeFailure(terminal.id, {
+      owner: terminalNotification?.leaseOwner ?? '',
+      generation: terminalNotification?.leaseGeneration ?? 0,
+    }),
+    true,
+  );
   assert.equal(await queue.claim('worker-f', 1_000), undefined);
   assert.equal((await queue.list()).find((job) => job.id === terminal.id)?.status, 'failed');
   queue.close();
+});
+
+test('queue lease generations fence terminal notification and reclaim transitions', async () => {
+  let now = new Date('2026-01-01T00:00:00.000Z');
+  const queue = new SqliteQueue(':memory:', () => new Date(now));
+  const job = await enqueueWorkerJob(queue, 1);
+  const first = await queue.claim('worker-a', 1_000);
+  assert.equal(first?.leaseGeneration, 1);
+  assert.equal(first?.leaseOwner, 'worker-a');
+  const leaseA = { owner: 'worker-a', generation: first?.leaseGeneration ?? 0 };
+
+  assert.equal(await queue.heartbeat(job.id, { owner: 'worker-a', generation: 2 }, 1_000), false);
+  const terminal = await queue.fail(job.id, leaseA, 'terminal failure', false);
+  assert.equal(terminal?.status, 'failed');
+  assert.equal(terminal?.leaseOwner, 'worker-a');
+  assert.equal(terminal?.leaseGeneration, leaseA.generation);
+  assert.equal(await queue.claim('worker-b', 1_000), undefined);
+  assert.equal(await queue.heartbeat(job.id, leaseA, 1_000), true);
+  assert.equal(
+    await queue.acknowledgeFailure(job.id, {
+      owner: 'worker-a',
+      generation: leaseA.generation + 1,
+    }),
+    false,
+  );
+  assert.equal(
+    await queue.releaseFailure(job.id, { owner: 'worker-b', generation: leaseA.generation }),
+    false,
+  );
+
+  now = new Date(now.getTime() + 1_001);
+  const reclaimed = await queue.claim('worker-b', 1_000);
+  assert.equal(reclaimed?.status, 'failed');
+  assert.equal(reclaimed?.leaseGeneration, leaseA.generation + 1);
+  const leaseB = {
+    owner: reclaimed?.leaseOwner ?? '',
+    generation: reclaimed?.leaseGeneration ?? 0,
+  };
+  assert.equal(await queue.acknowledgeFailure(job.id, leaseA), false);
+  assert.equal(await queue.releaseFailure(job.id, leaseB), true);
+  assert.equal((await queue.list()).find((item) => item.id === job.id)?.leaseOwner, undefined);
+
+  const retryJob = await queue.enqueue({
+    repository: 'octo/example',
+    pullRequest: 9,
+    baseSha,
+    headSha: 'c'.repeat(40),
+    reason: 'pull_request',
+  });
+  const retryFirst = await queue.claim('worker-c', 1_000);
+  assert.equal(retryFirst?.id, retryJob.id);
+  const retried = await queue.fail(
+    retryJob.id,
+    { owner: retryFirst?.leaseOwner ?? '', generation: retryFirst?.leaseGeneration ?? 0 },
+    'retryable failure',
+    true,
+  );
+  assert.equal(retried?.status, 'queued');
+  assert.equal(retried?.leaseOwner, undefined);
+  const retrySecond = await queue.claim('worker-d', 1_000);
+  assert.equal(retrySecond?.leaseGeneration, (retryFirst?.leaseGeneration ?? 0) + 1);
+  queue.close();
+});
+
+test('queue lease mutations use post-lock injected time for expiry fencing', async () => {
+  const mutationCases = [
+    {
+      name: 'heartbeat',
+      terminal: false,
+      invoke: (jobId: string, lease: { owner: string; generation: number }) => ({
+        method: 'heartbeat',
+        args: [jobId, lease, 1_000],
+      }),
+      expected: false,
+    },
+    {
+      name: 'complete',
+      terminal: false,
+      invoke: (jobId: string, lease: { owner: string; generation: number }) => ({
+        method: 'complete',
+        args: [jobId, lease, { outcome: 'PASS' }],
+      }),
+      expected: false,
+    },
+    {
+      name: 'fail',
+      terminal: false,
+      invoke: (jobId: string, lease: { owner: string; generation: number }) => ({
+        method: 'fail',
+        args: [jobId, lease, 'expired failure', false],
+      }),
+      expected: undefined,
+    },
+    {
+      name: 'acknowledgeFailure',
+      terminal: true,
+      invoke: (jobId: string, lease: { owner: string; generation: number }) => ({
+        method: 'acknowledgeFailure',
+        args: [jobId, lease],
+      }),
+      expected: false,
+    },
+    {
+      name: 'releaseFailure',
+      terminal: true,
+      invoke: (jobId: string, lease: { owner: string; generation: number }) => ({
+        method: 'releaseFailure',
+        args: [jobId, lease],
+      }),
+      expected: false,
+    },
+  ] as const;
+  for (const [index, mutation] of mutationCases.entries()) {
+    const directory = await mkdtemp(join(process.cwd(), 'work', `queue-lock-${mutation.name}-`));
+    const filename = join(directory, 'queue.sqlite');
+    const clock = new SharedArrayBuffer(8);
+    const clockView = new BigInt64Array(clock);
+    clockView[0] = BigInt(Date.parse('2026-01-01T00:00:00.000Z'));
+    const queue = new SqliteQueue(filename, () => new Date(Number(Atomics.load(clockView, 0))));
+    try {
+      const job = await queue.enqueue(
+        {
+          repository: 'octo/example',
+          pullRequest: 200 + index,
+          baseSha,
+          headSha: `${(index + 1).toString(16).padStart(2, '0')}${'d'.repeat(38)}`,
+          reason: 'pull_request',
+        },
+        mutation.terminal ? 1 : 3,
+      );
+      const claimed = await queue.claim(`lock-worker-${index}`, 1_000);
+      assert.equal(claimed?.id, job.id);
+      const lease = {
+        owner: claimed?.leaseOwner ?? '',
+        generation: claimed?.leaseGeneration ?? 0,
+      };
+      if (mutation.terminal) {
+        const failed = await queue.fail(job.id, lease, 'terminal failure', false);
+        assert.equal(failed?.status, 'failed');
+      }
+      const call = mutation.invoke(job.id, lease);
+      const result = await runQueueCallBehindImmediateLock(filename, clock, call.method, call.args);
+      assert.deepEqual(result, mutation.expected);
+      const row = (await queue.list()).find((item) => item.id === job.id);
+      assert.equal(row?.status, mutation.terminal ? 'failed' : 'running');
+    } finally {
+      queue.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  const directory = await mkdtemp(join(process.cwd(), 'work', 'queue-lock-claim-'));
+  const filename = join(directory, 'queue.sqlite');
+  const clock = new SharedArrayBuffer(8);
+  const clockView = new BigInt64Array(clock);
+  clockView[0] = BigInt(Date.parse('2026-01-01T00:00:00.000Z'));
+  const queue = new SqliteQueue(filename, () => new Date(Number(Atomics.load(clockView, 0))));
+  try {
+    const job = await queue.enqueue({
+      repository: 'octo/example',
+      pullRequest: 300,
+      baseSha,
+      headSha: 'e'.repeat(40),
+      reason: 'pull_request',
+    });
+    const first = await queue.claim('claim-first', 1_000);
+    assert.equal(first?.id, job.id);
+    const result = (await runQueueCallBehindImmediateLock(filename, clock, 'claim', [
+      'claim-second',
+      1_000,
+    ])) as { id: string; attempts: number; leaseGeneration: number; leaseOwner?: string };
+    assert.equal(result.id, job.id);
+    assert.equal(result.attempts, 2);
+    assert.equal(result.leaseGeneration, 2);
+    assert.equal(result.leaseOwner, 'claim-second');
+  } finally {
+    queue.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('idle reaper uses a bounded cursor and eventually retries failed cleanup', async () => {
+  const queue = new SqliteQueue(':memory:');
+  const jobs = [];
+  for (let index = 0; index < 17; index += 1) {
+    const job = await queue.enqueue({
+      repository: 'octo/example',
+      pullRequest: 100 + index,
+      baseSha,
+      headSha: `${index.toString(16).padStart(2, '0')}${'c'.repeat(38)}`,
+      reason: 'pull_request',
+    });
+    const claimed = await queue.claim(`reaper-${index}`, 1_000);
+    assert.equal(claimed?.id, job.id);
+    assert.equal(
+      await queue.complete(
+        job.id,
+        { owner: claimed?.leaseOwner ?? '', generation: claimed?.leaseGeneration ?? 0 },
+        { outcome: 'PASS' },
+      ),
+      true,
+    );
+    jobs.push(job);
+  }
+  const outputRoot = await mkdtemp(join(process.cwd(), 'work', 'reaper-cursor-'));
+  const permanentJobId = jobs[0]?.id;
+  const attempts: string[] = [];
+  for (const job of jobs) {
+    await mkdir(join(outputRoot, job.id, 'attempts', `1-${randomUUID()}`, 'sources'), {
+      recursive: true,
+    });
+  }
+  queue.list = async () => {
+    throw new Error('reaper must use keyset cleanup candidates');
+  };
+  const worker = new PatchProofWorker({
+    queue,
+    source: new FixtureSourceAdapter(),
+    store: new MemoryStateStore(),
+    github: publicationGithub([]),
+    outputRoot,
+    workerId: 'reaper-worker',
+    removeSources: async (quarantinePath) => {
+      const jobId = basename(dirname(dirname(dirname(quarantinePath))));
+      attempts.push(jobId);
+      if (jobId === permanentJobId) throw new Error('permanent cleanup failure');
+      await rm(quarantinePath, { recursive: true, force: true });
+    },
+  });
+  try {
+    for (let pass = 0; pass < 3; pass += 1) {
+      const before = attempts.length;
+      assert.equal((await worker.runOnce()).status, 'idle');
+      assert.equal(attempts.length - before <= 8, true);
+    }
+    assert.equal(new Set(attempts).size, 17);
+    assert.equal(attempts.filter((jobId) => jobId === permanentJobId).length, 1);
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+    queue.close();
+  }
 });
 
 test('publication failure retries with verified evidence and no generated sources', async () => {
@@ -631,6 +988,113 @@ test('explicit heartbeat loss cancels without publication and keeps evidence', a
     assert.equal(await pathExists(join(outputRoot, job.id, 'sources')), false);
     assert.equal((await verifyEvidenceBundle(result.bundlePath as string)).valid, true);
     assert.deepEqual(calls, []);
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+    queue.close();
+  }
+});
+
+test('heartbeat loss latch does not restore ownership after a later success', async () => {
+  const queue = new SqliteQueue(':memory:');
+  const job = await enqueueWorkerJob(queue);
+  const calls: string[] = [];
+  const originalHeartbeat = queue.heartbeat.bind(queue);
+  let heartbeatCalls = 0;
+  queue.heartbeat = async (jobId, lease, leaseMs) => {
+    heartbeatCalls += 1;
+    if (heartbeatCalls === 1) return false;
+    return originalHeartbeat(jobId, lease, leaseMs);
+  };
+  const outputRoot = await mkdtemp(join(process.cwd(), 'work', 'worker-heartbeat-latch-'));
+  try {
+    const worker = new PatchProofWorker({
+      queue,
+      source: new FixtureSourceAdapter(),
+      store: new MemoryStateStore(),
+      github: publicationGithub(calls),
+      outputRoot,
+      workerId: 'worker-heartbeat-latch',
+      leaseMs: 1_000,
+      backendOverride: 'local',
+      allowUnsafeLocal: true,
+      executeScenario: async (input) => {
+        await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 500));
+        return runTwoRevisions({
+          config: input.configResult.config,
+          basePath: input.basePath,
+          headPath: input.headPath,
+          backendOverride: 'local',
+          allowUnsafeLocal: true,
+          trustedConfig: true,
+        });
+      },
+    });
+    const result = await worker.runOnce();
+    assert.equal(result.status, 'cancelled');
+    assert.equal(heartbeatCalls, 1);
+    assert.deepEqual(calls, []);
+    assert.equal((await queue.list()).find((item) => item.id === job.id)?.status, 'running');
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+    queue.close();
+  }
+});
+
+test('overlapping runOnce calls serialize and stop leaves the waiter idle', async () => {
+  const queue = new SqliteQueue(':memory:');
+  const firstJob = await enqueueWorkerJob(queue);
+  const secondJob = await queue.enqueue({
+    repository: 'octo/example',
+    pullRequest: 8,
+    baseSha,
+    headSha: 'c'.repeat(40),
+    reason: 'pull_request',
+  });
+  const started = new Deferred();
+  const release = new Deferred();
+  const calls: string[] = [];
+  const outputRoot = await mkdtemp(join(process.cwd(), 'work', 'worker-run-once-mutex-'));
+  try {
+    const worker = new PatchProofWorker({
+      queue,
+      source: new FixtureSourceAdapter(),
+      store: new MemoryStateStore(),
+      github: publicationGithub(calls),
+      outputRoot,
+      workerId: 'worker-run-once-mutex',
+      leaseMs: 1_000,
+      backendOverride: 'local',
+      allowUnsafeLocal: true,
+      executeScenario: async (input) => {
+        assert.equal(input.job.id, firstJob.id);
+        started.resolve();
+        await release.promise;
+        return runTwoRevisions({
+          config: input.configResult.config,
+          basePath: input.basePath,
+          headPath: input.headPath,
+          backendOverride: 'local',
+          allowUnsafeLocal: true,
+          trustedConfig: true,
+        });
+      },
+    });
+    const firstRun = worker.runOnce();
+    await started.promise;
+    const secondRun = worker.runOnce();
+    const statesWhileBlocked = await queue.list();
+    assert.equal(statesWhileBlocked.find((job) => job.id === firstJob.id)?.status, 'running');
+    assert.equal(statesWhileBlocked.find((job) => job.id === secondJob.id)?.status, 'queued');
+    worker.stop();
+    release.resolve();
+    const firstResult = await firstRun;
+    const secondResult = await secondRun;
+    assert.equal(firstResult.status, 'cancelled');
+    assert.equal(secondResult.status, 'idle');
+    assert.deepEqual(calls, []);
+    const finalStates = await queue.list();
+    assert.equal(finalStates.find((job) => job.id === firstJob.id)?.status, 'running');
+    assert.equal(finalStates.find((job) => job.id === secondJob.id)?.status, 'queued');
   } finally {
     await rm(outputRoot, { recursive: true, force: true });
     queue.close();

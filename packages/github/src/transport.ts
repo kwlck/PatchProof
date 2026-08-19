@@ -1,5 +1,9 @@
 import type { CheckRunPayload, PullRequestCommentPayload } from './format.js';
 
+export interface GitHubMutationOptions {
+  signal?: AbortSignal;
+}
+
 export interface PullRequestSnapshot {
   number: number;
   baseSha: string;
@@ -15,17 +19,25 @@ export interface GitHubTransport {
     repository: string,
     headSha: string,
     payload: CheckRunPayload,
+    options?: GitHubMutationOptions,
   ): Promise<{ id: number }>;
-  updateCheck(repository: string, checkId: number, payload: CheckRunPayload): Promise<void>;
+  updateCheck(
+    repository: string,
+    checkId: number,
+    payload: CheckRunPayload,
+    options?: GitHubMutationOptions,
+  ): Promise<void>;
   createComment(
     repository: string,
     issueNumber: number,
     payload: PullRequestCommentPayload,
+    options?: GitHubMutationOptions,
   ): Promise<{ id: number; body: string }>;
   updateComment(
     repository: string,
     commentId: number,
     payload: PullRequestCommentPayload,
+    options?: GitHubMutationOptions,
   ): Promise<void>;
 }
 

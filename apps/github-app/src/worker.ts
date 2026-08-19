@@ -9,8 +9,8 @@ import {
 import { writeEvidenceBundle } from '@patchproof/cli';
 import { runTwoRevisions, type PolicyDeniedRun, type TwoRevisionRun } from '@patchproof/runner';
 import type { GitHubTransport, ManagedStateStore } from '@patchproof/github';
-import { publishRunFailure, publishRunResult } from './publisher.js';
-import type { QueueJob, RunQueue } from './queue.js';
+import { publishRunFailure, publishRunResult, type PublicationFence } from './publisher.js';
+import type { QueueCleanupCursor, QueueJob, QueueLease, RunQueue } from './queue.js';
 import type { SourceAdapter } from './source.js';
 
 export interface WorkerRunInput {
@@ -56,6 +56,8 @@ const MAX_REAPER_JOBS = 8;
 const OWNER_UUID_LENGTH = 36;
 const OWNER_SEPARATOR_LENGTH = 1;
 const MAX_QUEUE_OWNER_LENGTH = 128;
+
+const LEASE_LOST_ERROR = 'Queue job was cancelled or superseded before publication';
 
 interface OutputRootPaths {
   configuredRoot: string;
@@ -122,6 +124,80 @@ class SourceCleanupError extends WorkerExecutionError {
       cause,
     });
     this.name = 'SourceCleanupError';
+  }
+}
+
+class LeaseLostError extends Error {
+  public constructor(cause?: unknown) {
+    super(LEASE_LOST_ERROR, { cause });
+    this.name = 'LeaseLostError';
+  }
+}
+
+class WorkerLeaseFence implements PublicationFence {
+  public readonly controller = new AbortController();
+  private lostLatch = false;
+  private stopped = false;
+  private renewal: Promise<void> = Promise.resolve();
+  private readonly timer: NodeJS.Timeout;
+
+  public constructor(
+    private readonly queue: RunQueue,
+    private readonly jobId: string,
+    private readonly lease: QueueLease,
+    private readonly leaseMs: number,
+  ) {
+    const cadence = Math.max(100, Math.floor(leaseMs / 3));
+    this.timer = setInterval(() => {
+      void this.renew().catch(() => undefined);
+    }, cadence);
+  }
+
+  public get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  public get lost(): boolean {
+    return this.lostLatch;
+  }
+
+  private lose(cause?: unknown): void {
+    if (this.lostLatch) return;
+    this.lostLatch = true;
+    this.controller.abort(new LeaseLostError(cause));
+  }
+
+  private queueRenewal(): Promise<void> {
+    const next = this.renewal.then(async () => {
+      if (this.stopped || this.lostLatch) return;
+      try {
+        const renewed = await this.queue.heartbeat(this.jobId, this.lease, this.leaseMs);
+        if (!renewed) this.lose();
+      } catch (error) {
+        this.lose(error);
+      }
+    });
+    this.renewal = next.catch(() => undefined);
+    return next;
+  }
+
+  private async renew(): Promise<void> {
+    await this.queueRenewal();
+  }
+
+  public async assertOwned(): Promise<void> {
+    if (this.lostLatch || this.stopped) throw new LeaseLostError();
+    await this.renew();
+    if (this.lostLatch || this.stopped) throw new LeaseLostError();
+  }
+
+  public async stop(): Promise<void> {
+    if (!this.stopped) {
+      this.stopped = true;
+      clearInterval(this.timer);
+      this.lose();
+    }
+    await this.renewal;
   }
 }
 
@@ -215,8 +291,10 @@ function retryableWorkerError(error: unknown): boolean {
  */
 export class PatchProofWorker {
   private readonly leaseMs: number;
-  private readonly cleanedTerminalJobs = new Set<string>();
   private stopping = false;
+  private activeFence: WorkerLeaseFence | undefined;
+  private reaperCursor: QueueCleanupCursor | undefined;
+  private runOnceTail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly dependencies: PatchProofWorkerDependencies) {
     this.leaseMs = dependencies.leaseMs ?? 60_000;
@@ -224,6 +302,7 @@ export class PatchProofWorker {
 
   public stop(): void {
     this.stopping = true;
+    void this.activeFence?.stop();
   }
 
   private async resolveOutputRoot(create: boolean): Promise<OutputRootPaths | undefined> {
@@ -655,40 +734,75 @@ export class PatchProofWorker {
   }
 
   private async reaperAtIdle(): Promise<void> {
-    let jobs: QueueJob[];
+    let candidates: QueueCleanupCursor[];
     try {
-      jobs = await this.dependencies.queue.list();
+      candidates = await this.dependencies.queue.listTerminalCleanupCandidates(
+        this.reaperCursor,
+        MAX_REAPER_JOBS,
+      );
+      if (candidates.length === 0 && this.reaperCursor !== undefined) {
+        candidates = await this.dependencies.queue.listTerminalCleanupCandidates(
+          undefined,
+          MAX_REAPER_JOBS,
+        );
+      }
     } catch {
       return;
     }
-    const candidates = jobs
-      .filter(
-        (job) =>
-          (job.status === 'succeeded' || job.status === 'cancelled') &&
-          job.leaseOwner === undefined,
-      )
-      .slice(0, MAX_REAPER_JOBS);
-    for (const job of candidates) {
-      if (this.cleanedTerminalJobs.has(job.id)) continue;
+    if (candidates.length === 0) return;
+    for (const candidate of candidates) {
       try {
-        await this.cleanupTerminalAttempts(job.id);
-        this.cleanedTerminalJobs.add(job.id);
+        await this.cleanupTerminalAttempts(candidate.id);
       } catch {
         // Idle reaping is best effort. A failed terminal claim remains authoritative.
+      } finally {
+        this.reaperCursor = candidate;
       }
     }
   }
 
-  private async runTerminalClaim(claimed: QueueJob): Promise<WorkerRunResult> {
+  private async releaseTerminalLease(
+    claimed: QueueJob,
+    lease: QueueLease,
+    fence: WorkerLeaseFence,
+  ): Promise<void> {
+    if (fence.lost) return;
+    await fence.assertOwned().catch(() => undefined);
+    if (fence.lost) return;
+    await this.dependencies.queue.releaseFailure(claimed.id, lease);
+  }
+
+  private async runTerminalClaim(
+    claimed: QueueJob,
+    lease: QueueLease,
+    fence: WorkerLeaseFence,
+  ): Promise<WorkerRunResult> {
     const rootToken = resolve(this.dependencies.outputRoot);
     const baseTokens = [rootToken, join(rootToken, claimed.id)];
+    if (fence.lost)
+      return {
+        status: 'cancelled',
+        job: claimed,
+        error: LEASE_LOST_ERROR,
+      };
     try {
-      if (!this.cleanedTerminalJobs.has(claimed.id)) {
-        await this.cleanupTerminalAttempts(claimed.id);
-      }
+      await this.cleanupTerminalAttempts(claimed.id);
     } catch {
+      if (fence.lost)
+        return {
+          status: 'cancelled',
+          job: claimed,
+          error: LEASE_LOST_ERROR,
+        };
+      await this.releaseTerminalLease(claimed, lease, fence);
       return { status: 'failed', job: claimed, error: SOURCE_CLEANUP_ERROR };
     }
+    if (fence.lost)
+      return {
+        status: 'cancelled',
+        job: claimed,
+        error: LEASE_LOST_ERROR,
+      };
     const resolved = await this.resolveJobRoot(claimed.id, false).catch(() => undefined);
     const pathTokens = [
       ...baseTokens,
@@ -697,6 +811,7 @@ export class PatchProofWorker {
         : [resolved.outputRoot.realRoot, resolved.jobRoot, join(resolved.jobRoot, 'attempts')]),
     ];
     try {
+      await fence.assertOwned();
       await publishRunFailure(
         {
           repository: claimed.repository,
@@ -709,10 +824,30 @@ export class PatchProofWorker {
         },
         this.dependencies.store,
         this.dependencies.github,
+        fence,
       );
-      const acknowledged = await this.dependencies.queue.acknowledgeFailure(claimed.id);
-      if (acknowledged) this.cleanedTerminalJobs.add(claimed.id);
+      await fence.assertOwned();
+      if (fence.lost)
+        return {
+          status: 'cancelled',
+          job: claimed,
+          error: LEASE_LOST_ERROR,
+        };
+      const acknowledged = await this.dependencies.queue.acknowledgeFailure(claimed.id, lease);
+      if (!acknowledged)
+        return {
+          status: 'cancelled',
+          job: claimed,
+          error: LEASE_LOST_ERROR,
+        };
     } catch (error) {
+      if (fence.lost)
+        return {
+          status: 'cancelled',
+          job: claimed,
+          error: LEASE_LOST_ERROR,
+        };
+      await this.releaseTerminalLease(claimed, lease, fence);
       return {
         status: 'failed',
         job: claimed,
@@ -729,7 +864,7 @@ export class PatchProofWorker {
     };
   }
 
-  public async runOnce(): Promise<WorkerRunResult> {
+  private async runOnceExclusive(): Promise<WorkerRunResult> {
     if (this.stopping) return { status: 'idle' };
     const owner = createLeaseOwner(this.dependencies.workerId);
     const claimed = await this.dependencies.queue.claim(owner, this.leaseMs);
@@ -737,27 +872,22 @@ export class PatchProofWorker {
       await this.reaperAtIdle();
       return { status: 'idle' };
     }
-    let heartbeatTimer: NodeJS.Timeout | undefined;
+    if (this.stopping) return { status: 'cancelled', job: claimed };
+    if (claimed.leaseOwner === undefined) return { status: 'cancelled', job: claimed };
+    const lease: QueueLease = {
+      owner: claimed.leaseOwner,
+      generation: claimed.leaseGeneration,
+    };
+    const fence = new WorkerLeaseFence(this.dependencies.queue, claimed.id, lease, this.leaseMs);
+    this.activeFence = fence;
     let attemptPaths: AttemptPaths | undefined;
     let evidencePath: string | undefined;
     try {
-      heartbeatTimer = setInterval(
-        () => {
-          void this.dependencies.queue
-            .heartbeat(claimed.id, owner, this.leaseMs)
-            .catch(() => false);
-        },
-        Math.max(1_000, Math.floor(this.leaseMs / 3)),
-      );
-      if (claimed.status === 'failed') return await this.runTerminalClaim(claimed);
+      if (claimed.status === 'failed') return await this.runTerminalClaim(claimed, lease, fence);
       const result = await this.execute(claimed);
       attemptPaths = result.paths;
       evidencePath = result.bundlePath;
-      if (!(await this.dependencies.queue.heartbeat(claimed.id, owner, this.leaseMs)))
-        throw new WorkerExecutionError('Queue job was cancelled or superseded before publication', {
-          evidencePath,
-          pathTokens: result.paths.pathTokens,
-        });
+      await fence.assertOwned();
       await publishRunResult(
         {
           repository: claimed.repository,
@@ -767,14 +897,30 @@ export class PatchProofWorker {
         },
         this.dependencies.store,
         this.dependencies.github,
+        fence,
       );
-      const completed = await this.dependencies.queue.complete(claimed.id, owner, {
+      await fence.assertOwned();
+      if (fence.lost)
+        return {
+          status: 'cancelled',
+          job: claimed,
+          ...result,
+          error: LEASE_LOST_ERROR,
+        };
+      const completed = await this.dependencies.queue.complete(claimed.id, lease, {
         evidencePath: result.bundlePath,
         outcome: result.outcome,
       });
       if (!completed) return { status: 'cancelled', job: claimed, ...result };
       return { status: 'completed', job: claimed, ...result };
     } catch (error) {
+      if (fence.lost || this.stopping)
+        return {
+          status: 'cancelled',
+          job: claimed,
+          ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
+          error: LEASE_LOST_ERROR,
+        };
       const executionError = error instanceof WorkerExecutionError ? error : undefined;
       if (executionError?.evidencePath !== undefined) evidencePath = executionError.evidencePath;
       const pathTokens = executionError?.pathTokens ??
@@ -782,35 +928,18 @@ export class PatchProofWorker {
       const message =
         executionError?.message ?? sanitizeWorkerText(errorMessage(error), pathTokens);
       const retryable = retryableWorkerError(error);
-      const updated = await this.dependencies.queue.fail(claimed.id, owner, message, retryable);
-      if (updated?.status === 'failed' && executionError?.cleanupPending !== true) {
-        try {
-          await this.cleanupTerminalAttempts(updated.id);
-        } catch {
-          return {
-            status: 'failed',
-            job: updated,
-            error: SOURCE_CLEANUP_ERROR,
-            ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
-          };
-        }
-        try {
-          await publishRunFailure(
-            {
-              repository: claimed.repository,
-              pullRequest: claimed.pullRequest,
-              headSha: claimed.headSha,
-              error: message,
-            },
-            this.dependencies.store,
-            this.dependencies.github,
-          );
-          const acknowledged = await this.dependencies.queue.acknowledgeFailure(updated.id);
-          if (acknowledged) this.cleanedTerminalJobs.add(updated.id);
-        } catch {
-          // The durable queue remains failed when the GitHub transport is unavailable.
-        }
+      try {
+        await fence.assertOwned();
+        if (fence.lost) throw new LeaseLostError();
+      } catch {
+        return {
+          status: 'cancelled',
+          job: claimed,
+          error: LEASE_LOST_ERROR,
+          ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
+        };
       }
+      const updated = await this.dependencies.queue.fail(claimed.id, lease, message, retryable);
       if (updated?.status === 'queued')
         return {
           status: 'retried',
@@ -825,6 +954,32 @@ export class PatchProofWorker {
           error: message,
           ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
         };
+      if (updated.status === 'failed') {
+        if (executionError?.cleanupPending === true) {
+          if (fence.lost)
+            return {
+              status: 'cancelled',
+              job: claimed,
+              error: LEASE_LOST_ERROR,
+              ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
+            };
+          await this.releaseTerminalLease(updated, lease, fence);
+          if (fence.lost)
+            return {
+              status: 'cancelled',
+              job: claimed,
+              error: LEASE_LOST_ERROR,
+              ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
+            };
+          return {
+            status: 'failed',
+            job: updated,
+            error: SOURCE_CLEANUP_ERROR,
+            ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
+          };
+        }
+        return await this.runTerminalClaim(updated, lease, fence);
+      }
       return {
         status: 'failed',
         job: updated,
@@ -832,8 +987,28 @@ export class PatchProofWorker {
         ...(evidencePath === undefined ? {} : { bundlePath: evidencePath }),
       };
     } finally {
-      if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+      await fence.stop();
+      if (this.activeFence === fence) this.activeFence = undefined;
     }
+  }
+
+  public runOnce(): Promise<WorkerRunResult> {
+    const previous = this.runOnceTail;
+    let release!: () => void;
+    const turn = new Promise<void>((resolveTurn) => {
+      release = resolveTurn;
+    });
+    this.runOnceTail = previous.then(
+      () => turn,
+      () => turn,
+    );
+    return previous.then(
+      () => this.runOnceExclusive().finally(release),
+      (error) => {
+        release();
+        throw error;
+      },
+    );
   }
 
   public async runUntilIdle(): Promise<WorkerRunResult[]> {
@@ -842,6 +1017,21 @@ export class PatchProofWorker {
       const result = await this.runOnce();
       results.push(result);
       if (result.status === 'idle') break;
+      if (result.status === 'failed' && result.job?.status === 'failed') {
+        let current: QueueJob[];
+        try {
+          current = await this.dependencies.queue.list();
+        } catch {
+          break;
+        }
+        const unresolved = current.find((job) => job.id === result.job?.id);
+        if (
+          unresolved?.status === 'failed' &&
+          !unresolved.failureNotified &&
+          unresolved.leaseOwner === undefined
+        )
+          break;
+      }
     }
     return results;
   }
