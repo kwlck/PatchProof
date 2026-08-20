@@ -1153,7 +1153,8 @@ async function inspectLocalImage(
 ) {
   if (!IMAGE_TAG_PATTERN.test(tag) && !IMAGE_ID_PATTERN.test(tag))
     fail('validation', 'Validation Docker image identity is invalid');
-  const result = await command('docker', buildValidationImageInspectCommand(tag), {
+  const inspectCommand = buildValidationImageInspectCommand(tag);
+  const result = await command(inspectCommand[0], inspectCommand.slice(1), {
     label: 'Docker image inspection',
     diagnosticStage,
   });
