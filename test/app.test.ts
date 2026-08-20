@@ -2,7 +2,10 @@ import { generateKeyPairSync, verify as verifySignature } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import { test } from 'node:test';
+import https from 'node:https';
 import { Worker } from 'node:worker_threads';
 import assert from 'node:assert/strict';
 import { handleWebhook } from '../apps/github-app/dist/webhook.js';
@@ -12,6 +15,102 @@ import { SqliteStateStore } from '../apps/github-app/dist/sqlite.js';
 import { publishRunFailure, publishRunResult } from '../apps/github-app/dist/publisher.js';
 import { computeWebhookSignature, MemoryStateStore } from '@patchproof/github';
 import { createIntegrity, type EvidenceBundle } from '@patchproof/core';
+
+interface MockHttpsResponse {
+  readonly status: number;
+  readonly body?: string;
+  readonly headers?: Record<string, string | string[]>;
+  readonly stalled?: boolean;
+  readonly onDestroy?: () => void;
+}
+
+interface MockHttpsOptions {
+  readonly protocol?: string;
+  readonly hostname?: string;
+  readonly port?: number;
+  readonly servername?: string;
+  readonly method?: string;
+  readonly path?: string;
+  readonly headers?: Record<string, string>;
+  readonly signal?: AbortSignal;
+}
+
+function installMockHttpsRequest(
+  handler: (
+    options: MockHttpsOptions,
+    body: string,
+  ) => MockHttpsResponse | Promise<MockHttpsResponse>,
+): { requests: Array<{ options: MockHttpsOptions; body: string }>; restore: () => void } {
+  const originalRequest = https.request;
+  const requests: Array<{ options: MockHttpsOptions; body: string }> = [];
+  https.request = ((options: unknown, callback?: (response: unknown) => void) => {
+    const request = new EventEmitter() as EventEmitter & {
+      write: (chunk: string) => boolean;
+      end: () => void;
+    };
+    let body = '';
+    let requestSettled = false;
+    let response: Readable | undefined;
+    const signal = (options as MockHttpsOptions).signal;
+    const cleanup = (): void => {
+      signal?.removeEventListener('abort', abort);
+    };
+    const abort = (): void => {
+      if (response !== undefined) {
+        response.emit('aborted');
+        response.destroy(new DOMException('The operation was aborted', 'AbortError'));
+        return;
+      }
+      if (requestSettled) return;
+      requestSettled = true;
+      request.emit('error', new DOMException('The operation was aborted', 'AbortError'));
+    };
+    request.write = (chunk: string): boolean => {
+      body += chunk;
+      return true;
+    };
+    request.end = (): void => {
+      const recorded = { options: options as MockHttpsOptions, body };
+      requests.push(recorded);
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      signal?.addEventListener('abort', abort, { once: true });
+      void Promise.resolve(handler(recorded.options, recorded.body)).then(
+        (responseSpec) => {
+          if (requestSettled) return;
+          requestSettled = true;
+          response = responseSpec.stalled
+            ? new Readable({ read: () => {} })
+            : Readable.from(
+                responseSpec.body === undefined ? [] : [Buffer.from(responseSpec.body)],
+              );
+          const originalDestroy = response.destroy.bind(response);
+          response.destroy = ((error?: Error | null) => {
+            responseSpec.onDestroy?.();
+            return originalDestroy(error);
+          }) as typeof response.destroy;
+          Object.assign(response, {
+            statusCode: responseSpec.status,
+            headers: responseSpec.headers ?? {},
+          });
+          response.once('end', cleanup);
+          response.once('close', cleanup);
+          callback?.(response);
+        },
+        (error: unknown) => {
+          if (requestSettled) return;
+          requestSettled = true;
+          cleanup();
+          request.emit('error', error);
+        },
+      );
+    };
+    return request as unknown as ReturnType<typeof https.request>;
+  }) as typeof https.request;
+  return { requests, restore: () => (https.request = originalRequest) };
+}
 
 const testPublicationFence = {
   signal: new AbortController().signal,
@@ -302,23 +401,19 @@ test('issue_comment fetches refs from GitHub after authorization and handles API
 test('GitHub transport fetches and validates pull request refs through the least-privilege GET path', async () => {
   let invalid = false;
   let headRepository: string | null = 'octo/example';
-  const originalFetch = globalThis.fetch;
-  const requestedUrls: string[] = [];
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    requestedUrls.push(url.toString());
-    assert.equal(url.origin, 'https://api.github.com');
-    assert.equal(url.pathname, '/repos/octo/example/pulls/7');
-    assert.equal(url.search, '');
-    assert.equal(url.hash, '');
-    assert.equal(init?.method, 'GET');
-    assert.equal(init?.redirect, 'error');
-    assert.equal(
-      init?.headers && new Headers(init.headers).get('authorization'),
-      'Bearer test-token',
-    );
-    return new Response(
-      JSON.stringify({
+  const requestedPaths: string[] = [];
+  const mock = installMockHttpsRequest((options) => {
+    requestedPaths.push(options.path ?? '');
+    assert.equal(options.protocol, 'https:');
+    assert.equal(options.hostname, 'api.github.com');
+    assert.equal(options.port, 443);
+    assert.equal(options.servername, 'api.github.com');
+    assert.equal(options.path, '/repos/octo/example/pulls/7');
+    assert.equal(options.method, 'GET');
+    assert.equal(options.headers?.Authorization, 'Bearer test-token');
+    return {
+      status: 200,
+      body: JSON.stringify({
         number: 7,
         state: 'open',
         base: { sha: invalid ? 'short' : 'a'.repeat(40) },
@@ -327,9 +422,9 @@ test('GitHub transport fetches and validates pull request refs through the least
           repo: headRepository === null ? null : { full_name: headRepository },
         },
       }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    );
-  };
+      headers: { 'content-type': 'application/json' },
+    };
+  });
   const transport = new GitHubApiTransport('test-token');
   try {
     assert.deepEqual(await transport.getPullRequest('octo/example', 7), {
@@ -360,34 +455,29 @@ test('GitHub transport fetches and validates pull request refs through the least
       () => transport.getPullRequest('octo/example', 7),
       /invalid pull request refs/u,
     );
-    assert.deepEqual(requestedUrls, [
-      'https://api.github.com/repos/octo/example/pulls/7',
-      'https://api.github.com/repos/octo/example/pulls/7',
-      'https://api.github.com/repos/octo/example/pulls/7',
-      'https://api.github.com/repos/octo/example/pulls/7',
+    assert.deepEqual(requestedPaths, [
+      '/repos/octo/example/pulls/7',
+      '/repos/octo/example/pulls/7',
+      '/repos/octo/example/pulls/7',
+      '/repos/octo/example/pulls/7',
     ]);
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 
 test('GitHub mutation transport forwards and honors AbortSignal', async () => {
-  const originalFetch = globalThis.fetch;
-  const observed: Array<AbortSignal | undefined> = [];
-  const observedUrls: string[] = [];
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    observedUrls.push(url.toString());
-    assert.equal(url.origin, 'https://api.github.com');
-    assert.equal(url.hash, '');
-    assert.equal(init?.redirect, 'error');
-    observed.push(init?.signal);
-    if (init?.signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-    return new Response(JSON.stringify({ id: 17, body: 'managed' }), {
+  const mock = installMockHttpsRequest((options) => {
+    assert.equal(options.protocol, 'https:');
+    assert.equal(options.hostname, 'api.github.com');
+    assert.equal(options.port, 443);
+    assert.equal(options.servername, 'api.github.com');
+    return {
       status: 200,
+      body: JSON.stringify({ id: 17, body: 'managed' }),
       headers: { 'content-type': 'application/json' },
-    });
-  };
+    };
+  });
   const transport = new GitHubApiTransport('test-token');
   const controller = new AbortController();
   const payload = {
@@ -403,7 +493,7 @@ test('GitHub mutation transport forwards and honors AbortSignal', async () => {
       }),
       { id: 17 },
     );
-    assert.equal(observed[0], controller.signal);
+    assert.equal(mock.requests[0]?.options.signal, controller.signal);
     controller.abort();
     await assert.rejects(
       () =>
@@ -415,45 +505,45 @@ test('GitHub mutation transport forwards and honors AbortSignal', async () => {
         ),
       /aborted/u,
     );
-    assert.equal(observed[1], controller.signal);
-    assert.deepEqual(observedUrls, [
-      'https://api.github.com/repos/octo/example/check-runs',
-      'https://api.github.com/repos/octo/example/issues/7/comments',
-    ]);
+    assert.equal(mock.requests[1]?.options.signal, controller.signal);
+    assert.deepEqual(
+      mock.requests.map(({ options }) => options.path),
+      ['/repos/octo/example/check-runs', '/repos/octo/example/issues/7/comments'],
+    );
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 
 test('GitHub transport ignores attacker API-base environment values and rejects redirects', async () => {
-  const originalFetch = globalThis.fetch;
   const previousApiBase = process.env.PATCHPROOF_GITHUB_API_BASE;
   process.env.PATCHPROOF_GITHUB_API_BASE = 'https://attacker.test';
-  const attemptedUrls: string[] = [];
-  const redirects = [
-    { status: 301, location: 'https://api.github.com/repos/octo/example/issues/7/comments' },
-    { status: 302, location: 'https://attacker.test/steal' },
-    { status: 307, location: 'https://api.github.com/repos/octo/example/issues/7/comments' },
-    { status: 308, location: 'https://attacker.test/steal' },
+  const locations = [
+    'https://api.github.com/repos/octo/example/issues/7/comments',
+    'https://attacker.test/steal',
+    '//attacker.test/steal',
+    '../steal',
   ];
+  const redirects = [301, 302, 303, 307, 308].flatMap((status) =>
+    locations.map((location) => ({ status, location })),
+  );
   let responseIndex = 0;
   const provider = {
     requiresInstallationId: false as const,
     appId: 123,
     getToken: async () => 'development-token',
   };
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    attemptedUrls.push(url.toString());
-    assert.equal(url.origin, 'https://api.github.com');
-    assert.equal(init?.redirect, 'error');
-    const redirect = redirects[responseIndex] ?? redirects.at(-1);
+  const mock = installMockHttpsRequest((options) => {
+    const redirect = redirects[responseIndex];
     assert.ok(redirect);
-    return new Response('', {
-      status: redirect.status,
-      headers: { location: redirect.location },
-    });
-  };
+    assert.equal(options.protocol, 'https:');
+    assert.equal(options.hostname, 'api.github.com');
+    assert.equal(options.port, 443);
+    assert.equal(options.servername, 'api.github.com');
+    assert.equal(options.method, 'POST');
+    assert.equal(options.path, '/repos/octo/example/issues/7/comments');
+    return { status: redirect.status, headers: { location: redirect.location } };
+  });
   try {
     const transport = new GitHubApiTransport(provider);
     for (const redirect of redirects) {
@@ -461,14 +551,201 @@ test('GitHub transport ignores attacker API-base environment values and rejects 
         () => transport.createComment('octo/example', 7, { body: 'managed' }),
         /request failed/u,
       );
-      assert.equal(attemptedUrls.length, redirects.indexOf(redirect) + 1);
+      assert.equal(mock.requests.length, redirects.indexOf(redirect) + 1);
       responseIndex += 1;
     }
-    assert.ok(attemptedUrls.every((url) => !url.startsWith('https://attacker.test')));
+    assert.equal(mock.requests.length, redirects.length);
+    assert.deepEqual(
+      mock.requests.map(({ options }) => ({
+        protocol: options.protocol,
+        hostname: options.hostname,
+        port: options.port,
+        servername: options.servername,
+        method: options.method,
+        path: options.path,
+      })),
+      redirects.map(() => ({
+        protocol: 'https:',
+        hostname: 'api.github.com',
+        port: 443,
+        servername: 'api.github.com',
+        method: 'POST',
+        path: '/repos/octo/example/issues/7/comments',
+      })),
+    );
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
     if (previousApiBase === undefined) delete process.env.PATCHPROOF_GITHUB_API_BASE;
     else process.env.PATCHPROOF_GITHUB_API_BASE = previousApiBase;
+  }
+});
+
+test('GitHub transport uses canonical finite routes for every endpoint family', async () => {
+  const owner = 'A' + 'b'.repeat(37) + '9';
+  const repository = 'r'.repeat(100);
+  const identity = `${owner}/${repository}`;
+  const headSha = 'a'.repeat(40);
+  const expectedPaths = [
+    `/repos/${owner}/${repository}/pulls/7`,
+    `/repos/${owner}/${repository}/check-runs`,
+    `/repos/${owner}/${repository}/check-runs/8`,
+    `/repos/${owner}/${repository}/issues/9/comments`,
+    `/repos/${owner}/${repository}/issues/comments/10`,
+    `/repos/${owner}/${repository}/commits/${headSha}/check-runs?check_name=PatchProof&filter=all&app_id=123&per_page=100&page=1`,
+    `/repos/${owner}/${repository}/issues/9/comments?per_page=100&page=1`,
+  ];
+  const mock = installMockHttpsRequest((options) => {
+    assert.equal(options.protocol, 'https:');
+    assert.equal(options.hostname, 'api.github.com');
+    assert.equal(options.port, 443);
+    assert.equal(options.servername, 'api.github.com');
+    assert.equal(options.headers?.Authorization, 'Bearer test-token');
+    assert.equal(options.headers?.['User-Agent'], 'PatchProof/0.1.0');
+    assert.equal('agent' in options, false);
+    assert.equal('lookup' in options, false);
+    assert.equal('socketPath' in options, false);
+    const path = options.path ?? '';
+    const pathname = new URL(`https://api.github.com${path}`).pathname;
+    if (pathname.endsWith('/pulls/7'))
+      return {
+        status: 200,
+        body: JSON.stringify({
+          number: 7,
+          state: 'open',
+          base: { sha: headSha, repo: { full_name: identity } },
+          head: { sha: headSha, repo: { full_name: identity } },
+        }),
+      };
+    if (pathname.endsWith('/check-runs') && options.method === 'GET')
+      return { status: 200, body: JSON.stringify({ total_count: 0, check_runs: [] }) };
+    if (pathname.includes('/comments') && options.method === 'GET')
+      return { status: 200, body: JSON.stringify([]) };
+    if (pathname.endsWith('/comments'))
+      return { status: 201, body: JSON.stringify({ id: 11, body: 'managed' }) };
+    return { status: options.method === 'POST' ? 201 : 200, body: JSON.stringify({ id: 12 }) };
+  });
+  const provider = {
+    requiresInstallationId: false as const,
+    appId: 123,
+    getToken: async () => 'test-token',
+  };
+  try {
+    const transport = new GitHubApiTransport(provider);
+    assert.deepEqual(await transport.getPullRequest(identity, 7), {
+      number: 7,
+      state: 'open',
+      baseSha: headSha,
+      headSha,
+      headRepository: identity,
+      fork: false,
+      repository: identity,
+    });
+    await transport.createCheck(identity, headSha, {
+      name: 'PatchProof',
+      status: 'completed',
+      conclusion: 'success',
+    });
+    await transport.updateCheck(identity, 8, {
+      name: 'PatchProof',
+      status: 'completed',
+      conclusion: 'success',
+    });
+    assert.deepEqual(await transport.createComment(identity, 9, { body: 'managed' }), {
+      id: 11,
+      body: 'managed',
+    });
+    await transport.updateComment(identity, 10, { body: 'managed' });
+    assert.equal(await transport.findManagedCheck(identity, 9, headSha), undefined);
+    assert.equal(await transport.findManagedComment(identity, 9), undefined);
+    assert.deepEqual(
+      mock.requests.map(({ options }) => ({ method: options.method, path: options.path })),
+      [
+        { method: 'GET', path: expectedPaths[0] },
+        { method: 'POST', path: expectedPaths[1] },
+        { method: 'PATCH', path: expectedPaths[2] },
+        { method: 'POST', path: expectedPaths[3] },
+        { method: 'PATCH', path: expectedPaths[4] },
+        { method: 'GET', path: expectedPaths[5] },
+        { method: 'GET', path: expectedPaths[6] },
+      ],
+    );
+  } finally {
+    mock.restore();
+  }
+});
+
+test('GitHub transport rejects hostile route identities, SHAs, and IDs before dispatch', async () => {
+  const mock = installMockHttpsRequest(() => ({
+    status: 200,
+    body: JSON.stringify({ id: 1, body: 'unexpected' }),
+  }));
+  const transport = new GitHubApiTransport('test-token');
+  const hostileRepositories = [
+    '',
+    '/repo',
+    'owner/',
+    'owner/repo/extra',
+    'owner\\repo',
+    'owner?repo',
+    'owner#repo',
+    'owner%2Frepo',
+    'owner repo',
+    'owner/репо',
+    '-owner/repo',
+    'owner-/repo',
+    '_owner/repo',
+    'owner/.',
+    'owner/..',
+    'a'.repeat(40) + '/repo',
+    'owner/' + 'r'.repeat(101),
+    'owner/repo\n',
+    'owner/repo\r\n',
+  ];
+  try {
+    for (const repository of hostileRepositories)
+      await assert.rejects(
+        () => transport.createComment(repository, 7, { body: 'managed' }),
+        /Repository/u,
+      );
+    for (const sha of [
+      'A'.repeat(40),
+      'a'.repeat(39),
+      'g'.repeat(40),
+      'a'.repeat(40) + '/',
+      'a'.repeat(40) + '?x',
+    ])
+      await assert.rejects(
+        () =>
+          transport.createCheck('owner/repo', sha, {
+            name: 'PatchProof',
+            status: 'in_progress',
+          }),
+        /SHA/u,
+      );
+    for (const id of [
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      await assert.rejects(
+        () => transport.createComment('owner/repo', id, { body: 'managed' }),
+        /invalid/u,
+      );
+      await assert.rejects(
+        () =>
+          transport.updateCheck('owner/repo', id, {
+            name: 'PatchProof',
+            status: 'in_progress',
+          }),
+        /invalid/u,
+      );
+    }
+    assert.equal(mock.requests.length, 0);
+  } finally {
+    mock.restore();
   }
 });
 
@@ -628,8 +905,81 @@ test('GitHub App authentication rejects hostile identities and token responses',
   }
 });
 
+test('GitHub transport keeps endpoint dispatch runtime-private', async () => {
+  const mock = installMockHttpsRequest(() => ({
+    status: 200,
+    body: JSON.stringify({ id: 1, body: 'unexpected' }),
+  }));
+  const transport = new GitHubApiTransport('test-token');
+  const runtime = transport as unknown as Record<string, unknown>;
+  const prototypeNames = Object.getOwnPropertyNames(Object.getPrototypeOf(transport));
+  try {
+    assert.equal(runtime.request, undefined);
+    assert.equal(runtime.requestWithMetadata, undefined);
+    assert.equal(Reflect.get(transport, '#request'), undefined);
+    assert.equal(prototypeNames.some((name) => name.includes('request')), false);
+    const forged = { method: 'GET', path: 'https://attacker.test/steal' };
+    assert.throws(
+      () => (runtime.request as (...args: unknown[]) => unknown)(forged),
+      TypeError,
+    );
+    assert.equal(mock.requests.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('GitHub transport destroys rejected bodies and aborts accepted stalled bodies', async () => {
+  const rejectedStatuses = [301, 302, 303, 307, 308, 500];
+  let requestIndex = 0;
+  let destroyed = 0;
+  const mock = installMockHttpsRequest(() => ({
+    status: rejectedStatuses[requestIndex++] ?? 500,
+    stalled: true,
+    onDestroy: () => {
+      destroyed += 1;
+    },
+  }));
+  const transport = new GitHubApiTransport('test-token');
+  try {
+    for (const status of rejectedStatuses)
+      await assert.rejects(
+        () => transport.createComment('owner/repo', 7, { body: 'managed' }),
+        new RegExp(String(status), 'u'),
+      );
+    assert.equal(mock.requests.length, rejectedStatuses.length);
+    assert.equal(destroyed, rejectedStatuses.length);
+  } finally {
+    mock.restore();
+  }
+
+  let acceptedDestroyed = 0;
+  const acceptedMock = installMockHttpsRequest(() => ({
+    status: 200,
+    stalled: true,
+    onDestroy: () => {
+      acceptedDestroyed += 1;
+    },
+  }));
+  const controller = new AbortController();
+  const acceptedTransport = new GitHubApiTransport('test-token', 1_000);
+  try {
+    const pending = acceptedTransport.createComment(
+      'owner/repo',
+      7,
+      { body: 'managed' },
+      { signal: controller.signal },
+    );
+    setTimeout(() => controller.abort(), 10);
+    await assert.rejects(pending, /aborted/u);
+    assert.equal(acceptedMock.requests.length, 1);
+    assert.equal(acceptedDestroyed, 1);
+  } finally {
+    acceptedMock.restore();
+  }
+});
+
 test('GitHub transport uses external_id and fails closed on spoofed managed comments', async () => {
-  const originalFetch = globalThis.fetch;
   const requests: Array<{ path: string; body?: Record<string, unknown> }> = [];
   const provider = {
     requiresInstallationId: false as const,
@@ -637,26 +987,26 @@ test('GitHub transport uses external_id and fails closed on spoofed managed comm
     getToken: async () => 'development-token',
   };
   let commentMode: 'spoofed' | 'owned' | 'invalid' = 'spoofed';
-  globalThis.fetch = async (input, init) => {
-    const path = new URL(String(input)).pathname;
-    const method = init?.method ?? 'GET';
+  const mock = installMockHttpsRequest((options, requestBody) => {
+    const path = options.path ?? '';
+    const pathname = new URL(`https://api.github.com${path}`).pathname;
+    const method = options.method ?? 'GET';
     requests.push({
       path,
-      ...(typeof init?.body === 'string'
-        ? { body: JSON.parse(init.body) as Record<string, unknown> }
-        : {}),
+      ...(requestBody !== '' ? { body: JSON.parse(requestBody) as Record<string, unknown> } : {}),
     });
-    if (path.endsWith('/check-runs') && method === 'POST')
-      return new Response(JSON.stringify({ id: 7 }), { status: 201 });
-    if (path.endsWith('/check-runs') && method === 'GET') {
-      const url = new URL(String(input));
+    if (pathname.endsWith('/check-runs') && method === 'POST')
+      return { status: 201, body: JSON.stringify({ id: 7 }) };
+    if (pathname.endsWith('/check-runs') && method === 'GET') {
+      const url = new URL(`https://api.github.com${path}`);
       assert.equal(url.searchParams.get('check_name'), 'PatchProof');
       assert.equal(url.searchParams.get('filter'), 'all');
       assert.equal(url.searchParams.get('app_id'), '123');
       assert.equal(url.searchParams.get('per_page'), '100');
       assert.equal(url.searchParams.get('page'), '1');
-      return new Response(
-        JSON.stringify({
+      return {
+        status: 200,
+        body: JSON.stringify({
           check_runs: [
             { id: 8, name: 'PatchProof', external_name: 'wrong-field' },
             {
@@ -668,25 +1018,24 @@ test('GitHub transport uses external_id and fails closed on spoofed managed comm
             },
           ],
         }),
-        { status: 200 },
-      );
+      };
     }
-    if (path.includes('/comments')) {
+    if (pathname.includes('/comments')) {
       if (commentMode === 'invalid')
-        return new Response(JSON.stringify({ comments: true }), { status: 200 });
-      return new Response(
-        JSON.stringify([
+        return { status: 200, body: JSON.stringify({ comments: true }) };
+      return {
+        status: 200,
+        body: JSON.stringify([
           {
             id: commentMode === 'spoofed' ? 12 : 13,
             body: '<!-- patchproof:summary:start -->managed<!-- patchproof:summary:end -->',
             performed_via_github_app: { id: commentMode === 'spoofed' ? 999 : 123 },
           },
         ]),
-        { status: 200 },
-      );
+      };
     }
-    return new Response(JSON.stringify({ id: 1, body: 'ok' }), { status: 200 });
-  };
+    return { status: 200, body: JSON.stringify({ id: 1, body: 'ok' }) };
+  });
   try {
     const transport = new GitHubApiTransport(provider);
     const payload = {
@@ -709,12 +1058,11 @@ test('GitHub transport uses external_id and fails closed on spoofed managed comm
       /invalid comment response/u,
     );
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 
 test('GitHub Check reconciliation recovers an accepted create after an ambiguous timeout', async () => {
-  const originalFetch = globalThis.fetch;
   const headSha = 'a'.repeat(40);
   const externalId = `patchproof:octo/example#7:${headSha}`;
   let createRequests = 0;
@@ -724,25 +1072,28 @@ test('GitHub Check reconciliation recovers an accepted create after an ambiguous
     appId: 123,
     getToken: async () => 'development-token',
   };
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    if (init?.method === 'POST' && url.pathname.endsWith('/check-runs')) {
+  const mock = installMockHttpsRequest(async (options) => {
+    const path = options.path ?? '';
+    const method = options.method ?? 'GET';
+    const url = new URL(`https://api.github.com${path}`);
+    if (method === 'POST' && url.pathname.endsWith('/check-runs')) {
       createRequests += 1;
       // Model GitHub accepting the request while the client times out before
       // receiving the response. The next owner must reconcile, not create.
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      if (init.signal?.aborted) throw new DOMException('aborted', 'AbortError');
-      return new Response(JSON.stringify({ id: 101 }), { status: 201 });
+      if (options.signal?.aborted) throw new DOMException('aborted', 'AbortError');
+      return { status: 201, body: JSON.stringify({ id: 101 }) };
     }
-    if (init?.method === 'GET' && url.pathname.endsWith('/check-runs')) {
+    if (method === 'GET' && url.pathname.endsWith('/check-runs')) {
       listRequests += 1;
       assert.equal(url.searchParams.get('check_name'), 'PatchProof');
       assert.equal(url.searchParams.get('filter'), 'all');
       assert.equal(url.searchParams.get('app_id'), '123');
       assert.equal(url.searchParams.get('per_page'), '100');
       assert.equal(url.searchParams.get('page'), '1');
-      return new Response(
-        JSON.stringify({
+      return {
+        status: 200,
+        body: JSON.stringify({
           total_count: 1,
           check_runs: [
             {
@@ -754,11 +1105,10 @@ test('GitHub Check reconciliation recovers an accepted create after an ambiguous
             },
           ],
         }),
-        { status: 200 },
-      );
+      };
     }
-    throw new Error(`unexpected GitHub request: ${init?.method ?? 'GET'} ${url.pathname}`);
-  };
+    throw new Error(`unexpected GitHub request: ${method} ${url.pathname}`);
+  });
   try {
     const transport = new GitHubApiTransport(provider, 1);
     await assert.rejects(
@@ -778,69 +1128,69 @@ test('GitHub Check reconciliation recovers an accepted create after an ambiguous
     assert.equal(listRequests, 1);
     assert.equal(createRequests, 1, 'reconciliation must not blind-create a second Check');
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 
 test('managed comment reconciliation paginates to page two and stops at a hard bound', async () => {
-  const originalFetch = globalThis.fetch;
   const pages: number[] = [];
   const provider = {
     requiresInstallationId: false as const,
     appId: 123,
     getToken: async () => 'development-token',
   };
-  globalThis.fetch = async (input) => {
-    const page = Number(new URL(String(input)).searchParams.get('page'));
+  let invalidPage = false;
+  const mock = installMockHttpsRequest((options) => {
+    const url = new URL(`https://api.github.com${options.path ?? ''}`);
+    const page = Number(url.searchParams.get('page'));
     pages.push(page);
+    if (invalidPage)
+      return {
+        status: 200,
+        body: JSON.stringify(Array.from({ length: 100 }, () => ({}))),
+      };
     if (page === 1)
-      return new Response(
-        JSON.stringify(
+      return {
+        status: 200,
+        body: JSON.stringify(
           Array.from({ length: 100 }, (_, index) => ({
             id: index + 1,
             body: 'unmanaged',
             performed_via_github_app: { id: 999 },
           })),
         ),
-        { status: 200 },
-      );
+      };
     if (page === 2)
-      return new Response(
-        JSON.stringify([
+      return {
+        status: 200,
+        body: JSON.stringify([
           {
             id: 202,
             body: '<!-- patchproof:summary:start -->managed<!-- patchproof:summary:end -->',
             performed_via_github_app: { id: 123 },
           },
         ]),
-        { status: 200 },
-      );
-    return new Response(JSON.stringify([]), { status: 200 });
-  };
+      };
+    return { status: 200, body: JSON.stringify([]) };
+  });
   try {
     const transport = new GitHubApiTransport(provider);
     assert.equal((await transport.findManagedComment('octo/example', 7))?.id, 202);
     assert.deepEqual(pages, [1, 2]);
 
     pages.length = 0;
-    globalThis.fetch = async () => {
-      pages.push(1);
-      return new Response(JSON.stringify(Array.from({ length: 100 }, () => ({}))), {
-        status: 200,
-      });
-    };
+    invalidPage = true;
     await assert.rejects(
       () => transport.findManagedComment('octo/example', 7),
       /comment reconciliation was incomplete/u,
     );
     assert.equal(pages.length, 20);
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 
 test('managed Check reconciliation follows total_count beyond the first 100 runs', async () => {
-  const originalFetch = globalThis.fetch;
   const pages: number[] = [];
   const provider = {
     requiresInstallationId: false as const,
@@ -848,12 +1198,15 @@ test('managed Check reconciliation follows total_count beyond the first 100 runs
     getToken: async () => 'development-token',
   };
   const headSha = 'a'.repeat(40);
-  globalThis.fetch = async (input) => {
-    const page = Number(new URL(String(input)).searchParams.get('page'));
+  const mock = installMockHttpsRequest((options) => {
+    const page = Number(
+      new URL(`https://api.github.com${options.path ?? ''}`).searchParams.get('page'),
+    );
     pages.push(page);
     if (page === 1)
-      return new Response(
-        JSON.stringify({
+      return {
+        status: 200,
+        body: JSON.stringify({
           total_count: 101,
           check_runs: Array.from({ length: 100 }, (_, index) => ({
             id: index + 1,
@@ -863,10 +1216,10 @@ test('managed Check reconciliation follows total_count beyond the first 100 runs
             app: { id: 456 },
           })),
         }),
-        { status: 200 },
-      );
-    return new Response(
-      JSON.stringify({
+      };
+    return {
+      status: 200,
+      body: JSON.stringify({
         total_count: 101,
         check_runs: [
           {
@@ -878,15 +1231,14 @@ test('managed Check reconciliation follows total_count beyond the first 100 runs
           },
         ],
       }),
-      { status: 200 },
-    );
-  };
+    };
+  });
   try {
     const transport = new GitHubApiTransport(provider);
     assert.equal((await transport.findManagedCheck('octo/example', 7, headSha))?.id, 202);
     assert.deepEqual(pages, [1, 2]);
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 

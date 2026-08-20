@@ -335,6 +335,44 @@ test('Docker backend keeps scenario env out of launcher env and always cleans a 
   );
 });
 
+test('Docker backend preserves a timeout while a SIGTERM-ignoring launcher settles', async () => {
+  const processBackend: ExecutionBackend = {
+    kind: 'local',
+    async run(spec) {
+      if (spec.command[1] === 'image') return fakeExecution();
+      if (spec.command[1] === 'run') {
+        const cidIndex = spec.command.indexOf('--cidfile');
+        const cidFile = spec.command[cidIndex + 1];
+        assert.ok(cidFile);
+        // Model Docker CLI waiting for a container that ignored SIGTERM. The
+        // real LocalProcessBackend resolves after its bounded SIGKILL path.
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        await writeFile(cidFile, `${'b'.repeat(64)}\n`, 'utf8');
+        return fakeExecution({
+          exitCode: null,
+          signal: 'SIGKILL',
+          timedOut: true,
+          error: 'Execution exceeded 50 ms',
+        });
+      }
+      return fakeExecution();
+    },
+  };
+  const result = await new DockerBackend(processBackend, { cleanupTimeoutMs: 100 }).run({
+    revision: 'head',
+    workspace: process.cwd(),
+    command: ['node', 'scenario.mjs'],
+    cwd: '.',
+    environment: {},
+    timeoutMs: 50,
+    outputBytes: 1024,
+    secrets: [],
+    policy,
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.error, 'Execution exceeded 50 ms');
+});
+
 test('Docker backend hard-settles a never-resolving provisioning backend', async () => {
   const processBackend: ExecutionBackend = {
     kind: 'local',

@@ -8,6 +8,8 @@ import type {
   PullRequestSnapshot,
 } from '@patchproof/github';
 import { isManagedComment, managedCheckExternalName } from '@patchproof/github';
+import https from 'node:https';
+import type { IncomingMessage } from 'node:http';
 import type { GitHubInstallationTokenProvider } from './github-auth.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -15,7 +17,28 @@ const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const GITHUB_PAGE_SIZE = 100;
 const MAX_CHECK_PAGES = 20;
 const MAX_COMMENT_PAGES = 20;
-const GITHUB_API_ORIGIN = 'https://api.github.com';
+const GITHUB_API_HOSTNAME = 'api.github.com';
+const GITHUB_API_PROTOCOL = 'https:';
+const GITHUB_API_PORT = 443;
+const GITHUB_USER_AGENT = 'PatchProof/0.1.0';
+const MAX_OWNER_LENGTH = 39;
+const MAX_REPOSITORY_LENGTH = 100;
+
+type EndpointMethod = 'GET' | 'POST' | 'PATCH';
+
+const endpointBrand = Symbol('GitHubApiEndpoint');
+type GitHubApiEndpoint = {
+  readonly method: EndpointMethod;
+  readonly path: string;
+  readonly [endpointBrand]: true;
+};
+
+interface RepositorySegments {
+  readonly owner: string;
+  readonly repository: string;
+  readonly encodedOwner: string;
+  readonly encodedRepository: string;
+}
 
 export interface GitHubDevelopmentTokenProvider {
   readonly requiresInstallationId: false;
@@ -50,23 +73,47 @@ export class GitHubApiError extends Error {
   }
 }
 
-function repositoryPath(repository: string): string {
-  const parts = repository.split('/');
-  if (parts.length !== 2 || parts.some((part) => !/^[A-Za-z0-9_.-]+$/u.test(part)))
+const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
+const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/u;
+const ROUTE_REPOSITORY = '/repos/[A-Za-z0-9-]{1,39}/[A-Za-z0-9_.-]{1,100}';
+const ROUTE_ID = '[1-9][0-9]*';
+const ROUTE_SHA = '[0-9a-f]{40}';
+
+function repositorySegments(repository: string): RepositorySegments {
+  if (typeof repository !== 'string') throw new GitHubApiError('Repository must be owner/name');
+  const separator = repository.indexOf('/');
+  if (
+    separator < 1 ||
+    separator !== repository.lastIndexOf('/') ||
+    separator === repository.length - 1
+  )
     throw new GitHubApiError('Repository must be owner/name');
-  return `${encodeURIComponent(parts[0] ?? '')}/${encodeURIComponent(parts[1] ?? '')}`;
+  const owner = repository.slice(0, separator);
+  const repositoryName = repository.slice(separator + 1);
+  if (
+    owner.length > MAX_OWNER_LENGTH ||
+    !OWNER_PATTERN.test(owner) ||
+    repositoryName.length > MAX_REPOSITORY_LENGTH ||
+    !REPOSITORY_PATTERN.test(repositoryName) ||
+    repositoryName === '.' ||
+    repositoryName === '..'
+  )
+    throw new GitHubApiError('Repository must be owner/name');
+  const encodedOwner = encodeURIComponent(owner);
+  const encodedRepository = encodeURIComponent(repositoryName);
+  if (encodedOwner !== owner || encodedRepository !== repositoryName)
+    throw new GitHubApiError('Repository must be owner/name');
+  return { owner, repository: repositoryName, encodedOwner, encodedRepository };
 }
 
-function apiEndpoint(path: string): URL {
-  const endpoint = new URL(path, GITHUB_API_ORIGIN);
-  if (
-    endpoint.origin !== GITHUB_API_ORIGIN ||
-    endpoint.protocol !== 'https:' ||
-    !endpoint.pathname.startsWith('/repos/') ||
-    endpoint.hash !== ''
-  )
-    throw new GitHubApiError('GitHub API endpoint is invalid');
-  return endpoint;
+function isRepositoryIdentity(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  try {
+    repositorySegments(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function assertInstallationId(value: number): void {
@@ -80,9 +127,179 @@ function assertPositiveId(value: unknown, label: string): number {
   return value;
 }
 
+function positiveIdSegment(value: unknown, label: string): string {
+  return String(assertPositiveId(value, label));
+}
+
+function pageSegment(value: number, max: number, label: string): string {
+  if (!Number.isSafeInteger(value) || value < 1 || value > max)
+    throw new GitHubApiError(`GitHub ${label} page is invalid`);
+  return String(value);
+}
+
 function assertSha(value: string, label: string): void {
-  if (!/^[0-9a-f]{40}$/iu.test(value))
+  if (typeof value !== 'string' || !/^[0-9a-f]{40}$/u.test(value))
     throw new GitHubApiError(`GitHub ${label} must be a 40-character SHA`);
+}
+
+function isSha(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/u.test(value);
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
+function canonicalQuery(values: readonly [key: string, value: string][], expected: string): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of values) query.set(key, value);
+  const serialized = query.toString();
+  if (serialized !== expected || serialized.includes('#') || serialized.includes('?'))
+    throw new GitHubApiError('GitHub API query is invalid');
+  return serialized;
+}
+
+function makeEndpoint(method: EndpointMethod, path: string, grammar: RegExp): GitHubApiEndpoint {
+  if (
+    !grammar.test(path) ||
+    !path.startsWith('/repos/') ||
+    path.includes('\\') ||
+    path.includes('%') ||
+    path.includes('#') ||
+    path.includes('://') ||
+    path.includes('@') ||
+    hasControlCharacter(path)
+  )
+    throw new GitHubApiError('GitHub API endpoint is invalid');
+  return Object.freeze({ method, path, [endpointBrand]: true }) as GitHubApiEndpoint;
+}
+
+function assertEndpoint(value: unknown): GitHubApiEndpoint {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    !Object.isFrozen(value) ||
+    !Object.prototype.hasOwnProperty.call(value, endpointBrand)
+  )
+    throw new GitHubApiError('GitHub API endpoint is invalid');
+  const endpoint = value as GitHubApiEndpoint;
+  if (
+    endpoint[endpointBrand] !== true ||
+    (endpoint.method !== 'GET' && endpoint.method !== 'POST' && endpoint.method !== 'PATCH') ||
+    typeof endpoint.path !== 'string'
+  )
+    throw new GitHubApiError('GitHub API endpoint is invalid');
+  return endpoint;
+}
+
+function pullRequestEndpoint(
+  repository: RepositorySegments,
+  pullRequest: number,
+): GitHubApiEndpoint {
+  const id = positiveIdSegment(pullRequest, 'pull request number');
+  const path = `/repos/${repository.encodedOwner}/${repository.encodedRepository}/pulls/${id}`;
+  return makeEndpoint('GET', path, new RegExp(`^${ROUTE_REPOSITORY}/pulls/${ROUTE_ID}$`, 'u'));
+}
+
+function createCheckEndpoint(repository: RepositorySegments): GitHubApiEndpoint {
+  const path = `/repos/${repository.encodedOwner}/${repository.encodedRepository}/check-runs`;
+  return makeEndpoint('POST', path, new RegExp(`^${ROUTE_REPOSITORY}/check-runs$`, 'u'));
+}
+
+function updateCheckEndpoint(repository: RepositorySegments, checkId: number): GitHubApiEndpoint {
+  const id = positiveIdSegment(checkId, 'check ID');
+  const path = `/repos/${repository.encodedOwner}/${repository.encodedRepository}/check-runs/${id}`;
+  return makeEndpoint(
+    'PATCH',
+    path,
+    new RegExp(`^${ROUTE_REPOSITORY}/check-runs/${ROUTE_ID}$`, 'u'),
+  );
+}
+
+function createCommentEndpoint(
+  repository: RepositorySegments,
+  issueNumber: number,
+): GitHubApiEndpoint {
+  const id = positiveIdSegment(issueNumber, 'pull request number');
+  const path = `/repos/${repository.encodedOwner}/${repository.encodedRepository}/issues/${id}/comments`;
+  return makeEndpoint(
+    'POST',
+    path,
+    new RegExp(`^${ROUTE_REPOSITORY}/issues/${ROUTE_ID}/comments$`, 'u'),
+  );
+}
+
+function updateCommentEndpoint(
+  repository: RepositorySegments,
+  commentId: number,
+): GitHubApiEndpoint {
+  const id = positiveIdSegment(commentId, 'comment ID');
+  const path = `/repos/${repository.encodedOwner}/${repository.encodedRepository}/issues/comments/${id}`;
+  return makeEndpoint(
+    'PATCH',
+    path,
+    new RegExp(`^${ROUTE_REPOSITORY}/issues/comments/${ROUTE_ID}$`, 'u'),
+  );
+}
+
+function commitChecksEndpoint(
+  repository: RepositorySegments,
+  headSha: string,
+  appId: number,
+  page: number,
+): GitHubApiEndpoint {
+  assertSha(headSha, 'check head');
+  const appIdValue = positiveIdSegment(appId, 'GitHub App ID');
+  const pageValue = pageSegment(page, MAX_CHECK_PAGES, 'check reconciliation');
+  const query = canonicalQuery(
+    [
+      ['check_name', 'PatchProof'],
+      ['filter', 'all'],
+      ['app_id', appIdValue],
+      ['per_page', String(GITHUB_PAGE_SIZE)],
+      ['page', pageValue],
+    ],
+    `check_name=PatchProof&filter=all&app_id=${appIdValue}&per_page=${GITHUB_PAGE_SIZE}&page=${pageValue}`,
+  );
+  const path = `/repos/${repository.encodedOwner}/${repository.encodedRepository}/commits/${headSha}/check-runs?${query}`;
+  return makeEndpoint(
+    'GET',
+    path,
+    new RegExp(
+      `^${ROUTE_REPOSITORY}/commits/${ROUTE_SHA}/check-runs\\?check_name=PatchProof&filter=all&app_id=${ROUTE_ID}&per_page=${GITHUB_PAGE_SIZE}&page=${ROUTE_ID}$`,
+      'u',
+    ),
+  );
+}
+
+function issueCommentsEndpoint(
+  repository: RepositorySegments,
+  pullRequest: number,
+  page: number,
+): GitHubApiEndpoint {
+  const id = positiveIdSegment(pullRequest, 'pull request number');
+  const pageValue = pageSegment(page, MAX_COMMENT_PAGES, 'comment reconciliation');
+  const query = canonicalQuery(
+    [
+      ['per_page', String(GITHUB_PAGE_SIZE)],
+      ['page', pageValue],
+    ],
+    `per_page=${GITHUB_PAGE_SIZE}&page=${pageValue}`,
+  );
+  const path = `/repos/${repository.encodedOwner}/${repository.encodedRepository}/issues/${id}/comments?${query}`;
+  return makeEndpoint(
+    'GET',
+    path,
+    new RegExp(
+      `^${ROUTE_REPOSITORY}/issues/${ROUTE_ID}/comments\\?per_page=${GITHUB_PAGE_SIZE}&page=${ROUTE_ID}$`,
+      'u',
+    ),
+  );
 }
 
 function combineSignals(
@@ -106,7 +323,7 @@ function combineSignals(
 function safeApiError(error: unknown, signal: AbortSignal): never {
   if (signal.aborted) throw new DOMException('The GitHub API request was aborted', 'AbortError');
   void error;
-  // Do not retain provider/fetch error objects: adapters may attach request
+  // Do not retain provider/transport error objects: adapters may attach request
   // headers or other credential-bearing diagnostics to them.
   throw new GitHubApiError('GitHub API request failed');
 }
@@ -119,6 +336,50 @@ function checkPayloadForApi(payload: CheckRunPayload): Record<string, unknown> {
 function hasNextLink(headers: Headers): boolean {
   const link = headers.get('link');
   return link !== null && /(?:^|,)\s*<[^>]+>\s*;\s*rel\s*=\s*["']?next["']?/iu.test(link);
+}
+
+function headersFromResponse(response: IncomingMessage): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(response.headers)) {
+    if (value === undefined) continue;
+    headers.set(name, Array.isArray(value) ? value.join(', ') : value);
+  }
+  return headers;
+}
+
+function responseBody(response: IncomingMessage, status: number): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      reject(
+        error instanceof Error ? error : new GitHubApiError('GitHub API response failed', status),
+      );
+    };
+    response.on('data', (chunk: Buffer | string) => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        fail(new GitHubApiError('GitHub API response was too large', status));
+        response.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    response.once('error', fail);
+    response.once('aborted', () =>
+      fail(new GitHubApiError('GitHub API response was aborted', status)),
+    );
+    response.once('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+  });
 }
 
 export class GitHubApiTransport implements GitHubTransport {
@@ -178,12 +439,12 @@ export class GitHubApiTransport implements GitHubTransport {
     }
   }
 
-  private async requestWithMetadata<T>(
-    method: string,
-    path: string,
+  async #requestWithMetadata<T>(
+    endpoint: GitHubApiEndpoint,
     body?: unknown,
     options?: GitHubMutationOptions,
   ): Promise<{ body: T; headers: Headers }> {
+    const safeEndpoint = assertEndpoint(endpoint);
     const token = await this.resolveToken(options);
     const combined = combineSignals(options?.signal, this.requestTimeoutMs);
     // Offline/development static-token tests rely on the caller signal being
@@ -192,56 +453,82 @@ export class GitHubApiTransport implements GitHubTransport {
       this.staticToken !== undefined && options?.signal !== undefined
         ? options.signal
         : combined.signal;
-    let response: Response;
     try {
+      let requestBody: string | undefined;
       try {
-        response = await fetch(apiEndpoint(path), {
-          method,
-          headers: {
-            Accept: 'application/vnd.github+json',
-            Authorization: `Bearer ${token}`,
-            'X-GitHub-Api-Version': '2022-11-28',
-            ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
-          },
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-          signal: requestSignal,
-          redirect: 'error',
-        });
+        requestBody = body === undefined ? undefined : JSON.stringify(body);
       } catch (error) {
         safeApiError(error, requestSignal);
       }
-      if (!response.ok)
-        throw new GitHubApiError(`GitHub API request failed (${response.status})`, response.status);
-      if (response.status === 204) return { body: undefined as T, headers: response.headers };
-      const contentLength = response.headers.get('content-length');
-      if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES)
-        throw new GitHubApiError('GitHub API response was too large', response.status);
+      const response = await new Promise<IncomingMessage>((resolve, reject) => {
+        const request = https.request(
+          {
+            protocol: GITHUB_API_PROTOCOL,
+            hostname: GITHUB_API_HOSTNAME,
+            port: GITHUB_API_PORT,
+            servername: GITHUB_API_HOSTNAME,
+            method: safeEndpoint.method,
+            path: safeEndpoint.path,
+            headers: {
+              Accept: 'application/vnd.github+json',
+              'User-Agent': GITHUB_USER_AGENT,
+              Authorization: `Bearer ${token}`,
+              'X-GitHub-Api-Version': '2022-11-28',
+              ...(requestBody === undefined ? {} : { 'Content-Type': 'application/json' }),
+            },
+            signal: requestSignal,
+          },
+          resolve,
+        );
+        request.once('error', reject);
+        if (requestBody !== undefined) request.write(requestBody);
+        request.end();
+      }).catch((error: unknown) => safeApiError(error, requestSignal));
+      const status = response.statusCode;
+      if (status === undefined || !Number.isInteger(status) || status < 200 || status > 299) {
+        response.destroy();
+        throw new GitHubApiError(
+          status === undefined
+            ? 'GitHub API request failed'
+            : `GitHub API request failed (${status})`,
+          status,
+        );
+      }
+      const headers = headersFromResponse(response);
+      if (status === 204) {
+        response.resume();
+        return { body: undefined as T, headers };
+      }
+      const contentLength = headers.get('content-length');
+      if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES) {
+        response.destroy();
+        throw new GitHubApiError('GitHub API response was too large', status);
+      }
       let text: string;
       try {
-        text = await response.text();
+        text = await responseBody(response, status);
       } catch (error) {
+        if (requestSignal.aborted) safeApiError(error, requestSignal);
+        if (error instanceof GitHubApiError) throw error;
         safeApiError(error, requestSignal);
       }
-      if (text.length > MAX_RESPONSE_BYTES)
-        throw new GitHubApiError('GitHub API response was too large', response.status);
       try {
-        return { body: JSON.parse(text) as T, headers: response.headers };
+        return { body: JSON.parse(text) as T, headers };
       } catch (error) {
         void error;
-        throw new GitHubApiError('GitHub API response was invalid', response.status);
+        throw new GitHubApiError('GitHub API response was invalid', status);
       }
     } finally {
       combined.cleanup();
     }
   }
 
-  private async request<T>(
-    method: string,
-    path: string,
+  async #request<T>(
+    endpoint: GitHubApiEndpoint,
     body?: unknown,
     options?: GitHubMutationOptions,
   ): Promise<T> {
-    return (await this.requestWithMetadata<T>(method, path, body, options)).body;
+    return (await this.#requestWithMetadata<T>(endpoint, body, options)).body;
   }
 
   public async getPullRequest(
@@ -251,12 +538,13 @@ export class GitHubApiTransport implements GitHubTransport {
   ): Promise<PullRequestSnapshot> {
     if (!Number.isSafeInteger(pullRequest) || pullRequest < 1)
       throw new GitHubApiError('Pull request number must be a positive safe integer');
-    const result = await this.request<{
+    const repositoryValue = repositorySegments(repository);
+    const result = await this.#request<{
       number: number;
       state: string;
       base?: { sha?: unknown; repo?: { full_name?: unknown } | null };
       head?: { sha?: unknown; repo?: { full_name?: unknown } | null };
-    }>('GET', `/repos/${repositoryPath(repository)}/pulls/${pullRequest}`, undefined, options);
+    }>(pullRequestEndpoint(repositoryValue, pullRequest), undefined, options);
     const baseSha = result.base?.sha;
     const headSha = result.head?.sha;
     const headRepository = result.head?.repo?.full_name;
@@ -266,12 +554,11 @@ export class GitHubApiTransport implements GitHubTransport {
       (result.state !== 'open' && result.state !== 'closed') ||
       typeof baseSha !== 'string' ||
       typeof headSha !== 'string' ||
-      typeof headRepository !== 'string' ||
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(headRepository) ||
+      !isRepositoryIdentity(headRepository) ||
       (baseRepository !== undefined &&
-        (typeof baseRepository !== 'string' || baseRepository !== repository)) ||
-      !/^[0-9a-f]{40}$/iu.test(baseSha) ||
-      !/^[0-9a-f]{40}$/iu.test(headSha)
+        (!isRepositoryIdentity(baseRepository) || baseRepository !== repository)) ||
+      !isSha(baseSha) ||
+      !isSha(headSha)
     )
       throw new GitHubApiError('GitHub returned invalid pull request refs');
     return {
@@ -292,9 +579,9 @@ export class GitHubApiTransport implements GitHubTransport {
     options?: GitHubMutationOptions,
   ): Promise<{ id: number }> {
     assertSha(headSha, 'check head');
-    const result = await this.request<{ id: unknown }>(
-      'POST',
-      `/repos/${repositoryPath(repository)}/check-runs`,
+    const repositoryValue = repositorySegments(repository);
+    const result = await this.#request<{ id: unknown }>(
+      createCheckEndpoint(repositoryValue),
       { ...checkPayloadForApi(payload), head_sha: headSha },
       options,
     );
@@ -307,10 +594,9 @@ export class GitHubApiTransport implements GitHubTransport {
     payload: CheckRunPayload,
     options?: GitHubMutationOptions,
   ): Promise<void> {
-    assertPositiveId(checkId, 'check ID');
-    await this.request(
-      'PATCH',
-      `/repos/${repositoryPath(repository)}/check-runs/${checkId}`,
+    const repositoryValue = repositorySegments(repository);
+    await this.#request(
+      updateCheckEndpoint(repositoryValue, checkId),
       checkPayloadForApi(payload),
       options,
     );
@@ -322,10 +608,9 @@ export class GitHubApiTransport implements GitHubTransport {
     payload: PullRequestCommentPayload,
     options?: GitHubMutationOptions,
   ): Promise<{ id: number; body: string }> {
-    assertPositiveId(issueNumber, 'pull request number');
-    const result = await this.request<{ id: unknown; body: unknown }>(
-      'POST',
-      `/repos/${repositoryPath(repository)}/issues/${issueNumber}/comments`,
+    const repositoryValue = repositorySegments(repository);
+    const result = await this.#request<{ id: unknown; body: unknown }>(
+      createCommentEndpoint(repositoryValue, issueNumber),
       payload,
       options,
     );
@@ -340,13 +625,8 @@ export class GitHubApiTransport implements GitHubTransport {
     payload: PullRequestCommentPayload,
     options?: GitHubMutationOptions,
   ): Promise<void> {
-    assertPositiveId(commentId, 'comment ID');
-    await this.request(
-      'PATCH',
-      `/repos/${repositoryPath(repository)}/issues/comments/${commentId}`,
-      payload,
-      options,
-    );
+    const repositoryValue = repositorySegments(repository);
+    await this.#request(updateCommentEndpoint(repositoryValue, commentId), payload, options);
   }
 
   public async findManagedCheck(
@@ -356,9 +636,12 @@ export class GitHubApiTransport implements GitHubTransport {
     options?: GitHubMutationOptions,
   ): Promise<ManagedCheckLookup | undefined> {
     assertSha(headSha, 'check head');
+    if (!Number.isSafeInteger(pullRequest) || pullRequest < 1)
+      throw new GitHubApiError('Pull request number must be a positive safe integer');
     // Without an App identity there is no safe way to distinguish a managed
     // CheckRun from a similarly named check created by another integration.
     if (this.appId === undefined) return undefined;
+    const repositoryValue = repositorySegments(repository);
     const expected = managedCheckExternalName(repository, pullRequest, headSha);
     let scanned = 0;
     for (let page = 1; page <= MAX_CHECK_PAGES; page += 1) {
@@ -374,7 +657,7 @@ export class GitHubApiTransport implements GitHubTransport {
           }>;
         };
         headers: Headers;
-      } = await this.requestWithMetadata<{
+      } = await this.#requestWithMetadata<{
         total_count?: unknown;
         check_runs?: Array<{
           id?: unknown;
@@ -383,12 +666,7 @@ export class GitHubApiTransport implements GitHubTransport {
           head_sha?: unknown;
           app?: { id?: unknown } | null;
         }>;
-      }>(
-        'GET',
-        `/repos/${repositoryPath(repository)}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=PatchProof&filter=all&app_id=${this.appId}&per_page=${GITHUB_PAGE_SIZE}&page=${page}`,
-        undefined,
-        options,
-      );
+      }>(commitChecksEndpoint(repositoryValue, headSha, this.appId, page), undefined, options);
       const result = pageResponse.body;
       const headers = pageResponse.headers;
       if (typeof result !== 'object' || result === null || Array.isArray(result))
@@ -410,10 +688,7 @@ export class GitHubApiTransport implements GitHubTransport {
           throw new GitHubApiError('GitHub returned an invalid check response');
         if (run.name !== 'PatchProof' || run.external_id !== expected || run.app?.id !== this.appId)
           continue;
-        if (
-          run.head_sha !== undefined &&
-          (typeof run.head_sha !== 'string' || run.head_sha.toLowerCase() !== headSha.toLowerCase())
-        )
+        if (run.head_sha !== undefined && (!isSha(run.head_sha) || run.head_sha !== headSha))
           throw new GitHubApiError('GitHub returned an invalid check identity');
         const id = assertPositiveId(run.id, 'check ID');
         return { id, ...(typeof run.head_sha === 'string' ? { headSha: run.head_sha } : {}) };
@@ -441,23 +716,19 @@ export class GitHubApiTransport implements GitHubTransport {
   ): Promise<ManagedCommentLookup | undefined> {
     if (!Number.isSafeInteger(pullRequest) || pullRequest < 1)
       throw new GitHubApiError('Pull request number must be a positive safe integer');
+    const repositoryValue = repositorySegments(repository);
     // The current App identity is part of the ownership proof. Do not even
     // inspect comments when it is unavailable.
     if (this.appId === undefined) return undefined;
     let managed: ManagedCommentLookup | undefined;
     for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
-      const { body: result } = await this.requestWithMetadata<
+      const { body: result } = await this.#requestWithMetadata<
         Array<{
           id?: unknown;
           body?: unknown;
           performed_via_github_app?: { id?: unknown } | null;
         }>
-      >(
-        'GET',
-        `/repos/${repositoryPath(repository)}/issues/${pullRequest}/comments?per_page=${GITHUB_PAGE_SIZE}&page=${page}`,
-        undefined,
-        options,
-      );
+      >(issueCommentsEndpoint(repositoryValue, pullRequest, page), undefined, options);
       if (!Array.isArray(result))
         throw new GitHubApiError('GitHub returned an invalid comment response');
       if (result.length > GITHUB_PAGE_SIZE)

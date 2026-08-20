@@ -9,7 +9,10 @@ import type { BackendExecution, ExecutionBackend, ExecutionSpec } from './types.
 export const DEFAULT_DOCKER_PROVISIONING_TIMEOUT_MS = 120_000;
 const DOCKER_CLEANUP_TIMEOUT_MS = 5_000;
 const DOCKER_CONTROL_OUTPUT_BYTES = 16_384;
-const DOCKER_LAUNCHER_GRACE_MS = 250;
+// LocalProcessBackend force-kills a launcher at most 750 ms after requesting
+// termination. Docker CLI can keep waiting when the container ignores
+// SIGTERM, so the hard deadline must allow that bounded kill to settle.
+const DOCKER_LAUNCHER_GRACE_MS = 1_000;
 
 export interface DockerCommandOptions {
   containerName?: string;
