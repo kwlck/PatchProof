@@ -25,6 +25,12 @@ Paths reject traversal and symlink escape. Logs use a streaming redactor that ke
 
 Evidence records scenario-visible environment values only. Host launcher values such as `PATH` and `SystemRoot` are omitted, with sorted key names and a metadata hash retained for provenance. Source and replay locations use stable labels rather than host paths. Docker evidence identifies the declared container image and marks platform fields as container-scoped.
 
+The manual App validation workflow is isolated in a separate `app-validation` environment restricted to `main`, with required review and self-review prevention where supported. Its permissions are limited to contents read and Actions read at the workflow level. App credentials are environment secrets exposed only to the no-argument harness process, never as command arguments, workflow outputs, or `GITHUB_ENV` values. The workflow rejects missing or inconsistent repository, ref, pull-request, and SHA variables before credentialed execution.
+
+The credential-free validation bundle is produced only after protected CI checks pass for the same commit. Its manifest records the repository, `refs/heads/main`, exact source SHA, a sorted file inventory, and SHA-256 digests. The manual workflow looks up a completed successful `CI` run through the read-only Actions API, requires the exact workflow identity, branch, event, conclusion, head SHA, and numeric artifact identity, rejects unsafe archive paths, verifies every listed digest and the complete inventory, and only then runs the harness. It does not install dependencies while credentials are present and uploads only a fixed short-lived summary after a secret scan.
+
+The validation harness delivers events to localhost and does not establish a public endpoint. Public TLS delivery and any external webhook exposure require a separate operator authorization and deployment review. Validation uses a same-repository branch; third-party forks are outside the App credential boundary.
+
 SQLite queue leases, attempts, cancellation, and synchronize supersession prevent a stale worker from silently replacing newer work. Publication uses the persisted Check and managed-comment IDs.
 
 ## Residual risk and non-goals

@@ -7,3 +7,5 @@ import './app.test.ts';
 import './worker.test.ts';
 import './docs-check.test.ts';
 import './release-workflow.test.ts';
+import './app-validation.test.ts';
+import './app-validation-workflow.test.ts';
