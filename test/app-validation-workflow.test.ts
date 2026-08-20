@@ -188,6 +188,7 @@ test('CI produces an exact-SHA bundle only after successful checks and build', (
   assert.deepEqual(mapping(upload.with), {
     name: 'patchproof-app-validation-bundle',
     path: '${{ runner.temp }}/patchproof-app-validation-bundle',
+    'include-hidden-files': true,
     'if-no-files-found': 'error',
     'retention-days': 7,
   });
