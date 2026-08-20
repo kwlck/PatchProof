@@ -15,6 +15,7 @@ import {
   assertSecretFreeText,
   buildValidationConfig,
   buildValidationContainerListCommand,
+  buildValidationImage,
   buildValidationImageInventoryCommand,
   buildValidationImageCommand,
   buildValidationImageInspectCommand,
@@ -910,6 +911,34 @@ test('Docker inventory dispatch separates the executable from its arguments', as
     },
   ]);
   assert.notEqual(calls[0].args[0], 'docker');
+});
+
+test('Docker image inspection dispatch separates the executable from its arguments', async () => {
+  const workspace = await mkdtemp(join(root, 'work', 'app-validation-inspect-dispatch-'));
+  const calls: Array<{ file: string; args: string[] }> = [];
+  try {
+    const image = await buildValidationImage({
+      validationRoot: workspace,
+      repositoryRoot: root,
+      runId: '123e4567-e89b-12d3-a456-426614174000',
+      command: async (file, args) => {
+        calls.push({ file, args });
+        if (file === 'docker' && args[0] === 'image' && args[1] === 'inspect')
+          return { stdout: `sha256:${'a'.repeat(64)}\n`, stderr: '' };
+        return { stdout: '', stderr: '' };
+      },
+    });
+    const inspectCall = calls.find(
+      ({ file, args }) => file === 'docker' && args[0] === 'image' && args[1] === 'inspect',
+    );
+    assert.deepEqual(inspectCall, {
+      file: 'docker',
+      args: ['image', 'inspect', '--format', '{{.Id}}', image.tag],
+    });
+    assert.notEqual(inspectCall?.args[0], 'docker');
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
 
 test('first-party probe accepts only EROFS as read-only proof', async () => {
