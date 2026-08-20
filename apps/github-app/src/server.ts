@@ -54,13 +54,16 @@ export function createWebhookServer(dependencies: WebhookDependencies) {
       response.writeHead(result.status, { 'content-type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ message: result.body, enqueued: result.enqueued }));
     } catch (error) {
-      response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-      response.end(
-        JSON.stringify({
-          message: 'webhook handling failed',
-          error: error instanceof Error ? error.message : String(error),
-        }),
+      // Keep stack traces and credential-bearing provider errors on the
+      // operator side only. The HTTP client receives a bounded generic error.
+      console.error(
+        'PatchProof webhook handling failed',
+        error instanceof Error
+          ? error.message.replaceAll(/[\r\n]+/gu, ' ').slice(0, 512)
+          : 'unknown error',
       );
+      response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ message: 'webhook handling failed' }));
     }
   };
   return createServer((request: IncomingMessage, response: ServerResponse) => {

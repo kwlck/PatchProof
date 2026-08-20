@@ -2,9 +2,6 @@
   "name": "patchproof",
   "version": "0.1.0",
   "private": true,
-  "bin": {
-    "patchproof": "packages/cli/dist/main.js"
-  },
   "description": "Replayable evidence for pull-request bug fixes",
   "license": "Apache-2.0",
   "packageManager": "pnpm@11.16.0",
@@ -25,6 +22,12 @@
     "editorial:check": "node scripts/editorial-check.mjs",
     "audit:prod": "pnpm audit --prod",
     "patchproof": "node packages/cli/dist/main.js",
+    "package:build": "pnpm build && node scripts/package-build.mjs",
+    "package:check": "pnpm package:build && node scripts/package-check.mjs",
+    "release:sbom": "node scripts/sbom.mjs",
+    "sbom:check": "node scripts/sbom-check.mjs",
+    "release:checksums": "node scripts/checksums.mjs",
+    "version:check": "node scripts/version-check.mjs",
     "fixture:run": "pnpm patchproof run fixtures/pass/.patchproof.yml --base fixtures/pass/base --head fixtures/pass/head --backend local --allow-unsafe-local --output work/fixture-pass",
     "fixture:verify": "pnpm patchproof verify work/fixture-pass/patchproof.evidence.json"
   },
@@ -32,6 +35,7 @@
     "@patchproof/cli": "workspace:*",
     "@eslint/js": "^9.18.0",
     "@types/node": "^22.13.0",
+    "esbuild": "^0.28.1",
     "eslint": "^9.18.0",
     "prettier": "^3.5.3",
     "tsx": "^4.19.3",

@@ -14,6 +14,8 @@ export interface QueueCleanupCursor {
 }
 
 export interface QueueEnqueueRequest {
+  /** App installation identity; omitted only for legacy/offline test adapters. */
+  installationId?: number;
   repository: string;
   pullRequest: number;
   baseSha: string;
@@ -23,7 +25,12 @@ export interface QueueEnqueueRequest {
   reason: 'pull_request' | 'issue_comment';
 }
 
-export interface QueueJob extends Omit<QueueEnqueueRequest, 'headRepository' | 'fork'> {
+export interface QueueJob extends Omit<
+  QueueEnqueueRequest,
+  'headRepository' | 'fork' | 'installationId'
+> {
+  /** Undefined only for legacy rows; production workers fail closed on it. */
+  installationId: number | undefined;
   headRepository: string;
   fork: boolean;
   id: string;
@@ -58,7 +65,10 @@ export interface RunQueue {
   ): Promise<QueueJob | undefined>;
   acknowledgeFailure(jobId: string, lease: QueueLease): Promise<boolean>;
   releaseFailure(jobId: string, lease: QueueLease): Promise<boolean>;
+  /** Fenced cancellation for a leased, unnotified terminal failure. */
+  cancelTerminal(jobId: string, lease: QueueLease, reason: string): Promise<boolean>;
   cancel(jobId: string, reason: string): Promise<boolean>;
+  cancelPullRequest?(repository: string, pullRequest: number, reason: string): Promise<number>;
   listTerminalCleanupCandidates(
     after: QueueCleanupCursor | undefined,
     limit: number,
@@ -87,6 +97,15 @@ function rowToJob(row: Record<string, unknown>): QueueJob {
   if (!['queued', 'running', 'succeeded', 'failed', 'cancelled'].includes(status))
     throw new Error(`Queue row status is invalid: ${status}`);
   const repository = requiredString('repository');
+  const installationId = row.installation_id;
+  if (
+    installationId !== null &&
+    installationId !== undefined &&
+    (typeof installationId !== 'number' ||
+      !Number.isSafeInteger(installationId) ||
+      installationId < 1)
+  )
+    throw new Error('Queue row installation identity is invalid');
   const storedHeadRepository = row.head_repository;
   const headRepository =
     typeof storedHeadRepository === 'string' && storedHeadRepository.length > 0
@@ -99,12 +118,19 @@ function rowToJob(row: Record<string, unknown>): QueueJob {
     throw new Error('Queue row repository is invalid');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(headRepository))
     throw new Error('Queue row head repository is invalid');
+  if (
+    typeof row.pull_request !== 'number' ||
+    !Number.isSafeInteger(row.pull_request) ||
+    row.pull_request < 1
+  )
+    throw new Error('Queue row pull request is invalid');
   if (!/^[0-9a-f]{40}$/iu.test(baseSha) || !/^[0-9a-f]{40}$/iu.test(headSha))
     throw new Error('Queue row refs are invalid');
   if (reason !== 'pull_request' && reason !== 'issue_comment')
     throw new Error('Queue row reason is invalid');
   return {
     id: requiredString('id'),
+    installationId: typeof installationId === 'number' ? installationId : undefined,
     repository,
     pullRequest: requiredNumber('pull_request'),
     baseSha,
@@ -127,7 +153,14 @@ function rowToJob(row: Record<string, unknown>): QueueJob {
   };
 }
 
-function assertRequest(request: QueueEnqueueRequest): void {
+function assertRequest(request: QueueEnqueueRequest, requireInstallationId: boolean): void {
+  if (
+    request.installationId !== undefined &&
+    (!Number.isSafeInteger(request.installationId) || request.installationId < 1)
+  )
+    throw new Error('Queue installation identity must be a positive safe integer');
+  if (requireInstallationId && request.installationId === undefined)
+    throw new Error('Queue installation identity is required');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(request.repository))
     throw new Error('Queue repository must be owner/name');
   if (!Number.isSafeInteger(request.pullRequest) || request.pullRequest < 1)
@@ -137,6 +170,8 @@ function assertRequest(request: QueueEnqueueRequest): void {
   const headRepository = request.headRepository ?? request.repository;
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(headRepository))
     throw new Error('Queue head repository must be owner/name');
+  if (request.reason !== 'pull_request' && request.reason !== 'issue_comment')
+    throw new Error('Queue reason is invalid');
 }
 
 function assertLease(lease: QueueLease): void {
@@ -154,6 +189,7 @@ function assertLease(lease: QueueLease): void {
 export class SqliteQueue implements RunQueue {
   private readonly database: DatabaseSync;
   private readonly clock: () => Date;
+  private readonly requireInstallationId: boolean;
 
   private withImmediateTransaction<T>(operation: (now: Date) => T): T {
     this.database.exec('BEGIN IMMEDIATE');
@@ -172,14 +208,20 @@ export class SqliteQueue implements RunQueue {
     }
   }
 
-  public constructor(filename = ':memory:', clock: () => Date = () => new Date()) {
+  public constructor(
+    filename = ':memory:',
+    clock: () => Date = () => new Date(),
+    options: { requireInstallationId?: boolean } = {},
+  ) {
     this.database = new DatabaseSync(filename);
     this.clock = clock;
+    this.requireInstallationId = options.requireInstallationId === true;
     this.database.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS patchproof_jobs (
         id TEXT PRIMARY KEY,
+        installation_id INTEGER,
         repository TEXT NOT NULL,
         pull_request INTEGER NOT NULL,
         base_sha TEXT NOT NULL,
@@ -210,6 +252,7 @@ export class SqliteQueue implements RunQueue {
           AND lease_owner IS NULL AND lease_expires_at IS NULL;
     `);
     for (const column of [
+      'ALTER TABLE patchproof_jobs ADD COLUMN installation_id INTEGER',
       'ALTER TABLE patchproof_jobs ADD COLUMN head_repository TEXT',
       'ALTER TABLE patchproof_jobs ADD COLUMN fork INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE patchproof_jobs ADD COLUMN evidence_path TEXT',
@@ -226,7 +269,7 @@ export class SqliteQueue implements RunQueue {
   }
 
   public enqueue(request: QueueEnqueueRequest, maxAttempts = 3): Promise<QueueJob> {
-    assertRequest(request);
+    assertRequest(request, this.requireInstallationId);
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 20)
       throw new Error('Queue maxAttempts must be between 1 and 20');
     const now = nowIso(this.clock);
@@ -237,6 +280,7 @@ export class SqliteQueue implements RunQueue {
           `SELECT * FROM patchproof_jobs
            WHERE repository = ? AND pull_request = ? AND head_sha = ?
              AND COALESCE(head_repository, repository) = ?
+             AND COALESCE(installation_id, 0) = COALESCE(?, 0)
              AND status IN ('queued', 'running')
            ORDER BY updated_at DESC LIMIT 1`,
         )
@@ -245,6 +289,7 @@ export class SqliteQueue implements RunQueue {
           request.pullRequest,
           request.headSha,
           request.headRepository ?? request.repository,
+          request.installationId ?? null,
         );
       if (existing !== undefined) {
         this.database.exec('COMMIT');
@@ -256,8 +301,16 @@ export class SqliteQueue implements RunQueue {
            SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
                lease_generation = lease_generation + 1, last_error = ?, updated_at = ?
            WHERE repository = ? AND pull_request = ?
-             AND (head_sha <> ? OR COALESCE(head_repository, repository) <> ?)
-             AND status IN ('queued', 'running')`,
+             AND (
+               head_sha <> ? OR
+               COALESCE(head_repository, repository) <> ? OR
+               COALESCE(installation_id, 0) <> COALESCE(?, 0) OR
+               (status = 'failed' AND failure_notified = 0)
+             )
+             AND (
+               status IN ('queued', 'running') OR
+               (status = 'failed' AND failure_notified = 0)
+             )`,
         )
         .run(
           `Superseded by head ${request.headSha}`,
@@ -266,9 +319,11 @@ export class SqliteQueue implements RunQueue {
           request.pullRequest,
           request.headSha,
           request.headRepository ?? request.repository,
+          request.installationId ?? null,
         );
       const job: QueueJob = {
         ...request,
+        installationId: request.installationId,
         headRepository: request.headRepository ?? request.repository,
         fork: request.fork === true,
         failureNotified: false,
@@ -283,12 +338,13 @@ export class SqliteQueue implements RunQueue {
       this.database
         .prepare(
           `INSERT INTO patchproof_jobs
-          (id, repository, pull_request, base_sha, head_sha, head_repository, fork, reason, status, attempts,
+          (id, installation_id, repository, pull_request, base_sha, head_sha, head_repository, fork, reason, status, attempts,
             max_attempts, lease_generation, lease_owner, lease_expires_at, last_error, evidence_path, outcome, failure_notified, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)`,
         )
         .run(
           job.id,
+          job.installationId ?? null,
           job.repository,
           job.pullRequest,
           job.baseSha,
@@ -525,6 +581,27 @@ export class SqliteQueue implements RunQueue {
     );
   }
 
+  public cancelTerminal(jobId: string, lease: QueueLease, reason: string): Promise<boolean> {
+    assertLease(lease);
+    if (!reason || reason.length > 4096) throw new Error('Queue cancellation reason is invalid');
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const nowText = now.toISOString();
+        const result = this.database
+          .prepare(
+            `UPDATE patchproof_jobs
+             SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+                 lease_generation = lease_generation + 1, last_error = ?, updated_at = ?
+             WHERE id = ? AND status = 'failed' AND failure_notified = 0
+               AND lease_owner = ? AND lease_generation = ?
+               AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
+          )
+          .run(reason, nowText, jobId, lease.owner, lease.generation, nowText);
+        return result.changes === 1;
+      }),
+    );
+  }
+
   public cancel(jobId: string, reason: string): Promise<boolean> {
     if (!reason || reason.length > 4096) throw new Error('Queue cancellation reason is invalid');
     const result = this.database
@@ -536,6 +613,31 @@ export class SqliteQueue implements RunQueue {
       )
       .run(reason, nowIso(this.clock), jobId);
     return Promise.resolve(result.changes === 1);
+  }
+
+  public cancelPullRequest(
+    repository: string,
+    pullRequest: number,
+    reason: string,
+  ): Promise<number> {
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository))
+      throw new Error('Queue repository must be owner/name');
+    if (!Number.isSafeInteger(pullRequest) || pullRequest < 1)
+      throw new Error('Queue pull request must be a positive safe integer');
+    if (!reason || reason.length > 4096) throw new Error('Queue cancellation reason is invalid');
+    const result = this.database
+      .prepare(
+        `UPDATE patchproof_jobs
+         SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+             lease_generation = lease_generation + 1, last_error = ?, updated_at = ?
+         WHERE repository = ? AND pull_request = ?
+           AND (
+             status IN ('queued', 'running') OR
+             (status = 'failed' AND failure_notified = 0)
+           )`,
+      )
+      .run(reason, nowIso(this.clock), repository, pullRequest);
+    return Promise.resolve(result.changes);
   }
 
   public listTerminalCleanupCandidates(

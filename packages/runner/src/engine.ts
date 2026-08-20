@@ -5,6 +5,7 @@ import { canonicalize, decidePolicy, sha256, type PolicyDecision } from '@patchp
 import { assertSafeRelativePath, type PatchProofConfig } from '@patchproof/config';
 import { DockerBackend } from './docker.js';
 import { LocalProcessBackend } from './process.js';
+import { applyOperatorPolicy, resolveOperatorPolicy, type OperatorPolicyInput } from './policy.js';
 import {
   cleanupWorkspace,
   copyWorkspaceSafe,
@@ -25,6 +26,10 @@ export interface TwoRevisionOptions {
   backendOverride?: 'docker' | 'local';
   allowUnsafeLocal?: boolean;
   trustedConfig?: boolean;
+  /** Optional operator-owned ceilings and image/isolation requirements. */
+  operatorPolicy?: OperatorPolicyInput;
+  /** Cancels active provisioning/scenario work while preserving cleanup. */
+  signal?: AbortSignal;
 }
 
 export interface PolicyDeniedRun {
@@ -45,9 +50,9 @@ function scenarioEnvironmentFor(
   revision: 'base' | 'head',
 ): Record<string, string> {
   return {
+    ...config.scenario.environment,
     CI: '1',
     PATCHPROOF_REVISION: revision,
-    ...config.scenario.environment,
   };
 }
 
@@ -70,16 +75,51 @@ function launcherSummary(environment: Record<string, string>): {
 export async function runTwoRevisions(
   options: TwoRevisionOptions,
 ): Promise<TwoRevisionRun | PolicyDeniedRun> {
-  const backend = options.backendOverride ?? options.config.policy.backend;
+  const operatorPolicy =
+    options.operatorPolicy === undefined
+      ? undefined
+      : resolveOperatorPolicy(options.operatorPolicy);
+  // Select the effective backend before applying operator constraints. This
+  // prevents a Docker override from bypassing image and isolation checks that
+  // would otherwise inspect only the repository-declared backend.
+  const selectedBackend = options.backendOverride ?? options.config.policy.backend;
+  const effectiveRepositoryPolicy = {
+    ...options.config.policy,
+    backend: selectedBackend,
+  };
+  const operatorDecision =
+    operatorPolicy === undefined
+      ? undefined
+      : applyOperatorPolicy(effectiveRepositoryPolicy, operatorPolicy);
+  if (operatorDecision !== undefined && !operatorDecision.allowed)
+    return {
+      policy: {
+        allowed: false,
+        outcome: 'POLICY_DENIED',
+        reason: operatorDecision.reason ?? 'Operator policy denied execution',
+      },
+      reason: operatorDecision.reason ?? 'Operator policy denied execution',
+    };
+  const configuredPolicy = operatorDecision?.policy ?? effectiveRepositoryPolicy;
+  const backend = configuredPolicy.backend;
+  if (operatorPolicy?.forceDocker && backend !== 'docker') {
+    const reason =
+      'Operator policy requires the Docker backend; local process execution is not permitted';
+    return { policy: { allowed: false, outcome: 'POLICY_DENIED', reason }, reason };
+  }
   const decision = decidePolicy({
     backend,
-    allowUnsafeLocal: options.allowUnsafeLocal === true || options.config.policy.allowUnsafeLocal,
+    // Unsafe local execution requires both independent authorities. A
+    // repository cannot opt itself into host execution, and a CLI flag cannot
+    // override a trusted base policy that disallows it.
+    allowUnsafeLocal:
+      options.allowUnsafeLocal === true && options.config.policy.allowUnsafeLocal === true,
     fork: options.fork === true,
     allowFork: options.config.policy.allowFork,
     trustedConfig: options.trustedConfig === true,
   });
   if (!decision.allowed) return { policy: decision, reason: decision.reason ?? 'Execution denied' };
-  if (options.config.policy.network === 'allowlist') {
+  if (configuredPolicy.network === 'allowlist') {
     const policy = {
       allowed: false,
       outcome: 'POLICY_DENIED' as const,
@@ -126,10 +166,14 @@ export async function runTwoRevisions(
         cwd: safeCwd,
         environment,
         launcherEnvironment,
-        timeoutMs: options.config.policy.timeoutMs,
-        outputBytes: options.config.policy.outputBytes,
+        timeoutMs: configuredPolicy.timeoutMs,
+        outputBytes: configuredPolicy.outputBytes,
         secrets: options.config.redaction.secrets,
-        policy: { ...options.config.policy, backend },
+        policy: { ...configuredPolicy, backend },
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(operatorPolicy === undefined
+          ? {}
+          : { provisioningTimeoutMs: operatorPolicy.provisioningTimeoutMs }),
       };
       const execution = await backendInstance.run(spec);
       const dependencyLock = await hashKnownLockfile(workspace);

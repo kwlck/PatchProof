@@ -32,9 +32,18 @@ async function cliRun(args: string[]): Promise<{ code: number; stdout: string; s
 async function run(): Promise<void> {
   const outputRoot = join(root, 'work', 'e2e');
   await mkdir(outputRoot, { recursive: true });
+  // The maintained Docker fixture intentionally leaves unsafe local execution
+  // disabled. This test opts into local development explicitly in a temporary
+  // trusted config so it exercises the CLI without weakening the fixture.
+  const passConfigPath = join(outputRoot, 'pass.local.patchproof.yml');
+  const passConfig = (await readFile(join(root, 'fixtures/pass/.patchproof.yml'), 'utf8')).replace(
+    /  backend: docker\r?\n/u,
+    '  backend: local\n  allowUnsafeLocal: true\n',
+  );
+  await writeFile(passConfigPath, passConfig, 'utf8');
   const pass = await cliRun([
     'run',
-    'fixtures/pass/.patchproof.yml',
+    passConfigPath,
     '--base',
     'fixtures/pass/base',
     '--head',

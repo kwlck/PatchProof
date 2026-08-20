@@ -1,8 +1,10 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { dirname, extname, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { classifyOutcome, verifyEvidenceBundle, type EvidenceBundle } from '@patchproof/core';
 import {
   ConfigValidationError,
@@ -17,6 +19,13 @@ import { hasOption, option, parseArgs, type ParsedArgs } from './args.js';
 import { writeEvidenceBundle } from './bundle.js';
 
 const execFileAsync = promisify(execFile);
+const DOCTOR_TIMEOUT_MS = 5_000;
+
+interface DoctorCheck {
+  ok: boolean;
+  required: boolean;
+  detail: string;
+}
 
 const HELP = `PatchProof - replayable evidence for pull-request bug fixes
 
@@ -201,6 +210,151 @@ function configFromEvidence(bundle: EvidenceBundle): PatchProofConfig {
   };
 }
 
+function doctorCheck(ok: boolean, required: boolean, detail: string): DoctorCheck {
+  return { ok, required, detail };
+}
+
+function nodeMajorVersion(): number {
+  const major = Number.parseInt(process.versions.node.split('.')[0] ?? '', 10);
+  return Number.isSafeInteger(major) ? major : 0;
+}
+
+interface PnpmInvocation {
+  executable: string;
+  args: string[];
+  label: string;
+}
+
+async function pnpmInvocations(): Promise<PnpmInvocation[]> {
+  if (process.platform !== 'win32')
+    return [{ executable: 'pnpm', args: ['--version'], label: 'pnpm' }];
+  const paths: string[] = [];
+  try {
+    const located = await execFileAsync('where.exe', ['pnpm'], {
+      windowsHide: true,
+      timeout: DOCTOR_TIMEOUT_MS,
+      shell: false,
+      maxBuffer: 64 * 1024,
+    });
+    for (const path of located.stdout.split(/\r?\n/u).map((item) => item.trim()))
+      if (path.length > 0 && !paths.includes(path)) paths.push(path);
+  } catch {
+    // Continue with the PATH candidates below.
+  }
+  const invocations: PnpmInvocation[] = [];
+  for (const launcher of paths) {
+    const extension = extname(launcher).toLowerCase();
+    if (extension === '.cmd' || extension === '.bat') {
+      // Windows cannot execute a .cmd file through execFile with shell:false.
+      // Resolve the Node and pnpm module targets from the shim instead of
+      // invoking cmd.exe (which would reintroduce command interpolation).
+      try {
+        const source = await readFile(launcher, 'utf8');
+        const tokens = [...source.matchAll(/"([^"]+)"/gu)]
+          .map((match) => match[1])
+          .filter((item): item is string => item !== undefined);
+        const expand = (token: string): string =>
+          resolve(dirname(launcher), token.replaceAll('%~dp0', ''));
+        const nodeToken = tokens.find((token) => /(?:^|[\\/])node(?:\.exe)?$/iu.test(token));
+        const pnpmToken = tokens.find((token) => /pnpm\.(?:c|m)js$/iu.test(token));
+        if (nodeToken !== undefined && pnpmToken !== undefined) {
+          const nodeExecutable = expand(nodeToken);
+          const pnpmScript = expand(pnpmToken);
+          await access(nodeExecutable);
+          await access(pnpmScript);
+          invocations.push({
+            executable: nodeExecutable,
+            args: [pnpmScript, '--version'],
+            label: launcher,
+          });
+        }
+      } catch {
+        // A non-standard shim is handled by the next candidate.
+      }
+    } else {
+      invocations.push({ executable: launcher, args: ['--version'], label: launcher });
+    }
+  }
+  if (invocations.length === 0)
+    invocations.push({ executable: 'pnpm.exe', args: ['--version'], label: 'pnpm.exe' });
+  return invocations;
+}
+
+async function probePnpm(): Promise<DoctorCheck> {
+  const required = '11.16.0';
+  const failures: string[] = [];
+  for (const invocation of await pnpmInvocations()) {
+    try {
+      const result = await execFileAsync(invocation.executable, invocation.args, {
+        cwd: tmpdir(),
+        windowsHide: true,
+        timeout: DOCTOR_TIMEOUT_MS,
+        shell: false,
+        maxBuffer: 64 * 1024,
+      });
+      const version = result.stdout
+        .trim()
+        .split(/\s+/u)
+        .find((item) => /^\d+\.\d+\.\d+$/u.test(item));
+      if (version === undefined) {
+        failures.push(`${invocation.label} returned no semantic version`);
+        continue;
+      }
+      return doctorCheck(
+        version === required,
+        true,
+        `${invocation.label} reports ${version}; required exact pnpm@${required}`,
+      );
+    } catch (error) {
+      failures.push(
+        `${invocation.label}: ${
+          error instanceof Error
+            ? `${error.message}${'code' in error ? ` (code ${String(error.code)})` : ''}${'stderr' in error && typeof error.stderr === 'string' && error.stderr.length > 0 ? ` stderr: ${error.stderr.trim()}` : ''}`
+            : String(error)
+        }`,
+      );
+    }
+  }
+  return doctorCheck(
+    false,
+    true,
+    `pnpm executable/version probe failed: ${failures.join('; ') || 'not found'}; required exact pnpm@${required}`,
+  );
+}
+
+function probeSqlite(): DoctorCheck {
+  let database: { exec(sql: string): unknown; close(): void } | undefined;
+  try {
+    const require = createRequire(import.meta.url);
+    const sqlite = require('node:sqlite') as {
+      DatabaseSync?: new (filename: string) => {
+        exec(sql: string): unknown;
+        close(): void;
+      };
+    };
+    if (typeof sqlite.DatabaseSync !== 'function')
+      throw new Error('DatabaseSync is not exported by node:sqlite');
+    database = new sqlite.DatabaseSync(':memory:');
+    database.exec('CREATE TABLE doctor_probe (value INTEGER)');
+    database.exec('INSERT INTO doctor_probe (value) VALUES (1)');
+    database.close();
+    database = undefined;
+    return doctorCheck(
+      true,
+      true,
+      'node:sqlite DatabaseSync opened, wrote, and closed an in-memory database',
+    );
+  } catch (error) {
+    return doctorCheck(
+      false,
+      true,
+      `node:sqlite open/close probe failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    database?.close();
+  }
+}
+
 async function replayCommand(args: ParsedArgs): Promise<number> {
   const bundlePath = args.positional[0];
   if (bundlePath === undefined) throw new Error('replay requires an evidence bundle path');
@@ -309,42 +463,63 @@ async function replayCommand(args: ParsedArgs): Promise<number> {
 }
 
 async function doctorCommand(args: ParsedArgs): Promise<number> {
-  const checks: Record<string, { ok: boolean; detail: string }> = {};
-  checks.node = { ok: Number(process.versions.node.split('.')[0]) >= 22, detail: process.version };
   const packageManager = 'pnpm@11.16.0';
-  checks.pnpm = {
-    ok: packageManager === 'pnpm@11.16.0',
-    detail: `${packageManager} pinned in package.json; verify the launcher with pnpm --version`,
+  const node = nodeMajorVersion();
+  const checks: Record<string, DoctorCheck> = {
+    node: doctorCheck(
+      node >= 22,
+      true,
+      `${process.version}; supported Node.js is >=22.0.0 (detected major ${node})`,
+    ),
+    pnpm: await probePnpm(),
+    sqlite: probeSqlite(),
   };
   try {
-    const docker = await execFileAsync('docker', ['version', '--format', '{{.Server.Version}}'], {
-      windowsHide: true,
-    });
-    checks.docker = { ok: true, detail: docker.stdout.trim() };
-  } catch {
-    checks.docker = {
-      ok: false,
-      detail: 'Docker CLI/daemon unavailable; production Docker runs cannot start here',
-    };
+    const docker = await execFileAsync(
+      'docker',
+      ['version', '--format', '{{.Client.Version}}/{{.Server.Version}}'],
+      {
+        windowsHide: true,
+        timeout: DOCTOR_TIMEOUT_MS,
+        shell: false,
+        maxBuffer: 64 * 1024,
+      },
+    );
+    const versions = docker.stdout.trim();
+    checks.docker = doctorCheck(
+      versions.length > 0 && !versions.endsWith('/'),
+      false,
+      versions.length > 0
+        ? `Docker CLI/daemon reachable (${versions})`
+        : 'Docker CLI returned no daemon version; production Docker runs cannot start here',
+    );
+  } catch (error) {
+    checks.docker = doctorCheck(
+      false,
+      false,
+      `Docker CLI/daemon unavailable (warning for local development): ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-  checks.sqlite = {
-    ok: true,
-    detail: 'node:sqlite DatabaseSync (Node runtime feature; local state adapter)',
-  };
+  const requiredChecks = Object.values(checks).filter((item) => item.required);
+  const requiredOk = requiredChecks.every((item) => item.ok);
   const output = {
-    ok: Object.values(checks).every((item) => item.ok),
+    ok: requiredOk,
+    requiredOk,
     packageManager,
     checks,
-    note: 'corepack enable is intentionally not run because this project does not mutate global Node installation paths',
+    note: 'Docker is required for production runs but is a warning for local development; corepack enable is intentionally not run because this project does not mutate global Node installation paths',
   };
   if (hasOption(args, 'json')) jsonOutput(output);
   else
     console.log(
       Object.entries(output.checks)
-        .map(([key, value]) => `${value.ok ? 'OK' : 'WARN'} ${key}: ${value.detail}`)
+        .map(
+          ([key, value]) =>
+            `${value.ok ? 'OK' : value.required ? 'FAIL' : 'WARN'} ${key}: ${value.detail}`,
+        )
         .join('\n'),
     );
-  return 0;
+  return requiredOk ? 0 : 2;
 }
 
 export async function runCli(argv: readonly string[]): Promise<number> {

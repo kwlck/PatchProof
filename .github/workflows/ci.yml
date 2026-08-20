@@ -10,15 +10,20 @@ permissions:
 
 jobs:
   checks:
+    name: checks / Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 11.16.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm format:check
@@ -30,18 +35,87 @@ jobs:
       - run: pnpm docs:check
       - run: pnpm editorial:check
       - run: pnpm audit --prod
+      - run: pnpm package:check
+      - name: Hash Linux package
+        shell: bash
+        run: sha256sum work/release/patchproof-$(node -p "require('./package.json').version").tgz | awk '{print tolower($1)}' > work/release/linux-SHA256SUM
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-hash-linux-${{ matrix.node-version }}
+          path: work/release/linux-SHA256SUM
+
+  windows-package:
+    name: Windows package smoke / Node ${{ matrix.node-version }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm package:check
+      - name: Hash Windows package
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash (Join-Path work/release ("patchproof-" + (node -p "require('./package.json').version") + ".tgz")) -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path work/release/windows-SHA256 -Value $hash -NoNewline
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-hash-windows-node-${{ matrix.node-version }}
+          path: work/release/windows-SHA256
+
+  compare-package-hashes:
+    name: compare Linux/Windows package hashes
+    needs: [checks, windows-package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: package-hash-*
+          path: hashes
+          merge-multiple: false
+      - name: Compare package hashes
+        shell: bash
+        run: |
+          expected=(
+            package-hash-linux-22/linux-SHA256SUM
+            package-hash-linux-24/linux-SHA256SUM
+            package-hash-windows-node-22/windows-SHA256
+            package-hash-windows-node-24/windows-SHA256
+          )
+          hashes_seen=()
+          for file in "${expected[@]}"; do
+            path="hashes/$file"
+            test -f "$path"
+            hash="$(tr -d '\r\n' < "$path" | tr '[:upper:]' '[:lower:]')"
+            [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+            hashes_seen+=("$hash")
+          done
+          for hash in "${hashes_seen[@]}"; do
+            test "$hash" = "${hashes_seen[0]}"
+          done
+
   docker:
+    name: Docker integration
     runs-on: ubuntu-latest
     needs: checks
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 11.16.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: docker version
       - run: pnpm build
       - run: pnpm test:docker

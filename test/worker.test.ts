@@ -22,6 +22,10 @@ import { runTwoRevisions } from '@patchproof/runner';
 import { handleWebhook } from '../apps/github-app/dist/webhook.js';
 import { SqliteQueue } from '../apps/github-app/dist/queue.js';
 import { PatchProofWorker, type WorkerRunInput } from '../apps/github-app/dist/worker.js';
+import {
+  parseWorkerOperatorPolicy,
+  WorkerPolicyConfigurationError,
+} from '../apps/github-app/dist/worker-policy.js';
 import type { SourceAdapter } from '../apps/github-app/dist/source.js';
 
 const baseSha = 'a'.repeat(40);
@@ -31,6 +35,7 @@ class FixtureSourceAdapter implements SourceAdapter {
   public constructor(
     private readonly configPath = 'fixtures/pass/.patchproof.yml',
     private readonly headRepository = 'octo/example',
+    private readonly allowUnsafeLocal = false,
   ) {}
 
   public async materializeRevision(
@@ -41,7 +46,22 @@ class FixtureSourceAdapter implements SourceAdapter {
     assert.equal(repository, sha === baseSha ? 'octo/example' : this.headRepository);
     const source = sha === baseSha ? 'fixtures/pass/base' : 'fixtures/pass/head';
     await cp(source, destination, { recursive: true, dereference: false });
-    await cp(this.configPath, join(destination, '.patchproof.yml'));
+    const destinationConfig = join(destination, '.patchproof.yml');
+    await cp(this.configPath, destinationConfig);
+    if (this.allowUnsafeLocal) {
+      const config = await readFile(destinationConfig, 'utf8');
+      const policyHeader = /^policy:[ \t]*$/mu.exec(config);
+      if (policyHeader === null) throw new Error('fixture config must define policy');
+      const lineEnd = config.includes('\r\n') ? '\r\n' : '\n';
+      const headerEnd = config.indexOf(lineEnd, policyHeader.index + policyHeader[0].length);
+      assert.notEqual(headerEnd, -1, 'fixture policy header must end with a newline');
+      const insertion = headerEnd + lineEnd.length;
+      await writeFile(
+        destinationConfig,
+        `${config.slice(0, insertion)}  allowUnsafeLocal: true${lineEnd}${config.slice(insertion)}`,
+        'utf8',
+      );
+    }
   }
 }
 
@@ -57,6 +77,28 @@ async function pathExists(path: string): Promise<boolean> {
 function attemptRootFromEvidence(evidencePath: string): string {
   return join(evidencePath, '..', '..');
 }
+
+test('production worker policy requires an immutable image allowlist', () => {
+  const environment = {
+    PATCHPROOF_APPROVED_DOCKER_IMAGES: 'ghcr.io/patchproof/scenario@sha256:' + 'a'.repeat(64),
+  };
+  const policy = parseWorkerOperatorPolicy(environment);
+  assert.equal(policy.forceDocker, true);
+  assert.equal(policy.requireDigestPinnedImages, true);
+  assert.equal(policy.requireReadOnlyRoot, true);
+  assert.deepEqual(policy.approvedDockerImages, [environment.PATCHPROOF_APPROVED_DOCKER_IMAGES]);
+
+  assert.throws(
+    () => parseWorkerOperatorPolicy({ PATCHPROOF_MAX_TIMEOUT_MS: '0', ...environment }),
+    WorkerPolicyConfigurationError,
+  );
+  assert.throws(
+    () =>
+      parseWorkerOperatorPolicy({ ...environment, PATCHPROOF_APPROVED_DOCKER_IMAGES: 'latest' }),
+    WorkerPolicyConfigurationError,
+  );
+  assert.throws(() => parseWorkerOperatorPolicy({}), WorkerPolicyConfigurationError);
+});
 
 async function attemptRoots(outputRoot: string, jobId: string): Promise<string[]> {
   const names = await readdir(join(outputRoot, jobId, 'attempts'));
@@ -269,7 +311,11 @@ test('real issue_comment shape reaches durable queue, worker, evidence, Check, a
   try {
     const worker = new PatchProofWorker({
       queue,
-      source: new FixtureSourceAdapter('fixtures/pass-fork/.patchproof.yml', 'contrib/example'),
+      source: new FixtureSourceAdapter(
+        'fixtures/pass-fork/.patchproof.yml',
+        'contrib/example',
+        true,
+      ),
       store,
       github,
       outputRoot,
@@ -531,6 +577,193 @@ test('SQLite queue persists fork source identity, supersedes work, and reaps sta
   assert.equal(await queue.claim('worker-f', 1_000), undefined);
   assert.equal((await queue.list()).find((job) => job.id === terminal.id)?.status, 'failed');
   queue.close();
+});
+
+test('queue supersession fences active work across installation changes', async () => {
+  const queue = new SqliteQueue(':memory:', () => new Date('2026-01-01T00:00:00.000Z'), {
+    requireInstallationId: true,
+  });
+  const first = await queue.enqueue({
+    installationId: 10,
+    repository: 'octo/example',
+    pullRequest: 7,
+    baseSha,
+    headSha,
+    reason: 'pull_request',
+  });
+  const second = await queue.enqueue({
+    installationId: 11,
+    repository: 'octo/example',
+    pullRequest: 7,
+    baseSha,
+    headSha,
+    reason: 'pull_request',
+  });
+  assert.equal((await queue.list()).find((job) => job.id === first.id)?.status, 'cancelled');
+  assert.equal((await queue.list()).find((job) => job.id === second.id)?.status, 'queued');
+  queue.close();
+});
+
+test('same-head rerun fences an unnotified terminal failure before INFRA_ERROR comment publication', async () => {
+  let now = new Date('2026-01-01T00:00:00.000Z');
+  const queue = new SqliteQueue(':memory:', () => new Date(now));
+  const original = await enqueueWorkerJob(queue, 1);
+  const firstClaim = await queue.claim('terminal-seed', 1_000);
+  assert.equal(firstClaim?.id, original.id);
+  const failed = await queue.fail(
+    original.id,
+    { owner: firstClaim?.leaseOwner ?? '', generation: firstClaim?.leaseGeneration ?? 0 },
+    'terminal failure',
+    false,
+  );
+  assert.equal(failed?.status, 'failed');
+  now = new Date(now.getTime() + 2_000);
+  const releasedClaim = await queue.claim('terminal-release', 1_000);
+  assert.equal(releasedClaim?.status, 'failed');
+  await queue.releaseFailure(original.id, {
+    owner: releasedClaim?.leaseOwner ?? '',
+    generation: releasedClaim?.leaseGeneration ?? 0,
+  });
+
+  const started = new Deferred();
+  const release = new Deferred();
+  const calls: string[] = [];
+  const outputRoot = await mkdtemp(join(process.cwd(), 'work', 'worker-same-head-rerun-'));
+  await mkdir(join(outputRoot, original.id, 'attempts'), { recursive: true });
+  const github = {
+    async createCheck() {
+      calls.push('create-check');
+      started.resolve();
+      await release.promise;
+      return { id: 31 };
+    },
+    async updateCheck() {
+      calls.push('update-check');
+    },
+    async createComment() {
+      calls.push('create-comment');
+      return { id: 32, body: 'managed' };
+    },
+    async updateComment() {
+      calls.push('update-comment');
+    },
+  };
+  try {
+    const worker = new PatchProofWorker({
+      queue,
+      source: new FixtureSourceAdapter(),
+      store: new MemoryStateStore(),
+      github,
+      outputRoot,
+      workerId: 'worker-same-head-rerun',
+    });
+    const terminalRun = worker.runOnce();
+    await started.promise;
+    const rerun = await enqueueWorkerJob(queue, 1);
+    assert.equal((await queue.list()).find((job) => job.id === original.id)?.status, 'cancelled');
+    release.resolve();
+    const result = await terminalRun;
+    assert.equal(result.status, 'cancelled');
+    assert.equal(rerun.status, 'queued');
+    assert.deepEqual(calls, ['create-check']);
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+    queue.close();
+  }
+});
+
+test('stale terminal claims are fenced and cancelled instead of being reclaimed forever', async () => {
+  let now = new Date('2026-01-01T00:00:00.000Z');
+  const queue = new SqliteQueue(':memory:', () => new Date(now));
+  const job = await enqueueWorkerJob(queue, 1);
+  const firstClaim = await queue.claim('terminal-seed', 1_000);
+  assert.equal(firstClaim?.id, job.id);
+  const failed = await queue.fail(
+    job.id,
+    { owner: firstClaim?.leaseOwner ?? '', generation: firstClaim?.leaseGeneration ?? 0 },
+    'terminal failure',
+    false,
+  );
+  assert.equal(failed?.status, 'failed');
+  now = new Date(now.getTime() + 2_000);
+  const outputRoot = await mkdtemp(join(process.cwd(), 'work', 'stale-terminal-'));
+  try {
+    const worker = new PatchProofWorker({
+      queue,
+      source: new FixtureSourceAdapter(),
+      store: new MemoryStateStore(),
+      github: {
+        requiresFreshSnapshot: true,
+        async getPullRequest() {
+          return {
+            number: 7,
+            baseSha,
+            headSha: 'c'.repeat(40),
+            headRepository: 'octo/example',
+            fork: false,
+            state: 'open' as const,
+          };
+        },
+        async createCheck() {
+          throw new Error('stale terminal must not publish');
+        },
+        async updateCheck() {},
+        async createComment() {
+          throw new Error('stale terminal must not publish');
+        },
+        async updateComment() {},
+      },
+      outputRoot,
+      workerId: 'stale-terminal-worker',
+    });
+    const result = await worker.runOnce();
+    assert.equal(result.status, 'cancelled');
+    const cancelled = (await queue.list()).find((item) => item.id === job.id);
+    assert.equal(cancelled?.status, 'cancelled');
+    assert.equal(cancelled?.leaseOwner, undefined);
+    assert.equal(cancelled?.leaseExpiresAt, undefined);
+    assert.deepEqual(await worker.runOnce(), { status: 'idle' });
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+    queue.close();
+  }
+});
+
+test('legacy terminal rows without installation identity are acknowledged, not cancelled or looped', async () => {
+  const directory = await mkdtemp(join(process.cwd(), 'work', 'legacy-terminal-'));
+  const filename = join(directory, 'queue.sqlite');
+  let now = new Date('2026-01-01T00:00:00.000Z');
+  const legacyQueue = new SqliteQueue(filename, () => new Date(now));
+  const legacy = await legacyQueue.enqueue(
+    { repository: 'octo/example', pullRequest: 7, baseSha, headSha, reason: 'pull_request' },
+    1,
+  );
+  await legacyQueue.claim('legacy-worker', 1_000);
+  now = new Date(now.getTime() + 2_000);
+  legacyQueue.close();
+  const queue = new SqliteQueue(filename, () => new Date(now), {
+    requireInstallationId: true,
+  });
+  const outputRoot = await mkdtemp(join(process.cwd(), 'work', 'legacy-terminal-output-'));
+  try {
+    const worker = new PatchProofWorker({
+      queue,
+      source: new FixtureSourceAdapter(),
+      store: new MemoryStateStore(),
+      github: { requiresInstallationId: true },
+      outputRoot,
+      workerId: 'legacy-terminal-worker',
+    });
+    const result = await worker.runOnce();
+    assert.equal(result.status, 'failed');
+    assert.equal((await queue.list()).find((job) => job.id === legacy.id)?.status, 'failed');
+    assert.equal((await queue.list()).find((job) => job.id === legacy.id)?.failureNotified, true);
+    assert.equal((await worker.runOnce()).status, 'idle');
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+    queue.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('queue lease generations fence terminal notification and reclaim transitions', async () => {
@@ -1043,6 +1276,7 @@ test('heartbeat loss latch does not restore ownership after a later success', as
 test('overlapping runOnce calls serialize and stop leaves the waiter idle', async () => {
   const queue = new SqliteQueue(':memory:');
   const firstJob = await enqueueWorkerJob(queue);
+  await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 5));
   const secondJob = await queue.enqueue({
     repository: 'octo/example',
     pullRequest: 8,
