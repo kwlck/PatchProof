@@ -24,6 +24,7 @@ import {
   canonicalSyntheticPullRequest,
   cleanupValidationContainers,
   cleanupValidationImage,
+  listValidationImages,
   collectValidationDiagnostics,
   collectBoundedPages,
   formatValidationDiagnostics,
@@ -888,6 +889,29 @@ test('Docker build/config specs cannot pull, publish, or carry credentials', asy
   assert.doesNotMatch(dockerfile, /^FROM\s+(?!scratch)/imu);
 });
 
+test('Docker inventory dispatch separates the executable from its arguments', async () => {
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const entries = await listValidationImages(async (file, args) => {
+    calls.push({ file, args });
+    return { stdout: `repo:tag\tsha256:${'a'.repeat(64)}\n`, stderr: '' };
+  });
+  assert.equal(entries.length, 1);
+  assert.deepEqual(calls, [
+    {
+      file: 'docker',
+      args: [
+        'image',
+        'ls',
+        '--all',
+        '--no-trunc',
+        '--format',
+        '{{.Repository}}:{{.Tag}}\\t{{.ID}}',
+      ],
+    },
+  ]);
+  assert.notEqual(calls[0].args[0], 'docker');
+});
+
 test('first-party probe accepts only EROFS as read-only proof', async () => {
   const probe = await readFile(join(root, 'test', 'fixtures', 'app-validation', 'probe.c'), 'utf8');
   assert.match(probe, /open\("\/patchproof-validation-root-write"/u);
@@ -997,7 +1021,10 @@ test('image cleanup confirms tag and image-id absence, while inventory failure i
   let current = [{ reference: `${tag}:latest`, id: imageId }];
   const removed: string[] = [];
   const listImages = async () => current.map((entry) => ({ ...entry }));
-  const command = async (_file: string, args: string[]) => {
+  const command = async (file: string, args: string[]) => {
+    assert.equal(file, 'docker');
+    assert.deepEqual(args.slice(0, 2), ['image', 'rm']);
+    assert.notEqual(args[0], 'docker');
     const reference = args.at(-1);
     assert.equal(typeof reference, 'string');
     removed.push(reference as string);

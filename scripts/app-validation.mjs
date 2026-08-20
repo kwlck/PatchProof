@@ -1043,7 +1043,8 @@ function validateImageInventory(entries) {
 }
 
 export async function listValidationImages(command = fixedCommand) {
-  const result = await command('docker', buildValidationImageInventoryCommand(), {
+  const imageCommand = buildValidationImageInventoryCommand();
+  const result = await command(imageCommand[0], imageCommand.slice(1), {
     label: 'Docker image inventory',
     diagnosticStage: VALIDATION_PRIMARY_STAGES.DOCKER_INVENTORY,
   });
@@ -1094,7 +1095,8 @@ export async function cleanupValidationImage({ tag, imageId }, options = {}) {
   for (const reference of references) {
     if (!imageInventoryMatches(current, reference)) continue;
     try {
-      await command('docker', buildValidationImageRemoveCommand(reference), {
+      const removeCommand = buildValidationImageRemoveCommand(reference);
+      await command(removeCommand[0], removeCommand.slice(1), {
         label: 'Docker validation-image cleanup',
       });
     } catch (error) {
@@ -1161,7 +1163,8 @@ async function inspectLocalImage(
 }
 
 async function listDockerContainers() {
-  const result = await fixedCommand('docker', buildValidationContainerListCommand(), {
+  const containerCommand = buildValidationContainerListCommand();
+  const result = await fixedCommand(containerCommand[0], containerCommand.slice(1), {
     label: 'Docker residual inspection',
     diagnosticStage: VALIDATION_PRIMARY_STAGES.DOCKER_INVENTORY,
   });
