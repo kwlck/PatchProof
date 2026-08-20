@@ -208,18 +208,17 @@ test('summary serializer rejects unexpected fields and credential-shaped values'
 });
 
 test('summary destination is the fixed bounded RUNNER_TEMP path', () => {
-  assert.equal(
-    summaryPath('C:/runner/temp'),
-    join('C:/runner/temp', 'patchproof-app-validation-summary.json'),
-  );
+  const runnerTemp = resolve(root, 'work', 'summary-destination-test-temp');
+  assert.equal(summaryPath(runnerTemp), join(runnerTemp, 'patchproof-app-validation-summary.json'));
   assert.throws(() => summaryPath('relative/temp'), /temporary/u);
 });
 
 test('Docker build/config specs cannot pull, publish, or carry credentials', async () => {
   const tag = 'patchproof-app-validation-probe-0123456789abcdef0123456789abcdef';
+  const validationContext = resolve(root, 'test', 'fixtures', 'app-validation');
   const command = buildValidationImageCommand(
-    'C:/validation/context',
-    'C:/validation/Dockerfile',
+    validationContext,
+    join(validationContext, 'Dockerfile'),
     tag,
   );
   assert.equal(command[0], 'docker');
