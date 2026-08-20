@@ -917,12 +917,12 @@ test('GitHub transport keeps endpoint dispatch runtime-private', async () => {
     assert.equal(runtime.request, undefined);
     assert.equal(runtime.requestWithMetadata, undefined);
     assert.equal(Reflect.get(transport, '#request'), undefined);
-    assert.equal(prototypeNames.some((name) => name.includes('request')), false);
-    const forged = { method: 'GET', path: 'https://attacker.test/steal' };
-    assert.throws(
-      () => (runtime.request as (...args: unknown[]) => unknown)(forged),
-      TypeError,
+    assert.equal(
+      prototypeNames.some((name) => name.includes('request')),
+      false,
     );
+    const forged = { method: 'GET', path: 'https://attacker.test/steal' };
+    assert.throws(() => (runtime.request as (...args: unknown[]) => unknown)(forged), TypeError);
     assert.equal(mock.requests.length, 0);
   } finally {
     mock.restore();
