@@ -13,9 +13,9 @@
 
 One trusted reproduction. Two exact revisions. One evidence bundle.
 
-| Base revision | Head revision | PatchProof result |
-|:---:|:---:|:---:|
-| Expected failure | Pass | Verified evidence |
+|  Base revision   | Head revision | PatchProof result |
+| :--------------: | :-----------: | :---------------: |
+| Expected failure |     Pass      | Verified evidence |
 
 </div>
 
