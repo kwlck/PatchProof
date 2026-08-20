@@ -6,3 +6,4 @@ import './github.test.ts';
 import './app.test.ts';
 import './worker.test.ts';
 import './docs-check.test.ts';
+import './release-workflow.test.ts';
