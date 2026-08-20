@@ -1,6 +1,23 @@
+<div align="center">
+
 # PatchProof
 
-![PatchProof wordmark](docs/brand/patchproof-mark.svg)
+<img src="docs/brand/patchproof-mark.svg" alt="PatchProof wordmark" width="860">
+
+**Replayable proof that a bug fails before the patch and passes after it.**
+
+[![CI](https://github.com/kwlck/PatchProof/actions/workflows/ci.yml/badge.svg)](https://github.com/kwlck/PatchProof/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/kwlck/PatchProof/actions/workflows/codeql.yml/badge.svg)](https://github.com/kwlck/PatchProof/actions/workflows/codeql.yml)
+[![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-5FA04E?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-6EA8FE)](LICENSE)
+
+One trusted reproduction. Two exact revisions. One evidence bundle.
+
+|  Base revision   | Head revision | PatchProof result |
+| :--------------: | :-----------: | :---------------: |
+| Expected failure |     Pass      | Verified evidence |
+
+</div>
 
 PatchProof gives maintainers replayable evidence for a pull request that claims to fix a bug. It runs one trusted reproduction against the base and head revisions, records what happened, and publishes the result as a GitHub Check and one managed pull request comment.
 
