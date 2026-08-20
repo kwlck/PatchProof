@@ -4,7 +4,7 @@ PatchProof executes code from pull-request repositories. Treat it as a security 
 
 ## Reporting
 
-Do not open a public issue for a suspected vulnerability. Use a private security channel configured by the deploying organization and include a minimal reproduction, affected version, impact, and whether a secret or token may have been exposed. Do not include real credentials in a report.
+Do not open a public issue for a suspected vulnerability. [Report it privately through GitHub Security Advisories](https://github.com/kwlck/PatchProof/security/advisories/new) and include a minimal reproduction, affected version, impact, and whether a secret or token may have been exposed. Do not include real credentials in a report.
 
 ## Secret scanning guidance
 
