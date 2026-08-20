@@ -21,11 +21,14 @@ Subscribe only to the `pull_request` and `issue_comment` events. The App should 
 Create a separate GitHub Actions environment named `app-validation` with all of the following protections:
 
 - restrict deployment branches to `main`;
-- require a reviewer before the job can access the environment;
-- prevent self-review where the repository settings support that control; and
+- require `kwlck` to approve before the job can access the environment;
+- set the wait timer to zero;
+- leave self-review prevention disabled while `kwlck` is the only maintainer; and
 - do not use an administrator bypass during normal operation.
 
-Add exactly these environment secrets. Do not put them in repository variables, workflow files, command arguments, `GITHUB_ENV`, or step outputs:
+This solo-maintainer approval is a deliberate checkpoint against accidental execution, not independent review or account-compromise protection. A fresh Sol High review of the exact harness SHA is mandatory before each credentialed run. When a trusted second maintainer exists, or before production use, require that maintainer as the reviewer and enable self-review prevention.
+
+The environment has no secrets or variables yet. During setup, add exactly these environment secrets. Do not put them in repository variables, workflow files, command arguments, `GITHUB_ENV`, or step outputs:
 
 - `PATCHPROOF_VALIDATION_APP_PRIVATE_KEY`
 - `PATCHPROOF_VALIDATION_WEBHOOK_SECRET`
