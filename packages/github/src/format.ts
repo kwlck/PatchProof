@@ -4,10 +4,13 @@ import { renderMarkdownReport } from '@patchproof/report';
 export const MANAGED_COMMENT_START = '<!-- patchproof:summary:start -->';
 export const MANAGED_COMMENT_END = '<!-- patchproof:summary:end -->';
 
-export type CheckConclusion = 'success' | 'failure' | 'neutral' | 'action_required' | 'timed_out';
+export type CheckConclusion =
+  'success' | 'failure' | 'neutral' | 'action_required' | 'timed_out' | 'cancelled';
 
 export interface CheckRunPayload {
   name: 'PatchProof';
+  /** Deterministic GitHub external_id used to reconcile accepted creates. */
+  externalName?: string;
   status: 'queued' | 'in_progress' | 'completed';
   conclusion?: CheckConclusion;
   output: {
@@ -15,6 +18,19 @@ export interface CheckRunPayload {
     summary: string;
     text: string;
   };
+}
+
+/**
+ * The external ID is deliberately scoped to the repository, PR, and exact
+ * head. GitHub's check-run list endpoint can then reconcile a create accepted
+ * immediately before a local state write.
+ */
+export function managedCheckExternalName(
+  repository: string,
+  pullRequest: number,
+  headSha: string,
+): string {
+  return `patchproof:${repository}#${pullRequest}:${headSha.toLowerCase()}`;
 }
 
 export interface PullRequestCommentPayload {
@@ -63,6 +79,19 @@ export function buildQueuedCheckPayload(scenarioId = 'configured scenario'): Che
       title: 'PatchProof: queued',
       summary: `PatchProof will evaluate ${scenarioId} in the isolated runner.`,
       text: 'The webhook process only queued this run; it does not execute pull-request code.',
+    },
+  };
+}
+
+export function buildCancelledCheckPayload(): CheckRunPayload {
+  return {
+    name: 'PatchProof',
+    status: 'completed',
+    conclusion: 'cancelled',
+    output: {
+      title: 'PatchProof: cancelled',
+      summary: 'This pull-request revision was superseded or closed before execution completed.',
+      text: 'No result is published for a stale pull-request revision.',
     },
   };
 }

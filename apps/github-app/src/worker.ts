@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, readdir, realpath, rename, rm, unlink } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, realpath, rename, rm, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import {
   loadTrustedConfig,
@@ -7,7 +7,12 @@ import {
   type ConfigParseResult,
 } from '@patchproof/config';
 import { writeEvidenceBundle } from '@patchproof/cli';
-import { runTwoRevisions, type PolicyDeniedRun, type TwoRevisionRun } from '@patchproof/runner';
+import {
+  runTwoRevisions,
+  type OperatorPolicyInput,
+  type PolicyDeniedRun,
+  type TwoRevisionRun,
+} from '@patchproof/runner';
 import type { GitHubTransport, ManagedStateStore } from '@patchproof/github';
 import { publishRunFailure, publishRunResult, type PublicationFence } from './publisher.js';
 import type { QueueCleanupCursor, QueueJob, QueueLease, RunQueue } from './queue.js';
@@ -18,6 +23,8 @@ export interface WorkerRunInput {
   configResult: ConfigParseResult;
   basePath: string;
   headPath: string;
+  /** Cancellation handoff for source adapters and the runner implementation. */
+  signal: AbortSignal;
 }
 
 export type WorkerScenarioExecutor = (
@@ -34,6 +41,14 @@ export interface PatchProofWorkerDependencies {
   leaseMs?: number;
   backendOverride?: 'docker' | 'local';
   allowUnsafeLocal?: boolean;
+  /** Operator-owned runner ceilings and isolation requirements. */
+  operatorPolicy?: OperatorPolicyInput;
+  requireFreshSnapshot?: boolean;
+  /** Bounded operator hook; no evidence deletion is performed by default. */
+  retention?: {
+    maxCleanupJobs?: number;
+    onTerminalCandidate?: (candidate: QueueCleanupCursor) => Promise<void>;
+  };
   executeScenario?: WorkerScenarioExecutor;
   /** Low-level quarantine removal seam for deterministic worker tests. */
   removeSources?: (quarantinePath: string) => Promise<void>;
@@ -56,6 +71,7 @@ const MAX_REAPER_JOBS = 8;
 const OWNER_UUID_LENGTH = 36;
 const OWNER_SEPARATOR_LENGTH = 1;
 const MAX_QUEUE_OWNER_LENGTH = 128;
+let warnedWindowsPermissions = false;
 
 const LEASE_LOST_ERROR = 'Queue job was cancelled or superseded before publication';
 
@@ -131,6 +147,13 @@ class LeaseLostError extends Error {
   public constructor(cause?: unknown) {
     super(LEASE_LOST_ERROR, { cause });
     this.name = 'LeaseLostError';
+  }
+}
+
+class PullRequestStaleError extends Error {
+  public constructor(message = 'Pull request changed or closed before publication') {
+    super(message);
+    this.name = 'PullRequestStaleError';
   }
 }
 
@@ -242,11 +265,20 @@ function sanitizeWorkerText(message: string, paths: readonly string[]): string {
   const tokens = [...new Set(paths.flatMap(pathVariants))]
     .filter(Boolean)
     .sort((left, right) => right.length - left.length);
-  if (tokens.length === 0) return message;
-  return message.replace(
-    new RegExp(tokens.map(escapeRegex).join('|'), 'giu'),
-    '[worker path omitted]',
-  );
+  const withPaths =
+    tokens.length === 0
+      ? message
+      : message.replace(
+          new RegExp(tokens.map(escapeRegex).join('|'), 'giu'),
+          '[worker path omitted]',
+        );
+  return withPaths
+    .replaceAll(/Authorization\s*:\s*Bearer\s+[^\s`]+/giu, 'Authorization: [credential omitted]')
+    .replaceAll(
+      /((?:token|secret|private[_ -]?key))\s*[:=]\s*[^\s`]+/giu,
+      '$1: [credential omitted]',
+    )
+    .replaceAll(/(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/gu, '[credential omitted]');
 }
 
 function sanitizedErrorMessage(error: unknown, paths: readonly string[]): string {
@@ -291,6 +323,7 @@ function retryableWorkerError(error: unknown): boolean {
  */
 export class PatchProofWorker {
   private readonly leaseMs: number;
+  private readonly maxReaperJobs: number;
   private stopping = false;
   private activeFence: WorkerLeaseFence | undefined;
   private reaperCursor: QueueCleanupCursor | undefined;
@@ -298,6 +331,10 @@ export class PatchProofWorker {
 
   public constructor(private readonly dependencies: PatchProofWorkerDependencies) {
     this.leaseMs = dependencies.leaseMs ?? 60_000;
+    const configured = dependencies.retention?.maxCleanupJobs ?? MAX_REAPER_JOBS;
+    if (!Number.isSafeInteger(configured) || configured < 1 || configured > 100)
+      throw new Error('Worker retention cleanup bound is invalid');
+    this.maxReaperJobs = configured;
   }
 
   public stop(): void {
@@ -309,7 +346,7 @@ export class PatchProofWorker {
     const configuredRoot = resolve(this.dependencies.outputRoot);
     if (create) {
       try {
-        await mkdir(configuredRoot, { recursive: true });
+        await mkdir(configuredRoot, { recursive: true, mode: 0o700 });
       } catch (error) {
         throw new WorkerFilesystemError('Configured output root is unavailable', error);
       }
@@ -352,7 +389,7 @@ export class PatchProofWorker {
     const jobPath = join(outputRoot.realRoot, jobId);
     if (create) {
       try {
-        await mkdir(jobPath);
+        await mkdir(jobPath, { mode: 0o700 });
       } catch (error) {
         if (!isAlreadyExistingPath(error))
           throw new WorkerFilesystemError('Job root is unavailable', error);
@@ -377,7 +414,7 @@ export class PatchProofWorker {
     const attemptsRoot = join(jobRoot, 'attempts');
     if (create) {
       try {
-        await mkdir(attemptsRoot);
+        await mkdir(attemptsRoot, { mode: 0o700 });
       } catch (error) {
         if (!isAlreadyExistingPath(error))
           throw new WorkerFilesystemError('Attempts root is unavailable', error);
@@ -417,7 +454,7 @@ export class PatchProofWorker {
       attemptName = `${job.attempts}-${randomUUID()}`;
       attemptRoot = join(attemptsRoot, attemptName);
       try {
-        await mkdir(attemptRoot);
+        await mkdir(attemptRoot, { mode: 0o700 });
         break;
       } catch (error) {
         if (!isAlreadyExistingPath(error) || index === 2)
@@ -440,8 +477,8 @@ export class PatchProofWorker {
     const evidenceRoot = join(attemptRealPath, 'evidence');
     const sourcesRoot = join(attemptRealPath, 'sources');
     try {
-      await mkdir(evidenceRoot);
-      await mkdir(sourcesRoot);
+      await mkdir(evidenceRoot, { mode: 0o700 });
+      await mkdir(sourcesRoot, { mode: 0o700 });
     } catch (error) {
       throw new WorkerFilesystemError('Attempt workspace is unavailable', error);
     }
@@ -651,7 +688,7 @@ export class PatchProofWorker {
     }
   }
 
-  private async execute(job: QueueJob): Promise<ExecuteResult> {
+  private async execute(job: QueueJob, signal: AbortSignal): Promise<ExecuteResult> {
     const paths = await this.createAttempt(job);
     const basePath = join(paths.sourcesRoot, 'base');
     const headPath = join(paths.sourcesRoot, 'head');
@@ -660,8 +697,19 @@ export class PatchProofWorker {
     let primaryError: unknown;
     let primaryFailed = false;
     try {
-      await this.dependencies.source.materializeRevision(job.repository, job.baseSha, basePath);
-      await this.dependencies.source.materializeRevision(job.headRepository, job.headSha, headPath);
+      await this.dependencies.source.materializeRevision(job.repository, job.baseSha, basePath, {
+        ...(job.installationId === undefined ? {} : { installationId: job.installationId }),
+        signal,
+      });
+      await this.dependencies.source.materializeRevision(
+        job.headRepository,
+        job.headSha,
+        headPath,
+        {
+          ...(job.installationId === undefined ? {} : { installationId: job.installationId }),
+          signal,
+        },
+      );
       const configResult = await loadTrustedConfig(join(basePath, '.patchproof.yml'), basePath);
       const executor =
         this.dependencies.executeScenario ??
@@ -678,8 +726,12 @@ export class PatchProofWorker {
               : { backendOverride: this.dependencies.backendOverride }),
             allowUnsafeLocal: this.dependencies.allowUnsafeLocal === true,
             trustedConfig: true,
+            ...(this.dependencies.operatorPolicy === undefined
+              ? {}
+              : { operatorPolicy: this.dependencies.operatorPolicy }),
+            signal: input.signal,
           }));
-      const run = await executor({ job, configResult, basePath, headPath });
+      const run = await executor({ job, configResult, basePath, headPath, signal });
       const backend = this.dependencies.backendOverride ?? configResult.config.policy.backend;
       built = await writeEvidenceBundle({
         outputPath: paths.evidenceRoot,
@@ -703,6 +755,7 @@ export class PatchProofWorker {
           location: 'head',
         },
       });
+      await this.secureEvidenceTree(paths.evidenceRoot);
     } catch (error) {
       primaryFailed = true;
       primaryError = error;
@@ -733,17 +786,96 @@ export class PatchProofWorker {
     };
   }
 
+  private async secureEvidenceTree(root: string): Promise<void> {
+    await this.chmodOwned(root, 0o700);
+    const entries = await readdir(root, { withFileTypes: true });
+    for (const entry of entries) {
+      const child = join(root, entry.name);
+      if (entry.isSymbolicLink())
+        throw new WorkerFilesystemError('Evidence tree contains an unexpected link');
+      if (entry.isDirectory()) {
+        await this.secureEvidenceTree(child);
+      } else if (entry.isFile()) {
+        await this.chmodOwned(child, 0o600);
+      } else {
+        throw new WorkerFilesystemError('Evidence tree contains an unexpected entry');
+      }
+    }
+  }
+
+  private async chmodOwned(path: string, mode: number): Promise<void> {
+    if (process.platform === 'win32') {
+      if (!warnedWindowsPermissions) {
+        warnedWindowsPermissions = true;
+        console.warn('PatchProof POSIX evidence modes are unavailable on Windows; use ACLs.');
+      }
+      return;
+    }
+    const stats = await stat(path);
+    const getUid = process.getuid;
+    if (typeof getUid === 'function' && stats.uid !== getUid())
+      throw new WorkerFilesystemError('Evidence path ownership could not be validated');
+    await chmod(path, mode);
+  }
+
+  private shouldRequireFreshSnapshot(): boolean {
+    return (
+      this.dependencies.requireFreshSnapshot === true ||
+      this.dependencies.github.requiresFreshSnapshot === true
+    );
+  }
+
+  private async assertFreshPullRequest(job: QueueJob, fence: WorkerLeaseFence): Promise<void> {
+    if (!this.shouldRequireFreshSnapshot()) return;
+    await fence.assertOwned();
+    const snapshot = await this.dependencies.github.getPullRequest(
+      job.repository,
+      job.pullRequest,
+      {
+        signal: fence.signal,
+        ...(job.installationId === undefined ? {} : { installationId: job.installationId }),
+      },
+    );
+    if (
+      snapshot.number !== job.pullRequest ||
+      snapshot.state !== 'open' ||
+      snapshot.headSha.toLowerCase() !== job.headSha.toLowerCase() ||
+      snapshot.headRepository !== job.headRepository ||
+      (snapshot.repository !== undefined && snapshot.repository !== job.repository)
+    )
+      throw new PullRequestStaleError();
+    await fence.assertOwned();
+  }
+
+  private async cancelStaleJob(
+    job: QueueJob,
+    lease: QueueLease,
+    fence: WorkerLeaseFence,
+  ): Promise<WorkerRunResult> {
+    if (fence.lost) return { status: 'cancelled', job, error: LEASE_LOST_ERROR };
+    const reason = 'Pull request changed or closed before publication';
+    const cancelled =
+      job.status === 'failed'
+        ? await this.dependencies.queue.cancelTerminal(job.id, lease, reason)
+        : await this.dependencies.queue.cancel(job.id, reason);
+    return {
+      status: 'cancelled',
+      job,
+      error: cancelled ? reason : LEASE_LOST_ERROR,
+    };
+  }
+
   private async reaperAtIdle(): Promise<void> {
     let candidates: QueueCleanupCursor[];
     try {
       candidates = await this.dependencies.queue.listTerminalCleanupCandidates(
         this.reaperCursor,
-        MAX_REAPER_JOBS,
+        this.maxReaperJobs,
       );
       if (candidates.length === 0 && this.reaperCursor !== undefined) {
         candidates = await this.dependencies.queue.listTerminalCleanupCandidates(
           undefined,
-          MAX_REAPER_JOBS,
+          this.maxReaperJobs,
         );
       }
     } catch {
@@ -753,6 +885,8 @@ export class PatchProofWorker {
     for (const candidate of candidates) {
       try {
         await this.cleanupTerminalAttempts(candidate.id);
+        if (this.dependencies.retention?.onTerminalCandidate !== undefined)
+          await this.dependencies.retention.onTerminalCandidate(candidate);
       } catch {
         // Idle reaping is best effort. A failed terminal claim remains authoritative.
       } finally {
@@ -786,6 +920,18 @@ export class PatchProofWorker {
         error: LEASE_LOST_ERROR,
       };
     try {
+      await this.assertFreshPullRequest(claimed, fence);
+    } catch (error) {
+      if (error instanceof PullRequestStaleError) return this.cancelStaleJob(claimed, lease, fence);
+      if (fence.lost)
+        return {
+          status: 'cancelled',
+          job: claimed,
+          error: LEASE_LOST_ERROR,
+        };
+      return { status: 'failed', job: claimed, error: 'Pull request freshness check failed' };
+    }
+    try {
       await this.cleanupTerminalAttempts(claimed.id);
     } catch {
       if (fence.lost)
@@ -814,6 +960,9 @@ export class PatchProofWorker {
       await fence.assertOwned();
       await publishRunFailure(
         {
+          ...(claimed.installationId === undefined
+            ? {}
+            : { installationId: claimed.installationId }),
           repository: claimed.repository,
           pullRequest: claimed.pullRequest,
           headSha: claimed.headSha,
@@ -883,13 +1032,45 @@ export class PatchProofWorker {
     let attemptPaths: AttemptPaths | undefined;
     let evidencePath: string | undefined;
     try {
+      if (
+        this.dependencies.github.requiresInstallationId === true &&
+        claimed.installationId === undefined
+      ) {
+        if (claimed.status === 'failed') {
+          const acknowledged = await this.dependencies.queue.acknowledgeFailure(claimed.id, lease);
+          return {
+            status: 'failed',
+            job: claimed,
+            error: acknowledged
+              ? (claimed.lastError ??
+                'Legacy terminal job acknowledged without installation identity')
+              : 'Legacy terminal job could not be acknowledged',
+          };
+        }
+        await this.dependencies.queue.cancel(claimed.id, 'Installation identity unavailable');
+        return {
+          status: 'cancelled',
+          job: claimed,
+          error: 'Installation identity unavailable',
+        };
+      }
       if (claimed.status === 'failed') return await this.runTerminalClaim(claimed, lease, fence);
-      const result = await this.execute(claimed);
+      const result = await this.execute(claimed, fence.signal);
       attemptPaths = result.paths;
       evidencePath = result.bundlePath;
       await fence.assertOwned();
+      try {
+        await this.assertFreshPullRequest(claimed, fence);
+      } catch (error) {
+        if (error instanceof PullRequestStaleError)
+          return await this.cancelStaleJob(claimed, lease, fence);
+        throw error;
+      }
       await publishRunResult(
         {
+          ...(claimed.installationId === undefined
+            ? {}
+            : { installationId: claimed.installationId }),
           repository: claimed.repository,
           pullRequest: claimed.pullRequest,
           headSha: claimed.headSha,

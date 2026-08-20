@@ -12,6 +12,10 @@ export interface ExecutionSpec {
   outputBytes: number;
   secrets: string[];
   policy: PatchProofConfig['policy'];
+  /** Abort only the scenario process; backend cleanup remains bounded and mandatory. */
+  signal?: AbortSignal;
+  /** Operator-owned provisioning budget, separate from scenario timeout. */
+  provisioningTimeoutMs?: number;
 }
 
 export interface BackendExecution {
@@ -26,6 +30,10 @@ export interface BackendExecution {
   stderrTruncated: boolean;
   stdoutSizeBytes: number;
   stderrSizeBytes: number;
+  /** True when the caller cancelled this execution. */
+  cancelled?: boolean;
+  /** True when output, rather than wall-clock timeout, requested termination. */
+  outputLimitHit?: boolean;
   error?: string;
 }
 

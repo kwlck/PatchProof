@@ -1,4 +1,12 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 
@@ -48,37 +56,39 @@ else {
   const help = execFileSync(process.execPath, [cli, '--help'], {
     cwd: root,
     encoding: 'utf8',
+    shell: false,
+    windowsHide: true,
   });
   for (const command of ['init', 'validate', 'run', 'verify', 'replay', 'doctor'])
     if (!help.includes(`patchproof ${command}`)) failures.push(`CLI help is missing ${command}`);
-  const output = mkdtempSync(join(root, 'work', 'docs-check-'));
+  const workspace = mkdtempSync(join(root, 'work', 'docs-check-'));
   try {
+    const config = materializeLocalFixture(workspace);
+    const output = join(workspace, 'output');
     const report = execFileSync(
       process.execPath,
       [
         cli,
         'run',
-        'fixtures/pass/.patchproof.yml',
+        config,
         '--base',
-        'fixtures/pass/base',
+        resolve(root, 'fixtures/pass/base'),
         '--head',
-        'fixtures/pass/head',
+        resolve(root, 'fixtures/pass/head'),
         '--backend',
         'local',
         '--allow-unsafe-local',
         '--output',
         output,
       ],
-      { cwd: root, encoding: 'utf8' },
+      { cwd: root, encoding: 'utf8', shell: false, windowsHide: true, maxBuffer: 1_000_000 },
     );
     for (const marker of ['PatchProof PASS -', 'BASE', 'HEAD', 'Evidence   schema=1', 'Replay'])
       if (!report.includes(marker)) failures.push(`CLI report is missing: ${marker}`);
   } catch (error) {
-    failures.push(
-      `CLI fixture report did not run: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    failures.push(`CLI fixture report did not run: ${commandDiagnostics(error)}`);
   } finally {
-    rmSync(output, { recursive: true, force: true });
+    rmSync(workspace, { recursive: true, force: true });
   }
 }
 if (failures.length > 0) {
@@ -97,4 +107,39 @@ function walk(directory) {
     else if (entry.isFile() && entry.name.endsWith('.md')) result.push(path.slice(root.length + 1));
   }
   return result;
+}
+
+function materializeLocalFixture(workspace) {
+  const source = resolve(root, 'fixtures/pass/.patchproof.yml');
+  const destination = join(workspace, 'pass.local.patchproof.yml');
+  copyFileSync(source, destination);
+  const fixture = readFileSync(destination, 'utf8');
+  const policy = /^(policy:\r?\n)(?:  allowUnsafeLocal:[^\r\n]*\r?\n)?/mu;
+  if (!policy.test(fixture)) throw new Error('trusted fixture is missing its policy section');
+  const localFixture = fixture.replace(policy, (section, header) => {
+    const lineEnding = header.endsWith('\r\n') ? '\r\n' : '\n';
+    return `${header}  allowUnsafeLocal: true${lineEnding}`;
+  });
+  if (!/^  allowUnsafeLocal:\s*true\s*$/mu.test(localFixture))
+    throw new Error('temporary docs-check fixture did not enable unsafe local execution');
+  writeFileSync(destination, localFixture, 'utf8');
+  return destination;
+}
+
+function commandDiagnostics(error) {
+  if (error !== null && typeof error === 'object') {
+    const status =
+      'status' in error && (typeof error.status === 'number' || typeof error.status === 'string')
+        ? `exit code ${String(error.status)}`
+        : undefined;
+    const stderr = 'stderr' in error && typeof error.stderr === 'string' ? error.stderr.trim() : '';
+    const details = [status];
+    if (stderr.length > 0) {
+      const bounded =
+        stderr.length > 4_096 ? `${stderr.slice(0, 4_096)}\n[stderr truncated]` : stderr;
+      details.push(`stderr: ${bounded}`);
+    }
+    if (details.some((detail) => detail !== undefined)) return details.filter(Boolean).join('; ');
+  }
+  return error instanceof Error ? error.message : String(error);
 }

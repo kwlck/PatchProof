@@ -1,30 +1,166 @@
 name: Release artifacts
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and validate release assets without creating a GitHub Release
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  quality:
+    name: release checks / Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 11.16.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm test:e2e
+      - run: pnpm build
+      - run: docker version
+      - run: pnpm test:docker
+      - run: pnpm docs:check
+      - run: pnpm editorial:check
+      - run: pnpm audit --prod
+      - run: pnpm package:check
+
+  artifacts:
+    name: release assets
+    needs: quality
+    outputs:
+      version: ${{ steps.package-version.outputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: pnpm
+      - name: Set deterministic release timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct \"$GITHUB_SHA\")" >> "$GITHUB_ENV"
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - run: node scripts/sbom.mjs
-      - uses: actions/upload-artifact@v4
+      - name: Read package version
+        id: package-version
+        shell: bash
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+      - run: pnpm package:build
+      - run: pnpm release:sbom -- --artifact "work/release/patchproof-${{ steps.package-version.outputs.version }}.tgz"
+      - run: pnpm sbom:check -- --artifact "work/release/patchproof-${{ steps.package-version.outputs.version }}.tgz"
+      - run: node scripts/checksums.mjs --asset "work/release/patchproof-${{ steps.package-version.outputs.version }}.tgz" --asset "work/release/patchproof-${{ steps.package-version.outputs.version }}.spdx.json"
+      - name: Check release version and asset names
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            node scripts/version-check.mjs --tag "$GITHUB_REF_NAME" --package work/release/package/package.json --asset "work/release/patchproof-${{ steps.package-version.outputs.version }}.tgz" --asset "work/release/patchproof-${{ steps.package-version.outputs.version }}.spdx.json" --asset work/release/SHA256SUMS
+          else
+            node scripts/version-check.mjs --package work/release/package/package.json --asset "work/release/patchproof-${{ steps.package-version.outputs.version }}.tgz" --asset "work/release/patchproof-${{ steps.package-version.outputs.version }}.spdx.json" --asset work/release/SHA256SUMS
+          fi
+      - name: Verify release checksums
+        shell: bash
+        run: cd work/release && sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: patchproof-release-artifacts
+          name: patchproof-release-assets
+          if-no-files-found: error
           path: |
-            packages/*/dist
-            apps/*/dist
-            work/release/patchproof-sbom.spdx.json
+            work/release/patchproof-${{ steps.package-version.outputs.version }}.tgz
+            work/release/patchproof-${{ steps.package-version.outputs.version }}.spdx.json
+            work/release/SHA256SUMS
+          retention-days: 14
+
+  release:
+    name: publish GitHub Release
+    needs: artifacts
+    if: ${{ needs.artifacts.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    # Configure the protected `release` environment and main branch/tag rules in repository settings.
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Verify tag commit is on origin/main
+        shell: bash
+        run: |
+          git fetch origin '+refs/heads/main:refs/remotes/origin/main' --no-tags
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          main_commit="$(git rev-parse origin/main)"
+          git merge-base --is-ancestor "$tag_commit" "$main_commit"
+      - name: Read package version
+        id: package-version
+        shell: bash
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: patchproof-release-assets
+          path: work/release
+      - name: Verify downloaded release checksums
+        shell: bash
+        run: cd work/release && sha256sum -c SHA256SUMS
+      - name: Attest release assets
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            work/release/patchproof-${{ needs.artifacts.outputs.version }}.tgz
+            work/release/patchproof-${{ needs.artifacts.outputs.version }}.spdx.json
+            work/release/SHA256SUMS
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "PatchProof $GITHUB_REF_NAME" \
+            --notes "PatchProof $GITHUB_REF_NAME standalone CLI distribution. SHA256SUMS contains SHA-256 digests for each asset." \
+            work/release/patchproof-${{ needs.artifacts.outputs.version }}.tgz \
+            work/release/patchproof-${{ needs.artifacts.outputs.version }}.spdx.json \
+            work/release/SHA256SUMS
+  dry-run:
+    name: validate release dry run
+    needs: artifacts
+    if: ${{ needs.artifacts.result == 'success' && github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: patchproof-release-assets
+          path: work/release
+      - name: Verify dry-run checksums
+        shell: bash
+        run: cd work/release && sha256sum -c SHA256SUMS
+      - run: echo 'Dry run complete. Release creation, write permissions, and attestations were skipped.'

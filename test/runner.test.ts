@@ -6,10 +6,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildDockerCommand,
+  DockerBackend,
+  applyOperatorPolicy,
   hashKnownLockfile,
+  isPolicyDeniedRun,
   LocalProcessBackend,
   prepareDockerWorkspace,
+  runTwoRevisions,
 } from '@patchproof/runner';
+import type { PatchProofConfig } from '@patchproof/config';
+import type { BackendExecution, ExecutionBackend, ExecutionSpec } from '@patchproof/runner';
 
 const policy = {
   backend: 'docker' as const,
@@ -140,6 +146,256 @@ test('Docker command encodes the isolation policy and scenario environment', () 
       }),
     /absolute path/u,
   );
+  assert.throws(
+    () =>
+      buildDockerCommand({
+        revision: 'head',
+        workspace: 'C:/workspace',
+        command: ['node'],
+        cwd: '.',
+        environment: {},
+        timeoutMs: 2000,
+        outputBytes: 4096,
+        secrets: [],
+        policy: { ...policy, dockerImage: '--privileged' },
+      }),
+    /image/u,
+  );
+  const nested = buildDockerCommand(
+    {
+      revision: 'head',
+      workspace: 'C:/workspace',
+      command: ['node', 'scenario.mjs'],
+      cwd: 'nested/project',
+      environment: { SCENARIO_ONLY: 'inside' },
+      timeoutMs: 2000,
+      outputBytes: 4096,
+      secrets: [],
+      policy,
+    },
+    { containerName: 'patchproof-test-container', cidFile: 'C:/tmp/patchproof.cid' },
+  );
+  assert.ok(nested.includes('--pull'));
+  assert.ok(nested.includes('never'));
+  assert.ok(nested.includes('--name'));
+  assert.ok(nested.includes('patchproof-test-container'));
+  assert.ok(nested.includes('--cidfile'));
+  assert.ok(nested.includes('C:/tmp/patchproof.cid'));
+  assert.ok(nested.includes('/workspace/nested/project'));
+  assert.equal(nested.includes('--rm'), false);
+});
+
+test('operator policy constrains limits and requires approved immutable images', () => {
+  const bounded = applyOperatorPolicy(policy, {
+    forceDocker: true,
+    maxTimeoutMs: 1000,
+  });
+  assert.equal(bounded.allowed, false);
+  assert.match(bounded.reason ?? '', /timeoutMs/u);
+  const digest = `node@sha256:${'a'.repeat(64)}`;
+  const approved = applyOperatorPolicy(
+    { ...policy, dockerImage: digest },
+    {
+      forceDocker: true,
+      approvedDockerImages: [digest],
+      requireDigestPinnedImages: true,
+    },
+  );
+  assert.equal(approved.allowed, true);
+  const unauthorized = applyOperatorPolicy(
+    { ...policy, dockerImage: `node@sha256:${'b'.repeat(64)}` },
+    {
+      forceDocker: true,
+      approvedDockerImages: [digest],
+      requireDigestPinnedImages: true,
+    },
+  );
+  assert.equal(unauthorized.allowed, false);
+  assert.match(unauthorized.reason ?? '', /approved/u);
+});
+
+test('operator constraints inspect the effective Docker override', async () => {
+  const config: PatchProofConfig = {
+    version: 1,
+    name: 'effective backend policy test',
+    scenario: {
+      id: 'effective-backend-policy',
+      name: 'effective backend policy',
+      command: ['node'],
+      cwd: '.',
+      expectedFailure: { exitCode: 1 },
+      environment: {},
+    },
+    policy: { ...policy, backend: 'local', dockerImage: 'node:latest' },
+    redaction: { secrets: [] },
+  };
+  const result = await runTwoRevisions({
+    config,
+    basePath: process.cwd(),
+    headPath: process.cwd(),
+    backendOverride: 'docker',
+    trustedConfig: true,
+    operatorPolicy: { forceDocker: true, requireDigestPinnedImages: true },
+  });
+  assert.equal(isPolicyDeniedRun(result), true);
+  if (isPolicyDeniedRun(result)) assert.match(result.reason, /sha256/u);
+});
+
+test('local execution requires both trusted config opt-in and explicit caller opt-in', async () => {
+  const config: PatchProofConfig = {
+    version: 1,
+    name: 'local opt-in test',
+    scenario: {
+      id: 'local-opt-in',
+      name: 'local opt-in',
+      command: ['node'],
+      cwd: '.',
+      expectedFailure: { exitCode: 1 },
+      environment: {},
+    },
+    policy: { ...policy, backend: 'local', allowUnsafeLocal: false },
+    redaction: { secrets: [] },
+  };
+  const run = await runTwoRevisions({
+    config,
+    basePath: process.cwd(),
+    headPath: process.cwd(),
+    backendOverride: 'local',
+    allowUnsafeLocal: true,
+    trustedConfig: true,
+  });
+  assert.equal(isPolicyDeniedRun(run), true);
+  if (isPolicyDeniedRun(run)) assert.match(run.reason, /explicit unsafe opt-in/u);
+});
+
+function fakeExecution(overrides: Partial<BackendExecution> = {}): BackendExecution {
+  return {
+    exitCode: 0,
+    timedOut: false,
+    startedAt: new Date().toISOString(),
+    durationMs: 0,
+    stdout: '',
+    stderr: '',
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    stdoutSizeBytes: 0,
+    stderrSizeBytes: 0,
+    ...overrides,
+  };
+}
+
+test('Docker backend keeps scenario env out of launcher env and always cleans a named container', async () => {
+  const calls: ExecutionSpec[] = [];
+  const processBackend: ExecutionBackend = {
+    kind: 'local',
+    async run(spec) {
+      calls.push(spec);
+      if (spec.command[1] === 'image') return fakeExecution();
+      if (spec.command[1] === 'run') {
+        const cidIndex = spec.command.indexOf('--cidfile');
+        const cidFile = spec.command[cidIndex + 1];
+        assert.ok(cidFile);
+        await writeFile(cidFile, `${'a'.repeat(64)}\n`, 'utf8');
+        return fakeExecution({ exitCode: 42 });
+      }
+      return fakeExecution();
+    },
+  };
+  const result = await new DockerBackend(processBackend).run({
+    revision: 'head',
+    workspace: process.cwd(),
+    command: ['node', 'scenario.mjs'],
+    cwd: 'nested/project',
+    environment: { SCENARIO_ONLY: 'inside', PATH: 'host-path' },
+    launcherEnvironment: { PATH: 'host-path', SystemRoot: 'system', HOST_SECRET: 'never' },
+    timeoutMs: 2000,
+    outputBytes: 4096,
+    secrets: [],
+    policy,
+  });
+  assert.equal(result.exitCode, 42);
+  assert.equal(result.error, undefined);
+  const runCall = calls.find((call) => call.command[1] === 'run');
+  assert.ok(runCall);
+  assert.deepEqual(runCall.environment, {});
+  assert.deepEqual(runCall.launcherEnvironment, { PATH: 'host-path', SystemRoot: 'system' });
+  assert.ok(runCall.command.includes('SCENARIO_ONLY=inside'));
+  assert.equal(
+    runCall.command.some((item) => item.includes('host-secret')),
+    false,
+  );
+  const runName = runCall.command[runCall.command.indexOf('--name') + 1];
+  assert.match(runName ?? '', /^patchproof-head-[0-9a-f]{32}$/u);
+  assert.equal(calls.filter((call) => call.command[2] === 'stop').length, 1);
+  assert.equal(calls.filter((call) => call.command[2] === 'kill').length, 1);
+  assert.equal(calls.filter((call) => call.command[2] === 'rm').length, 1);
+  assert.equal(
+    calls.some((call) => call.command.includes('{{.Names}}')),
+    true,
+  );
+});
+
+test('Docker backend preserves a timeout while a SIGTERM-ignoring launcher settles', async () => {
+  const processBackend: ExecutionBackend = {
+    kind: 'local',
+    async run(spec) {
+      if (spec.command[1] === 'image') return fakeExecution();
+      if (spec.command[1] === 'run') {
+        const cidIndex = spec.command.indexOf('--cidfile');
+        const cidFile = spec.command[cidIndex + 1];
+        assert.ok(cidFile);
+        // Model Docker CLI waiting for a container that ignored SIGTERM. The
+        // real LocalProcessBackend resolves after its bounded SIGKILL path.
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        await writeFile(cidFile, `${'b'.repeat(64)}\n`, 'utf8');
+        return fakeExecution({
+          exitCode: null,
+          signal: 'SIGKILL',
+          timedOut: true,
+          error: 'Execution exceeded 50 ms',
+        });
+      }
+      return fakeExecution();
+    },
+  };
+  const result = await new DockerBackend(processBackend, { cleanupTimeoutMs: 100 }).run({
+    revision: 'head',
+    workspace: process.cwd(),
+    command: ['node', 'scenario.mjs'],
+    cwd: '.',
+    environment: {},
+    timeoutMs: 50,
+    outputBytes: 1024,
+    secrets: [],
+    policy,
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.error, 'Execution exceeded 50 ms');
+});
+
+test('Docker backend hard-settles a never-resolving provisioning backend', async () => {
+  const processBackend: ExecutionBackend = {
+    kind: 'local',
+    run: async () => new Promise<BackendExecution>(() => undefined),
+  };
+  const started = performance.now();
+  const result = await new DockerBackend(processBackend, {
+    provisioningTimeoutMs: 20,
+    cleanupTimeoutMs: 20,
+  }).run({
+    revision: 'head',
+    workspace: process.cwd(),
+    command: ['node'],
+    cwd: '.',
+    environment: {},
+    timeoutMs: 20,
+    outputBytes: 1024,
+    secrets: [],
+    policy,
+  });
+  assert.ok(performance.now() - started < 1000);
+  assert.equal(result.exitCode, null);
+  assert.match(result.error ?? '', /hard deadline|inspect failed/u);
 });
 
 test('local backend executes argv without shell interpolation', async () => {
@@ -183,6 +439,32 @@ test('local backend reports timeouts and bounded output', async () => {
     },
   });
   assert.equal(result.timedOut, true);
+});
+
+test('local backend cancels a running process without shell interpolation', async () => {
+  const controller = new AbortController();
+  const backend = new LocalProcessBackend();
+  const running = backend.run({
+    revision: 'head',
+    workspace: process.cwd(),
+    command: ['node', '-e', 'setTimeout(() => {}, 5000)'],
+    cwd: '.',
+    environment: { PATH: process.env.PATH ?? '' },
+    timeoutMs: 5000,
+    outputBytes: 1024,
+    secrets: [],
+    signal: controller.signal,
+    policy: {
+      ...policy,
+      backend: 'local',
+      allowUnsafeLocal: true,
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  controller.abort();
+  const result = await running;
+  assert.equal(result.cancelled, true);
+  assert.match(result.error ?? '', /cancelled/u);
 });
 
 test('local backend bounds only after streaming redaction', async () => {

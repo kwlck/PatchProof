@@ -7,18 +7,22 @@ export async function assertPathInside(
   label: string,
 ): Promise<string> {
   const rootReal = await realpath(root);
-  const candidateResolved = resolve(rootReal, candidate);
-  if (
-    relative(rootReal, candidateResolved).startsWith('..') ||
-    isAbsolute(relative(rootReal, candidateResolved))
-  )
+  // Resolve relative candidates against the caller's root before resolving
+  // either path through symlinks. On Windows a workspace may be presented via
+  // a mapped drive while realpath returns its canonical drive; resolving an
+  // absolute C: candidate under a D: root would otherwise compare unrelated
+  // drives and reject every valid path.
+  const candidateResolved = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
+  const lexicalRoot = resolve(root);
+  const lexicalRelative = relative(lexicalRoot, candidateResolved);
+  if (lexicalRelative.startsWith('..') || isAbsolute(lexicalRelative))
     throw new Error(`${label} escapes trusted root`);
+  const candidateStat = await lstat(candidateResolved);
+  if (candidateStat.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
   const candidateReal = await realpath(candidateResolved);
   const rel = relative(rootReal, candidateReal);
   if (rel.startsWith('..') || isAbsolute(rel))
     throw new Error(`${label} resolves outside trusted root`);
-  const stat = await lstat(candidateReal);
-  if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
   return candidateReal;
 }
 
