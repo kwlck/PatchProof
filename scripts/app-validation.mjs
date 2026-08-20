@@ -40,6 +40,81 @@ export const VALIDATION_EXIT_CODES = Object.freeze({
   validation: 1,
 });
 
+export const VALIDATION_PRIMARY_STAGES = Object.freeze({
+  GENERIC: 'generic',
+  PREFLIGHT_ARGUMENTS: 'preflight-arguments',
+  PREFLIGHT_ENVIRONMENT: 'preflight-environment',
+  PREFLIGHT_ROOT: 'preflight-root',
+  PREFLIGHT_CHECKOUT: 'preflight-checkout',
+  PREFLIGHT_MODULES: 'preflight-modules',
+  PREFLIGHT_AUTHENTICATION: 'preflight-authentication',
+  PROTECTED_READ_SNAPSHOT: 'protected-read-snapshot',
+  PROTECTED_READ_METADATA: 'protected-read-metadata',
+  PROTECTED_READ_INSTALLATION: 'protected-read-installation',
+  DOCKER_INVENTORY: 'docker-inventory',
+  DOCKER_BUILD: 'docker-build',
+  DOCKER_INSPECTION: 'docker-inspection',
+  STATE_INITIALIZATION: 'state-initialization',
+  WEBHOOK_BIND: 'webhook-bind',
+  WEBHOOK_DELIVERY: 'webhook-delivery',
+  WORKER_EXECUTION: 'worker-execution',
+  EVIDENCE_VERIFICATION: 'evidence-verification',
+  RECONCILIATION: 'reconciliation',
+  DUPLICATE_REPLAY: 'duplicate-replay',
+  SUMMARY_WRITING: 'summary-writing',
+});
+
+export const VALIDATION_CLEANUP_STAGES = Object.freeze({
+  GENERIC: 'generic',
+  SERVER: 'server',
+  QUEUE: 'queue',
+  STORE: 'store',
+  CONTAINERS: 'containers',
+  IMAGE: 'image',
+  WORKSPACE: 'workspace',
+});
+
+export const VALIDATION_REASON_CODES = Object.freeze({
+  GENERIC: 'generic',
+  INVALID_INPUT: 'invalid-input',
+  OPERATION_FAILED: 'operation-failed',
+  INVALID_RESPONSE: 'invalid-response',
+  IDENTITY_MISMATCH: 'identity-mismatch',
+  POLICY_DENIED: 'policy-denied',
+  TIMEOUT: 'timeout',
+  CLEANUP_FAILED: 'cleanup-failed',
+});
+
+export const VALIDATION_REASON_MEANINGS = Object.freeze({
+  generic: 'The validation boundary failed for an unspecified reason.',
+  'invalid-input': 'A fixed validation input was rejected.',
+  'operation-failed': 'The bounded validation operation failed.',
+  'invalid-response': 'A bounded operation returned an invalid response.',
+  'identity-mismatch': 'A protected identity did not match the allowlist.',
+  'policy-denied': 'A validation policy assertion was not satisfied.',
+  timeout: 'A bounded operation timed out.',
+  'cleanup-failed': 'A fixed cleanup boundary did not complete.',
+});
+
+export const MAX_VALIDATION_DIAGNOSTIC_BYTES = 2048;
+export const MAX_VALIDATION_DIAGNOSTIC_CAUSE_DEPTH = 4;
+
+const PRIMARY_STAGE_VALUES = Object.freeze(Object.values(VALIDATION_PRIMARY_STAGES));
+const CLEANUP_STAGE_VALUES = Object.freeze(Object.values(VALIDATION_CLEANUP_STAGES));
+const REASON_VALUES = Object.freeze(Object.values(VALIDATION_REASON_CODES));
+const PRIMARY_STAGE_SET = new Set(PRIMARY_STAGE_VALUES);
+const CLEANUP_STAGE_SET = new Set(CLEANUP_STAGE_VALUES);
+const REASON_SET = new Set(REASON_VALUES);
+const VALIDATION_ERROR_CODES = new Set(['preflight', 'validation']);
+const SAFE_CLEANUP_DIAGNOSTICS = new WeakSet();
+const SAFE_CLEANUP_DIAGNOSTIC_ARRAYS = new WeakSet();
+const PRIVATE_ERROR_RECORDS = new WeakMap();
+const GENERIC_CAUSE_RECORD = Object.freeze({
+  code: 'validation',
+  stage: VALIDATION_PRIMARY_STAGES.GENERIC,
+  reason: VALIDATION_REASON_CODES.GENERIC,
+});
+
 const MAX_PRIVATE_KEY_BYTES = 128 * 1024;
 const MAX_WEBHOOK_SECRET_LENGTH = 16 * 1024;
 const MAX_SUMMARY_BYTES = 64 * 1024;
@@ -62,20 +137,417 @@ const VALIDATION_MUTATION_METHODS = Object.freeze([
   'updateComment',
 ]);
 
+function normalizeErrorCode(code) {
+  return VALIDATION_ERROR_CODES.has(code) ? code : 'validation';
+}
+
+function normalizeReason(reason, fallback = VALIDATION_REASON_CODES.GENERIC) {
+  return REASON_SET.has(reason) ? reason : fallback;
+}
+
+function reasonOrFallback(reason, fallback) {
+  return reason === undefined ? fallback : normalizeReason(reason);
+}
+
+function normalizeStage(stage, allowed, fallback) {
+  return allowed.has(stage) ? stage : fallback;
+}
+
+function defaultReasonForCode(code) {
+  return code === 'preflight'
+    ? VALIDATION_REASON_CODES.INVALID_INPUT
+    : VALIDATION_REASON_CODES.OPERATION_FAILED;
+}
+
+function privateErrorRecord(value) {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function'))
+    return undefined;
+  return PRIVATE_ERROR_RECORDS.get(value);
+}
+
+function freezeCauseRecord(record) {
+  if (record.causeRecord !== undefined) {
+    const nested = record.causeRecord;
+    delete record.causeRecord;
+    Object.defineProperty(record, 'causeRecord', {
+      configurable: false,
+      enumerable: false,
+      value: nested,
+      writable: false,
+    });
+  }
+  return Object.freeze(record);
+}
+
+function cloneCauseRecord(record, depth = 0) {
+  if (record === undefined || depth >= MAX_VALIDATION_DIAGNOSTIC_CAUSE_DEPTH) return undefined;
+  const clone = {
+    code: normalizeErrorCode(record.code),
+    stage: normalizeStage(record.stage, PRIMARY_STAGE_SET, VALIDATION_PRIMARY_STAGES.GENERIC),
+    reason: normalizeReason(record.reason),
+  };
+  if (record.causeRecord !== undefined) {
+    const nested = cloneCauseRecord(record.causeRecord, depth + 1);
+    if (nested !== undefined) clone.causeRecord = nested;
+  }
+  return freezeCauseRecord(clone);
+}
+
+function publicCauseRecord(record, depth = 0) {
+  if (record === undefined || depth >= MAX_VALIDATION_DIAGNOSTIC_CAUSE_DEPTH) return undefined;
+  const copy = {
+    code: record.code,
+    stage: record.stage,
+    reason: record.reason,
+  };
+  if (record.causeRecord !== undefined) {
+    const nested = publicCauseRecord(record.causeRecord, depth + 1);
+    if (nested !== undefined)
+      Object.defineProperty(copy, 'cause', {
+        configurable: false,
+        enumerable: false,
+        value: nested,
+        writable: false,
+      });
+  }
+  return Object.freeze(copy);
+}
+
+function causeRecordFor(cause) {
+  if (cause === undefined) return undefined;
+  const source = privateErrorRecord(cause);
+  return source === undefined ? GENERIC_CAUSE_RECORD : cloneCauseRecord(source);
+}
+
+function freezeErrorRecord(record) {
+  return Object.freeze({
+    code: record.code,
+    stage: record.stage,
+    reason: record.reason,
+    causeRecord: record.causeRecord,
+    boundaryOwner: record.boundaryOwner,
+    cleanupDiagnostics: record.cleanupDiagnostics,
+    cleanupOnly: record.cleanupOnly,
+  });
+}
+
+function updatePrivateErrorRecord(error, updates) {
+  const current = privateErrorRecord(error);
+  if (current === undefined) return undefined;
+  const next = freezeErrorRecord({
+    code: current.code,
+    stage: current.stage,
+    reason: current.reason,
+    causeRecord: current.causeRecord,
+    boundaryOwner: updates.boundaryOwner ?? current.boundaryOwner,
+    cleanupDiagnostics: updates.cleanupDiagnostics ?? current.cleanupDiagnostics,
+    cleanupOnly: updates.cleanupOnly ?? current.cleanupOnly,
+  });
+  PRIVATE_ERROR_RECORDS.set(error, next);
+  return next;
+}
+
 /**
  * Errors from this module are intentionally bounded and never carry provider
- * responses, private keys, installation tokens, or command output.
+ * responses, private keys, installation tokens, or command output.  The
+ * optional diagnostic object is closed over the fixed enums above.
  */
 export class AppValidationError extends Error {
-  constructor(code, message, cause) {
-    super(message, cause === undefined ? undefined : { cause });
+  constructor(code, message, cause, diagnostic = {}) {
+    super(message);
     this.name = 'AppValidationError';
-    this.code = code;
+    const fixedCode = normalizeErrorCode(code);
+    const fixedStage = normalizeStage(
+      diagnostic?.stage,
+      PRIMARY_STAGE_SET,
+      VALIDATION_PRIMARY_STAGES.GENERIC,
+    );
+    const causeRecordSource = cause === undefined ? undefined : privateErrorRecord(cause);
+    const causeRecord = causeRecordFor(cause);
+    const hasForeignCause = cause !== undefined && causeRecordSource === undefined;
+    const fixedReason = hasForeignCause
+      ? VALIDATION_REASON_CODES.GENERIC
+      : diagnostic?.reason === undefined
+        ? defaultReasonForCode(fixedCode)
+        : normalizeReason(diagnostic.reason);
+    Object.defineProperties(this, {
+      code: { configurable: false, enumerable: true, value: fixedCode, writable: false },
+      stage: { configurable: false, enumerable: true, value: fixedStage, writable: false },
+      reason: { configurable: false, enumerable: true, value: fixedReason, writable: false },
+    });
+    PRIVATE_ERROR_RECORDS.set(
+      this,
+      freezeErrorRecord({
+        code: fixedCode,
+        stage: fixedStage,
+        reason: fixedReason,
+        causeRecord,
+        boundaryOwner: undefined,
+        cleanupDiagnostics: undefined,
+        cleanupOnly: false,
+      }),
+    );
+    if (causeRecord !== undefined)
+      Object.defineProperty(this, 'cause', {
+        configurable: false,
+        enumerable: false,
+        value: publicCauseRecord(causeRecord),
+        writable: false,
+      });
   }
 }
 
-function fail(code, message, cause) {
-  throw new AppValidationError(code, message, cause);
+function fail(code, message, cause, diagnostic = {}) {
+  throw new AppValidationError(code, message, cause, diagnostic);
+}
+
+function codeForBoundary(stage) {
+  return stage.startsWith('preflight-') ? 'preflight' : 'validation';
+}
+
+function annotateValidationError(error, stage, reason = VALIDATION_REASON_CODES.OPERATION_FAILED) {
+  const fixedStage = normalizeStage(stage, PRIMARY_STAGE_SET, VALIDATION_PRIMARY_STAGES.GENERIC);
+  const sourceRecord = privateErrorRecord(error);
+  if (sourceRecord?.boundaryOwner === fixedStage) return error;
+  const wrapped = new AppValidationError(
+    codeForBoundary(fixedStage),
+    'App validation boundary failed',
+    error,
+    {
+      stage: fixedStage,
+      reason: sourceRecord === undefined ? VALIDATION_REASON_CODES.GENERIC : reason,
+    },
+  );
+  const wrappedRecord = privateErrorRecord(wrapped);
+  PRIVATE_ERROR_RECORDS.set(
+    wrapped,
+    freezeErrorRecord({
+      code: wrappedRecord.code,
+      stage: wrappedRecord.stage,
+      reason: wrappedRecord.reason,
+      causeRecord: wrappedRecord.causeRecord,
+      boundaryOwner: fixedStage,
+      cleanupDiagnostics: sourceRecord?.cleanupDiagnostics,
+      cleanupOnly: sourceRecord?.cleanupOnly === true,
+    }),
+  );
+  return wrapped;
+}
+
+export async function withValidationStage(
+  stage,
+  operation,
+  reason = VALIDATION_REASON_CODES.OPERATION_FAILED,
+) {
+  const fixedStage = normalizeStage(stage, PRIMARY_STAGE_SET, VALIDATION_PRIMARY_STAGES.GENERIC);
+  try {
+    return await operation();
+  } catch (error) {
+    throw annotateValidationError(error, fixedStage, reason);
+  }
+}
+
+function diagnosticChainFromError(
+  error,
+  fallbackStage,
+  allowedStages,
+  fallbackReason,
+  forceRootStage = false,
+) {
+  const chain = [];
+  let current = privateErrorRecord(error);
+  let depth = 0;
+  let first = true;
+  while (current !== undefined && depth < MAX_VALIDATION_DIAGNOSTIC_CAUSE_DEPTH) {
+    const stage =
+      first && forceRootStage
+        ? fallbackStage
+        : normalizeStage(current.stage, allowedStages, fallbackStage);
+    chain.push({
+      code: normalizeErrorCode(current.code),
+      stage,
+      reason: reasonOrFallback(current.reason, fallbackReason),
+    });
+    current = current.causeRecord;
+    depth += 1;
+    first = false;
+  }
+  if (chain.length === 0)
+    chain.push({
+      code: 'validation',
+      stage: fallbackStage,
+      reason: VALIDATION_REASON_CODES.GENERIC,
+    });
+  return Object.freeze(chain.map((record) => Object.freeze(record)));
+}
+
+function cleanupDiagnostic(stage, error) {
+  const fixedStage = normalizeStage(stage, CLEANUP_STAGE_SET, VALIDATION_CLEANUP_STAGES.GENERIC);
+  const diagnostic = Object.freeze({
+    stage: fixedStage,
+    chain: diagnosticChainFromError(
+      error,
+      fixedStage,
+      CLEANUP_STAGE_SET,
+      VALIDATION_REASON_CODES.CLEANUP_FAILED,
+      true,
+    ),
+  });
+  SAFE_CLEANUP_DIAGNOSTICS.add(diagnostic);
+  return diagnostic;
+}
+
+function trustedCleanupDiagnostics(values) {
+  const diagnostics = Object.freeze([...values]);
+  SAFE_CLEANUP_DIAGNOSTIC_ARRAYS.add(diagnostics);
+  return diagnostics;
+}
+
+export async function runValidationCleanup(operations = {}) {
+  const failures = [];
+  const attempted = [];
+  for (const stage of CLEANUP_STAGE_VALUES) {
+    if (stage === VALIDATION_CLEANUP_STAGES.GENERIC) continue;
+    let lookupCompleted = false;
+    try {
+      const operation = operations?.[stage];
+      lookupCompleted = true;
+      if (operation === undefined) continue;
+      attempted.push(stage);
+      if (typeof operation !== 'function') {
+        failures.push(cleanupDiagnostic(stage));
+        continue;
+      }
+      await operation();
+    } catch {
+      if (!lookupCompleted) attempted.push(stage);
+      if (!failures.some((failure) => failure.stage === stage))
+        failures.push(cleanupDiagnostic(stage));
+    }
+  }
+  return Object.freeze({
+    attempted: Object.freeze([...attempted]),
+    failures: trustedCleanupDiagnostics(failures),
+  });
+}
+
+function diagnosticInput(input, cleanupFailures) {
+  const privateRecord = privateErrorRecord(input);
+  if (privateRecord?.cleanupDiagnostics !== undefined)
+    return {
+      primaryError: privateRecord.cleanupOnly ? undefined : input,
+      cleanupFailures: privateRecord.cleanupDiagnostics,
+    };
+  if (privateRecord === undefined && input !== null && typeof input === 'object') {
+    let hasDiagnosticShape = false;
+    try {
+      hasDiagnosticShape = 'primaryError' in input || 'cleanupFailures' in input;
+    } catch {
+      return { primaryError: input, cleanupFailures: [] };
+    }
+    if (hasDiagnosticShape) {
+      try {
+        return { primaryError: input.primaryError, cleanupFailures: input.cleanupFailures ?? [] };
+      } catch {
+        return { primaryError: input, cleanupFailures: [] };
+      }
+    }
+  }
+  if (cleanupFailures !== undefined) return { primaryError: input, cleanupFailures };
+  return { primaryError: input, cleanupFailures: [] };
+}
+
+export function collectValidationDiagnostics(input, cleanupFailures) {
+  const normalized = diagnosticInput(input, cleanupFailures);
+  const primary =
+    normalized.primaryError === undefined
+      ? undefined
+      : diagnosticChainFromError(
+          normalized.primaryError,
+          VALIDATION_PRIMARY_STAGES.GENERIC,
+          PRIMARY_STAGE_SET,
+          VALIDATION_REASON_CODES.GENERIC,
+        );
+  const cleanup = [];
+  const seen = new Set();
+  let cleanupValues;
+  let hostileCleanupContainer = false;
+  if (SAFE_CLEANUP_DIAGNOSTIC_ARRAYS.has(normalized.cleanupFailures)) {
+    cleanupValues = normalized.cleanupFailures;
+  } else {
+    try {
+      if (Array.isArray(normalized.cleanupFailures)) {
+        const length = normalized.cleanupFailures.length;
+        if (!Number.isSafeInteger(length) || length < 0) {
+          hostileCleanupContainer = true;
+        } else {
+          const limit = Math.min(length, CLEANUP_STAGE_VALUES.length);
+          const snapshot = [];
+          for (let index = 0; index < limit; index += 1)
+            snapshot.push(normalized.cleanupFailures[index]);
+          cleanupValues = snapshot;
+        }
+      }
+    } catch {
+      hostileCleanupContainer = true;
+    }
+  }
+  if (hostileCleanupContainer) cleanupValues = [undefined];
+  if (cleanupValues !== undefined)
+    for (const failure of cleanupValues) {
+      if (!SAFE_CLEANUP_DIAGNOSTICS.has(failure)) {
+        const stage = VALIDATION_CLEANUP_STAGES.GENERIC;
+        if (!seen.has(stage)) {
+          seen.add(stage);
+          cleanup.push(cleanupDiagnostic(stage, undefined));
+        }
+        continue;
+      }
+      const stage = failure.stage;
+      if (seen.has(stage)) continue;
+      seen.add(stage);
+      cleanup.push(failure);
+    }
+  return Object.freeze({
+    primary,
+    cleanup: Object.freeze(cleanup),
+  });
+}
+
+function diagnosticChainText(chain) {
+  if (!Array.isArray(chain) || chain.length === 0) return 'generic/generic';
+  return chain.map((record) => `${record.stage}/${record.reason}`).join('>');
+}
+
+export function formatValidationDiagnostics(input, cleanupFailures) {
+  const diagnostics = collectValidationDiagnostics(input, cleanupFailures);
+  const lines = [];
+  if (diagnostics.primary !== undefined)
+    lines.push(`APP_VALIDATION_FAILURE primary=${diagnosticChainText(diagnostics.primary)}`);
+  for (const failure of diagnostics.cleanup)
+    lines.push(`APP_VALIDATION_CLEANUP_FAILURE cleanup=${diagnosticChainText(failure.chain)}`);
+  const text = lines.join('\n');
+  if (Buffer.byteLength(text, 'utf8') <= MAX_VALIDATION_DIAGNOSTIC_BYTES) return text;
+  return diagnostics.primary === undefined
+    ? 'APP_VALIDATION_CLEANUP_FAILURE cleanup=generic/generic'
+    : 'APP_VALIDATION_FAILURE primary=generic/generic';
+}
+
+function attachCleanupDiagnostics(error, failures) {
+  if (privateErrorRecord(error) === undefined || failures.length === 0) return error;
+  const safeFailures = trustedCleanupDiagnostics(
+    failures
+      .filter((failure) => SAFE_CLEANUP_DIAGNOSTICS.has(failure))
+      .slice(0, CLEANUP_STAGE_VALUES.length - 1),
+  );
+  if (safeFailures.length > 0)
+    updatePrivateErrorRecord(error, { cleanupDiagnostics: safeFailures });
+  return error;
+}
+
+function markCleanupOnly(error) {
+  updatePrivateErrorRecord(error, { cleanupOnly: true });
+  return error;
 }
 
 function hasControlCharacters(value, allowLineBreaks = false) {
@@ -231,20 +703,6 @@ export function parseValidationEnvironment(environment = process.env) {
 export function assertNoValidationArguments(arguments_ = process.argv.slice(2)) {
   if (!Array.isArray(arguments_) || arguments_.length !== 0)
     fail('preflight', 'The App validation harness does not accept command-line arguments');
-}
-
-function sanitizeMessage(value) {
-  return String(value)
-    .replaceAll(/-----BEGIN[\s\S]*?-----END[^-]*-----/giu, '[credential omitted]')
-    .replaceAll(/Authorization\s*:\s*Bearer\s+[^\s`]+/giu, 'Authorization: [credential omitted]')
-    .replaceAll(/(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/gu, '[credential omitted]')
-    .replaceAll(/[\r\n]+/gu, ' ')
-    .slice(0, 512);
-}
-
-function errorForOperator(error) {
-  if (error instanceof AppValidationError) return error.message;
-  return 'App validation failed';
 }
 
 function secretPatternMatch(text, secrets = []) {
@@ -489,7 +947,7 @@ function assertCurrentCheckoutSha(repositoryRoot, patchproofSha) {
       return actual;
     })
     .catch((error) => {
-      if (error instanceof AppValidationError) throw error;
+      if (privateErrorRecord(error) !== undefined) throw error;
       fail('preflight', 'Current checkout SHA could not be verified', error);
     });
 }
@@ -559,7 +1017,11 @@ async function fixedCommand(file, arguments_, options = {}) {
       maxBuffer: options.maxBuffer ?? 1_048_576,
     });
   } catch (error) {
-    fail('validation', `Validation ${options.label ?? 'command'} failed`, error);
+    throw annotateValidationError(
+      error,
+      options.diagnosticStage ?? VALIDATION_PRIMARY_STAGES.GENERIC,
+      VALIDATION_REASON_CODES.OPERATION_FAILED,
+    );
   }
 }
 
@@ -583,6 +1045,7 @@ function validateImageInventory(entries) {
 export async function listValidationImages(command = fixedCommand) {
   const result = await command('docker', buildValidationImageInventoryCommand(), {
     label: 'Docker image inventory',
+    diagnosticStage: VALIDATION_PRIMARY_STAGES.DOCKER_INVENTORY,
   });
   if (typeof result?.stdout !== 'string') fail('validation', 'Docker image inventory is invalid');
   const entries = [];
@@ -616,7 +1079,7 @@ export async function cleanupValidationImage({ tag, imageId }, options = {}) {
     try {
       return validateImageInventory(await listImages());
     } catch (error) {
-      if (error instanceof AppValidationError) throw error;
+      if (privateErrorRecord(error) !== undefined) throw error;
       fail('validation', 'Docker image inventory failed', error);
     }
   };
@@ -635,7 +1098,7 @@ export async function cleanupValidationImage({ tag, imageId }, options = {}) {
         label: 'Docker validation-image cleanup',
       });
     } catch (error) {
-      if (error instanceof AppValidationError) throw error;
+      if (privateErrorRecord(error) !== undefined) throw error;
       fail('validation', 'Docker validation-image cleanup failed', error);
     }
     // Refresh the authoritative daemon inventory before attempting the next
@@ -681,11 +1144,16 @@ export function instrumentProductionTransport(transport) {
   });
 }
 
-async function inspectLocalImage(tag) {
+async function inspectLocalImage(
+  tag,
+  command = fixedCommand,
+  diagnosticStage = VALIDATION_PRIMARY_STAGES.DOCKER_INSPECTION,
+) {
   if (!IMAGE_TAG_PATTERN.test(tag) && !IMAGE_ID_PATTERN.test(tag))
     fail('validation', 'Validation Docker image identity is invalid');
-  const result = await fixedCommand('docker', buildValidationImageInspectCommand(tag), {
+  const result = await command('docker', buildValidationImageInspectCommand(tag), {
     label: 'Docker image inspection',
+    diagnosticStage,
   });
   const value = result.stdout.trim();
   if (!IMAGE_ID_PATTERN.test(value)) fail('validation', 'Validation image identity is invalid');
@@ -695,6 +1163,7 @@ async function inspectLocalImage(tag) {
 async function listDockerContainers() {
   const result = await fixedCommand('docker', buildValidationContainerListCommand(), {
     label: 'Docker residual inspection',
+    diagnosticStage: VALIDATION_PRIMARY_STAGES.DOCKER_INVENTORY,
   });
   return new Set(
     result.stdout
@@ -747,39 +1216,49 @@ export async function buildValidationImage({
 }) {
   const tag = `patchproof-app-validation-probe-${runId.replaceAll('-', '')}`;
   if (!IMAGE_TAG_PATTERN.test(tag)) fail('validation', 'Validation Docker image tag is invalid');
-  const context = join(validationRoot, 'image-context');
-  await mkdir(context, { recursive: true, mode: 0o700 });
-  const fixtureRoot = join(repositoryRoot, 'test', 'fixtures', 'app-validation');
-  const source = join(fixtureRoot, 'probe.c');
-  const dockerfileSource = join(fixtureRoot, 'Dockerfile');
-  const binary = join(context, 'probe');
-  const dockerfile = join(context, 'Dockerfile');
-  await access(source);
-  await access(dockerfileSource);
-  await cp(dockerfileSource, dockerfile, { force: true, errorOnExist: false });
-  let compiled = false;
-  let lastError;
-  for (const compiler of ['cc', 'gcc']) {
-    try {
-      await command(compiler, ['-std=c11', '-O2', '-static', '-s', '-o', binary, source], {
+  const { context, dockerfile } = await withValidationStage(
+    VALIDATION_PRIMARY_STAGES.DOCKER_BUILD,
+    async () => {
+      const context = join(validationRoot, 'image-context');
+      await mkdir(context, { recursive: true, mode: 0o700 });
+      const fixtureRoot = join(repositoryRoot, 'test', 'fixtures', 'app-validation');
+      const source = join(fixtureRoot, 'probe.c');
+      const dockerfileSource = join(fixtureRoot, 'Dockerfile');
+      const binary = join(context, 'probe');
+      const dockerfile = join(context, 'Dockerfile');
+      await access(source);
+      await access(dockerfileSource);
+      await cp(dockerfileSource, dockerfile, { force: true, errorOnExist: false });
+      let compiled = false;
+      let lastError;
+      for (const compiler of ['cc', 'gcc']) {
+        try {
+          await command(compiler, ['-std=c11', '-O2', '-static', '-s', '-o', binary, source], {
+            cwd: repositoryRoot,
+            label: 'validation probe compilation',
+            diagnosticStage: VALIDATION_PRIMARY_STAGES.DOCKER_BUILD,
+          });
+          compiled = true;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!compiled)
+        fail('validation', 'A static C compiler is required for the validation probe', lastError);
+      if (process.platform !== 'win32') await chmod(binary, 0o755);
+      const imageCommand = buildValidationImageCommand(context, dockerfile, tag);
+      await command(imageCommand[0], imageCommand.slice(1), {
         cwd: repositoryRoot,
-        label: 'validation probe compilation',
+        label: 'Docker image build',
+        diagnosticStage: VALIDATION_PRIMARY_STAGES.DOCKER_BUILD,
       });
-      compiled = true;
-      break;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  if (!compiled)
-    fail('validation', 'A static C compiler is required for the validation probe', lastError);
-  if (process.platform !== 'win32') await chmod(binary, 0o755);
-  const imageCommand = buildValidationImageCommand(context, dockerfile, tag);
-  await command(imageCommand[0], imageCommand.slice(1), {
-    cwd: repositoryRoot,
-    label: 'Docker image build',
-  });
-  const imageId = await inspectLocalImage(tag);
+      return { context, dockerfile };
+    },
+  );
+  const imageId = await withValidationStage(VALIDATION_PRIMARY_STAGES.DOCKER_INSPECTION, () =>
+    inspectLocalImage(tag, command),
+  );
   return Object.freeze({ tag, imageId, context, dockerfile });
 }
 
@@ -929,7 +1408,7 @@ async function readGitHubJson(pathname, token, options = {}) {
       fail('validation', 'GitHub protected preflight response was invalid', error);
     }
   } catch (error) {
-    if (error instanceof AppValidationError) throw error;
+    if (privateErrorRecord(error) !== undefined) throw error;
     fail('validation', 'GitHub protected preflight read failed', error);
   } finally {
     clearTimeout(timeout);
@@ -962,7 +1441,7 @@ export async function collectBoundedPages(fetchPage, options = {}) {
     try {
       response = await fetchPage(page);
     } catch (error) {
-      if (error instanceof AppValidationError) throw error;
+      if (privateErrorRecord(error) !== undefined) throw error;
       fail('validation', `${label} page could not be fetched`, error);
     }
     if (typeof response !== 'object' || response === null || !Array.isArray(response.items))
@@ -1205,7 +1684,7 @@ function extractEvidenceDigest(bundlePath, secrets, verifyEvidenceBundle) {
       };
     })
     .catch((error) => {
-      if (error instanceof AppValidationError) throw error;
+      if (privateErrorRecord(error) !== undefined) throw error;
       fail('validation', 'Evidence bundle could not be verified', error);
     });
 }
@@ -1325,6 +1804,20 @@ function assertQueueState(jobs, environment, expectedStatus) {
   return job;
 }
 
+export function assertCompletedValidationJob(jobs, environment, bundlePath) {
+  const completed = assertQueueState(jobs, environment, 'succeeded');
+  if (completed.evidencePath !== bundlePath || completed.attempts !== 1)
+    fail('validation', 'Validation worker evidence identity is invalid');
+  return completed;
+}
+
+export function assertDuplicateValidationJob(jobs, environment, completed) {
+  const afterDuplicate = assertQueueState(jobs, environment, 'succeeded');
+  if (afterDuplicate.attempts !== 1 || afterDuplicate.id !== completed.id)
+    fail('validation', 'Duplicate delivery created a second queue attempt');
+  return afterDuplicate;
+}
+
 async function loadProductionModules() {
   const root = dirname(fileURLToPath(import.meta.url));
   const [auth, api, server, queue, sqlite, source, worker, github, core] = await Promise.all([
@@ -1367,7 +1860,7 @@ async function cleanupFileOrDirectory(pathname, label) {
       () => undefined,
     );
   } catch (error) {
-    if (error instanceof AppValidationError) throw error;
+    if (privateErrorRecord(error) !== undefined) throw error;
     fail('validation', `${label} cleanup failed`, error);
   }
 }
@@ -1379,289 +1872,389 @@ async function cleanupFileOrDirectory(pathname, label) {
  * defaults and are never replaced by a token test adapter.
  */
 export async function runValidation(options = {}) {
-  assertNoValidationArguments(options.arguments_ ?? process.argv.slice(2));
-  const environment = parseValidationEnvironment(options.environment ?? process.env);
-  const repositoryRoot = safeResolvedRepositoryRoot(
-    options.repositoryRoot ?? dirname(fileURLToPath(import.meta.url)) + '/..',
-  );
-  await assertCurrentCheckoutSha(repositoryRoot, environment.patchproofSha);
+  let currentPrimaryStage = VALIDATION_PRIMARY_STAGES.GENERIC;
+  const primary = async (stage, operation, reason = VALIDATION_REASON_CODES.OPERATION_FAILED) => {
+    currentPrimaryStage = normalizeStage(
+      stage,
+      PRIMARY_STAGE_SET,
+      VALIDATION_PRIMARY_STAGES.GENERIC,
+    );
+    return withValidationStage(currentPrimaryStage, operation, reason);
+  };
 
-  const modules = await loadProductionModules();
-  const auth = new modules.auth.GitHubAppAuth({
-    appId: environment.appId,
-    privateKey: environment.privateKey,
-  });
-  const productionTransport = new modules.api.GitHubApiTransport(auth);
-  assertProductionAppWiring(auth, productionTransport, environment.appId);
-  const instrumentedTransport = instrumentProductionTransport(productionTransport);
-  const github = instrumentedTransport.transport;
-  const mutationCount = instrumentedTransport.mutationCount;
-
-  // Read the live snapshot through the production transport before any local
-  // image, queue, webhook, or remote mutation is prepared.
-  const snapshot = await github.getPullRequest(environment.repository, environment.pullRequest, {
-    installationId: environment.installationId,
-  });
-  assertSnapshotMatches(snapshot, environment);
-  const installationToken = await auth.getToken(environment.installationId);
-  const liveMetadata = validateLivePullRequestMetadata(
-    await readGitHubJson(
-      `${apiPathForRepository(environment.repository)}/pulls/${environment.pullRequest}`,
-      installationToken,
-    ),
-    environment,
-  );
-  validateInstallationScope(
-    await readGitHubJson('/installation/repositories?per_page=100&page=1', installationToken),
-    environment.repository,
-  );
-
-  const runId = randomUUID();
-  const startedAt = new Date().toISOString();
-  const validationRoot = await mkdtemp(join(environment.runnerTemp, 'patchproof-app-validation-'));
-  let image;
-  const imageTag = `patchproof-app-validation-probe-${runId.replaceAll('-', '')}`;
-  let beforeContainers;
-  let server;
-  let worker;
-  let queue;
-  let store;
-  let primaryError;
-  let result;
-  let evidence;
-  let surfaces;
-  let duplicateResponse;
-  let duplicateMutations;
-  let cleanupFailure;
   try {
-    beforeContainers = await listDockerContainers();
-    image = await buildValidationImage({
-      validationRoot,
-      repositoryRoot,
-      runId,
-      ...(options.command === undefined ? {} : { command: options.command }),
-    });
-    // Docker's local image ID is an immutable, daemon-local identity. It can
-    // be inspected without a registry and avoids a mutable tag allowlist.
-    const configText = buildValidationConfig(image.imageId);
-    const fixtureRoot = join(repositoryRoot, 'test', 'fixtures', 'app-validation');
-    const productionSource = new modules.source.GitHubSourceAdapter(auth);
-    const source = new FixtureOverlaySourceAdapter(
-      productionSource,
-      fixtureRoot,
-      validationRoot,
-      environment.repository,
-      environment.baseSha,
-      environment.headSha,
-      configText,
+    currentPrimaryStage = VALIDATION_PRIMARY_STAGES.PREFLIGHT_ARGUMENTS;
+    assertNoValidationArguments(options.arguments_ ?? process.argv.slice(2));
+    currentPrimaryStage = VALIDATION_PRIMARY_STAGES.PREFLIGHT_ENVIRONMENT;
+    const environment = parseValidationEnvironment(options.environment ?? process.env);
+    currentPrimaryStage = VALIDATION_PRIMARY_STAGES.PREFLIGHT_ROOT;
+    const repositoryRoot = safeResolvedRepositoryRoot(
+      options.repositoryRoot ?? dirname(fileURLToPath(import.meta.url)) + '/..',
     );
-    const sqlitePath = join(validationRoot, 'state.sqlite');
-    const outputRoot = join(validationRoot, 'evidence');
-    store = new modules.sqlite.SqliteStateStore(sqlitePath);
-    queue = new modules.queue.SqliteQueue(sqlitePath, () => new Date(), {
-      requireInstallationId: true,
-    });
-    const dependencies = {
-      webhookSecret: environment.webhookSecret,
-      store,
-      github,
-      enqueue: async (request) => queue.enqueue(request),
-      cancelPullRequest: async (repository, pullRequest, reason) =>
-        queue.cancelPullRequest(repository, pullRequest, reason),
-      requireInstallationId: true,
-    };
-    server = modules.server.createWebhookServer(dependencies);
-    const port = await listenWebhook(server);
-    const body = canonicalSyntheticPullRequest(liveMetadata);
-    const deliveryId = randomUUID();
-    const request = buildWebhookRequest(body, environment.webhookSecret, deliveryId);
-    const queuedResponse = await postWebhook(port, request);
-    if (queuedResponse.status !== 202)
-      fail('validation', 'Synthetic pull request delivery was not queued');
-    const queuedJobs = await queue.list();
-    assertQueueState(queuedJobs, environment, 'queued');
-
-    worker = new modules.worker.PatchProofWorker({
-      queue,
-      source,
-      store,
-      github,
-      outputRoot,
-      workerId: `app-validation-${runId}`,
-      operatorPolicy: {
-        forceDocker: true,
-        maxTimeoutMs: 10_000,
-        maxOutputBytes: 8192,
-        maxMemoryMb: 64,
-        maxCpuCount: 1,
-        maxPids: 32,
-        // The config names the exact local image ID; a mutable tag allowlist
-        // would be rejected by the production policy as not digest-pinned.
-        approvedDockerImages: [],
-        requireDigestPinnedImages: false,
-        requireReadOnlyRoot: true,
-        provisioningTimeoutMs: 120_000,
-      },
-      requireFreshSnapshot: true,
-    });
-    result = await worker.runOnce();
-    if (
-      result.status !== 'completed' ||
-      result.job?.status !== 'running' ||
-      result.bundlePath === undefined
-    )
-      fail('validation', 'Production worker did not complete exactly one validation attempt');
-    const completedJob = assertQueueState(await queue.list(), environment, 'succeeded');
-    if (completedJob.evidencePath !== result.bundlePath || completedJob.attempts !== 1)
-      fail('validation', 'Validation worker evidence identity is invalid');
-    assertWithin(outputRoot, result.bundlePath, 'Validation evidence path');
-    evidence = await extractEvidenceDigest(
-      result.bundlePath,
-      [environment.privateKey, environment.webhookSecret],
-      modules.core.verifyEvidenceBundle,
+    await primary(VALIDATION_PRIMARY_STAGES.PREFLIGHT_CHECKOUT, () =>
+      assertCurrentCheckoutSha(repositoryRoot, environment.patchproofSha),
     );
-    if (evidence.result !== 'PASS')
-      fail('validation', 'Validation probe did not produce PASS evidence');
-    const state = await store.getRun(
-      environment.repository,
-      environment.pullRequest,
-      environment.headSha,
-      environment.appId,
+
+    const modules = await primary(
+      VALIDATION_PRIMARY_STAGES.PREFLIGHT_MODULES,
+      loadProductionModules,
     );
-    if (state?.checkId === undefined || state.commentId === undefined)
-      fail('validation', 'Validation managed-surface IDs were not persisted');
-    const postToken = await auth.getToken(environment.installationId);
-    surfaces = await reconcileRemoteSurfaces({
-      github,
-      environment,
-      appId: environment.appId,
-      token: postToken,
-    });
-    if (surfaces.checkId !== state.checkId || surfaces.commentId !== state.commentId)
-      fail('validation', 'Validation managed-surface IDs did not reconcile to stored IDs');
+    const auth = await primary(
+      VALIDATION_PRIMARY_STAGES.PREFLIGHT_AUTHENTICATION,
+      () =>
+        new modules.auth.GitHubAppAuth({
+          appId: environment.appId,
+          privateKey: environment.privateKey,
+        }),
+    );
+    const productionTransport = await primary(
+      VALIDATION_PRIMARY_STAGES.PREFLIGHT_AUTHENTICATION,
+      () => new modules.api.GitHubApiTransport(auth),
+    );
+    await primary(VALIDATION_PRIMARY_STAGES.PREFLIGHT_AUTHENTICATION, () =>
+      assertProductionAppWiring(auth, productionTransport, environment.appId),
+    );
+    const instrumentedTransport = instrumentProductionTransport(productionTransport);
+    const github = instrumentedTransport.transport;
+    const mutationCount = instrumentedTransport.mutationCount;
 
-    // Replay byte-for-byte with the same UUID. The production SQLite delivery
-    // claim must return duplicate before parsing, queueing, or mutating.
-    const mutationsBeforeReplay = mutationCount();
-    duplicateResponse = await postWebhook(port, request);
-    if (
-      duplicateResponse.status !== 200 ||
-      !duplicateResponse.body.includes('duplicate delivery ignored')
-    )
-      fail('validation', 'Duplicate delivery was not ignored');
-    const afterDuplicate = assertQueueState(await queue.list(), environment, 'succeeded');
-    if (afterDuplicate.attempts !== 1 || afterDuplicate.id !== completedJob.id)
-      fail('validation', 'Duplicate delivery created a second queue attempt');
-    const duplicateSurfaces = await reconcileRemoteSurfaces({
-      github,
-      environment,
-      appId: environment.appId,
-      token: await auth.getToken(environment.installationId),
-    });
-    if (
-      duplicateSurfaces.checkId !== surfaces.checkId ||
-      duplicateSurfaces.commentId !== surfaces.commentId
-    )
-      fail('validation', 'Duplicate delivery changed managed surface identities');
-    duplicateMutations = mutationCount() - mutationsBeforeReplay;
-    if (duplicateMutations !== 0)
-      fail('validation', 'Duplicate delivery performed a remote mutation');
-    const finalImageId = await inspectLocalImage(image.tag);
-    if (finalImageId !== image.imageId)
-      fail('validation', 'Validation image identity changed during execution');
+    // Read the live snapshot through the production transport before any local
+    // image, queue, webhook, or remote mutation is prepared.
+    const snapshot = await primary(VALIDATION_PRIMARY_STAGES.PROTECTED_READ_SNAPSHOT, () =>
+      github.getPullRequest(environment.repository, environment.pullRequest, {
+        installationId: environment.installationId,
+      }),
+    );
+    await primary(VALIDATION_PRIMARY_STAGES.PROTECTED_READ_SNAPSHOT, () =>
+      assertSnapshotMatches(snapshot, environment),
+    );
+    const installationToken = await primary(VALIDATION_PRIMARY_STAGES.PROTECTED_READ_METADATA, () =>
+      auth.getToken(environment.installationId),
+    );
+    const liveMetadata = await primary(
+      VALIDATION_PRIMARY_STAGES.PROTECTED_READ_METADATA,
+      async () =>
+        validateLivePullRequestMetadata(
+          await readGitHubJson(
+            `${apiPathForRepository(environment.repository)}/pulls/${environment.pullRequest}`,
+            installationToken,
+          ),
+          environment,
+        ),
+    );
+    await primary(VALIDATION_PRIMARY_STAGES.PROTECTED_READ_INSTALLATION, async () =>
+      validateInstallationScope(
+        await readGitHubJson('/installation/repositories?per_page=100&page=1', installationToken),
+        environment.repository,
+      ),
+    );
 
-    const summary = {
-      schemaVersion: 1,
-      patchproofSha: environment.patchproofSha,
-      runId,
-      repository: environment.repository,
-      pullRequest: environment.pullRequest,
-      baseRef: environment.baseRef,
-      baseSha: environment.baseSha,
-      headSha: environment.headSha,
-      deliveryId,
-      terminalState: 'completed',
-      attemptState: 'succeeded',
-      check: {
-        id: state.checkId,
-        appId: environment.appId,
-        ownership: 'app',
+    const runId = randomUUID();
+    const startedAt = new Date().toISOString();
+    const validationRoot = await primary(VALIDATION_PRIMARY_STAGES.STATE_INITIALIZATION, () =>
+      mkdtemp(join(environment.runnerTemp, 'patchproof-app-validation-')),
+    );
+    let image;
+    const imageTag = `patchproof-app-validation-probe-${runId.replaceAll('-', '')}`;
+    let beforeContainers;
+    let server;
+    let worker;
+    let queue;
+    let store;
+    let primaryError;
+    let result;
+    let evidence;
+    let surfaces;
+    let duplicateMutations;
+    let request;
+    let port;
+    const cleanupFailures = [];
+    try {
+      beforeContainers = await primary(VALIDATION_PRIMARY_STAGES.DOCKER_INVENTORY, () =>
+        listDockerContainers(),
+      );
+      image = await primary(VALIDATION_PRIMARY_STAGES.DOCKER_BUILD, () =>
+        buildValidationImage({
+          validationRoot,
+          repositoryRoot,
+          runId,
+          ...(options.command === undefined ? {} : { command: options.command }),
+        }),
+      );
+      // Docker's local image ID is an immutable, daemon-local identity. It can
+      // be inspected without a registry and avoids a mutable tag allowlist.
+      currentPrimaryStage = VALIDATION_PRIMARY_STAGES.STATE_INITIALIZATION;
+      const configText = buildValidationConfig(image.imageId);
+      const fixtureRoot = join(repositoryRoot, 'test', 'fixtures', 'app-validation');
+      const productionSource = await primary(
+        VALIDATION_PRIMARY_STAGES.STATE_INITIALIZATION,
+        () => new modules.source.GitHubSourceAdapter(auth),
+      );
+      const source = new FixtureOverlaySourceAdapter(
+        productionSource,
+        fixtureRoot,
+        validationRoot,
+        environment.repository,
+        environment.baseSha,
+        environment.headSha,
+        configText,
+      );
+      const sqlitePath = join(validationRoot, 'state.sqlite');
+      const outputRoot = join(validationRoot, 'evidence');
+      store = await primary(
+        VALIDATION_PRIMARY_STAGES.STATE_INITIALIZATION,
+        () => new modules.sqlite.SqliteStateStore(sqlitePath),
+      );
+      queue = await primary(
+        VALIDATION_PRIMARY_STAGES.STATE_INITIALIZATION,
+        () =>
+          new modules.queue.SqliteQueue(sqlitePath, () => new Date(), {
+            requireInstallationId: true,
+          }),
+      );
+      const dependencies = {
+        webhookSecret: environment.webhookSecret,
+        store,
+        github,
+        enqueue: async (webhookRequest) => queue.enqueue(webhookRequest),
+        cancelPullRequest: async (repository, pullRequest, reason) =>
+          queue.cancelPullRequest(repository, pullRequest, reason),
+        requireInstallationId: true,
+      };
+      server = await primary(VALIDATION_PRIMARY_STAGES.WEBHOOK_BIND, () =>
+        modules.server.createWebhookServer(dependencies),
+      );
+      port = await primary(VALIDATION_PRIMARY_STAGES.WEBHOOK_BIND, () => listenWebhook(server));
+      await primary(VALIDATION_PRIMARY_STAGES.WEBHOOK_DELIVERY, async () => {
+        const body = canonicalSyntheticPullRequest(liveMetadata);
+        const deliveryId = randomUUID();
+        request = buildWebhookRequest(body, environment.webhookSecret, deliveryId);
+        const queuedResponse = await postWebhook(port, request);
+        if (queuedResponse.status !== 202)
+          fail('validation', 'Synthetic pull request delivery was not queued');
+        const queuedJobs = await queue.list();
+        assertQueueState(queuedJobs, environment, 'queued');
+      });
+      worker = await primary(
+        VALIDATION_PRIMARY_STAGES.WORKER_EXECUTION,
+        () =>
+          new modules.worker.PatchProofWorker({
+            queue,
+            source,
+            store,
+            github,
+            outputRoot,
+            workerId: `app-validation-${runId}`,
+            operatorPolicy: {
+              forceDocker: true,
+              maxTimeoutMs: 10_000,
+              maxOutputBytes: 8192,
+              maxMemoryMb: 64,
+              maxCpuCount: 1,
+              maxPids: 32,
+              // The config names the exact local image ID; a mutable tag allowlist
+              // would be rejected by the production policy as not digest-pinned.
+              approvedDockerImages: [],
+              requireDigestPinnedImages: false,
+              requireReadOnlyRoot: true,
+              provisioningTimeoutMs: 120_000,
+            },
+            requireFreshSnapshot: true,
+          }),
+      );
+      result = await primary(VALIDATION_PRIMARY_STAGES.WORKER_EXECUTION, () => worker.runOnce());
+      currentPrimaryStage = VALIDATION_PRIMARY_STAGES.WORKER_EXECUTION;
+      if (
+        result.status !== 'completed' ||
+        result.job?.status !== 'running' ||
+        result.bundlePath === undefined
+      )
+        fail('validation', 'Production worker did not complete exactly one validation attempt');
+      const completedJobs = await primary(VALIDATION_PRIMARY_STAGES.WORKER_EXECUTION, () =>
+        queue.list(),
+      );
+      currentPrimaryStage = VALIDATION_PRIMARY_STAGES.WORKER_EXECUTION;
+      const completed = assertCompletedValidationJob(completedJobs, environment, result.bundlePath);
+      currentPrimaryStage = VALIDATION_PRIMARY_STAGES.EVIDENCE_VERIFICATION;
+      assertWithin(outputRoot, result.bundlePath, 'Validation evidence path');
+      evidence = await primary(VALIDATION_PRIMARY_STAGES.EVIDENCE_VERIFICATION, () =>
+        extractEvidenceDigest(
+          result.bundlePath,
+          [environment.privateKey, environment.webhookSecret],
+          modules.core.verifyEvidenceBundle,
+        ),
+      );
+      currentPrimaryStage = VALIDATION_PRIMARY_STAGES.EVIDENCE_VERIFICATION;
+      if (evidence.result !== 'PASS')
+        fail('validation', 'Validation probe did not produce PASS evidence');
+      const state = await primary(VALIDATION_PRIMARY_STAGES.EVIDENCE_VERIFICATION, () =>
+        store.getRun(
+          environment.repository,
+          environment.pullRequest,
+          environment.headSha,
+          environment.appId,
+        ),
+      );
+      if (state?.checkId === undefined || state.commentId === undefined)
+        fail('validation', 'Validation managed-surface IDs were not persisted');
+      surfaces = await primary(VALIDATION_PRIMARY_STAGES.RECONCILIATION, async () =>
+        reconcileRemoteSurfaces({
+          github,
+          environment,
+          appId: environment.appId,
+          token: await auth.getToken(environment.installationId),
+        }),
+      );
+      await primary(VALIDATION_PRIMARY_STAGES.RECONCILIATION, () => {
+        if (surfaces.checkId !== state.checkId || surfaces.commentId !== state.commentId)
+          fail('validation', 'Validation managed-surface IDs did not reconcile to stored IDs');
+      });
+
+      // Replay byte-for-byte with the same UUID. The production SQLite delivery
+      // claim must return duplicate before parsing, queueing, or mutating.
+      await primary(VALIDATION_PRIMARY_STAGES.DUPLICATE_REPLAY, async () => {
+        const mutationsBeforeReplay = mutationCount();
+        const duplicateResponse = await postWebhook(port, request);
+        if (
+          duplicateResponse.status !== 200 ||
+          !duplicateResponse.body.includes('duplicate delivery ignored')
+        )
+          fail('validation', 'Duplicate delivery was not ignored');
+        const afterDuplicate = assertDuplicateValidationJob(
+          await queue.list(),
+          environment,
+          completed,
+        );
+        const duplicateSurfaces = await reconcileRemoteSurfaces({
+          github,
+          environment,
+          appId: environment.appId,
+          token: await auth.getToken(environment.installationId),
+        });
+        if (
+          duplicateSurfaces.checkId !== surfaces.checkId ||
+          duplicateSurfaces.commentId !== surfaces.commentId
+        )
+          fail('validation', 'Duplicate delivery changed managed surface identities');
+        duplicateMutations = mutationCount() - mutationsBeforeReplay;
+        if (duplicateMutations !== 0)
+          fail('validation', 'Duplicate delivery performed a remote mutation');
+        const finalImageId = await inspectLocalImage(
+          image.tag,
+          fixedCommand,
+          VALIDATION_PRIMARY_STAGES.DUPLICATE_REPLAY,
+        );
+        if (finalImageId !== image.imageId)
+          fail('validation', 'Validation image identity changed during execution');
+      });
+
+      const summary = {
+        schemaVersion: 1,
+        patchproofSha: environment.patchproofSha,
+        runId,
+        repository: environment.repository,
+        pullRequest: environment.pullRequest,
+        baseRef: environment.baseRef,
+        baseSha: environment.baseSha,
         headSha: environment.headSha,
-      },
-      comment: { id: state.commentId, appId: environment.appId, ownership: 'app' },
-      evidence,
-      duplicate: {
-        status: 'ignored',
-        queuedJobs: 1,
-        workerAttempts: 1,
-        mutations: duplicateMutations,
-      },
-      docker: {
-        image: image.tag,
-        imageId: image.imageId,
-        network: 'none',
-        user: '65532:65532',
-        readOnlyRoot: true,
-        capDrop: 'ALL',
-        noNewPrivileges: true,
-        resourceBounds: { memoryMb: 64, cpuCount: 1, pids: 32 },
-        residualContainers: 0,
-      },
-      timestamps: { startedAt, finishedAt: new Date().toISOString() },
-      cleanup: { ok: true, residualCount: 0 },
-    };
-    result.summary = summary;
+        deliveryId: request.deliveryId,
+        terminalState: 'completed',
+        attemptState: 'succeeded',
+        check: {
+          id: state.checkId,
+          appId: environment.appId,
+          ownership: 'app',
+          headSha: environment.headSha,
+        },
+        comment: { id: state.commentId, appId: environment.appId, ownership: 'app' },
+        evidence,
+        duplicate: {
+          status: 'ignored',
+          queuedJobs: 1,
+          workerAttempts: 1,
+          mutations: duplicateMutations,
+        },
+        docker: {
+          image: image.tag,
+          imageId: image.imageId,
+          network: 'none',
+          user: '65532:65532',
+          readOnlyRoot: true,
+          capDrop: 'ALL',
+          noNewPrivileges: true,
+          resourceBounds: { memoryMb: 64, cpuCount: 1, pids: 32 },
+          residualContainers: 0,
+        },
+        timestamps: { startedAt, finishedAt: new Date().toISOString() },
+        cleanup: { ok: true, residualCount: 0 },
+      };
+      result.summary = summary;
+    } catch (error) {
+      primaryError = annotateValidationError(error, currentPrimaryStage);
+    } finally {
+      const cleanup = await runValidationCleanup({
+        [VALIDATION_CLEANUP_STAGES.SERVER]: async () => {
+          let firstError;
+          try {
+            worker?.stop();
+          } catch (error) {
+            firstError = error;
+          }
+          try {
+            await closeServer(server);
+          } catch (error) {
+            firstError ??= error;
+          }
+          if (firstError !== undefined) throw firstError;
+        },
+        [VALIDATION_CLEANUP_STAGES.QUEUE]: () => queue?.close(),
+        [VALIDATION_CLEANUP_STAGES.STORE]: () => store?.close(),
+        [VALIDATION_CLEANUP_STAGES.CONTAINERS]: () =>
+          beforeContainers === undefined
+            ? undefined
+            : cleanupValidationContainers(beforeContainers),
+        [VALIDATION_CLEANUP_STAGES.IMAGE]: () =>
+          cleanupValidationImage({ tag: image?.tag ?? imageTag, imageId: image?.imageId }),
+        [VALIDATION_CLEANUP_STAGES.WORKSPACE]: () =>
+          validationRoot === undefined
+            ? undefined
+            : cleanupFileOrDirectory(validationRoot, 'Validation workspace'),
+      });
+      cleanupFailures.push(...cleanup.failures);
+    }
+    if (primaryError !== undefined) {
+      throw attachCleanupDiagnostics(primaryError, cleanupFailures);
+    }
+    if (cleanupFailures.length > 0) {
+      const cleanupError = annotateValidationError(
+        new AppValidationError('validation', 'App validation cleanup failed', undefined, {
+          stage: VALIDATION_PRIMARY_STAGES.GENERIC,
+          reason: VALIDATION_REASON_CODES.CLEANUP_FAILED,
+        }),
+        currentPrimaryStage,
+      );
+      throw attachCleanupDiagnostics(markCleanupOnly(cleanupError), cleanupFailures);
+    }
+    currentPrimaryStage = VALIDATION_PRIMARY_STAGES.SUMMARY_WRITING;
+    if (result?.summary === undefined) fail('validation', 'App validation produced no summary');
+    await primary(VALIDATION_PRIMARY_STAGES.SUMMARY_WRITING, () =>
+      writeValidationSummary(result.summary, environment.runnerTemp, [
+        environment.privateKey,
+        environment.webhookSecret,
+      ]),
+    );
+    return result.summary;
   } catch (error) {
-    primaryError = error;
-  } finally {
-    try {
-      worker?.stop();
-      await closeServer(server);
-    } catch (error) {
-      cleanupFailure = error;
-    }
-    try {
-      queue?.close();
-    } catch (error) {
-      cleanupFailure ??= error;
-    }
-    try {
-      store?.close();
-    } catch (error) {
-      cleanupFailure ??= error;
-    }
-    if (beforeContainers !== undefined) {
-      try {
-        await cleanupValidationContainers(beforeContainers);
-      } catch (error) {
-        cleanupFailure ??= error;
-      }
-    }
-    try {
-      await cleanupValidationImage({ tag: image?.tag ?? imageTag, imageId: image?.imageId });
-    } catch (error) {
-      cleanupFailure ??= error;
-    }
-    try {
-      await cleanupFileOrDirectory(validationRoot, 'Validation workspace');
-    } catch (error) {
-      cleanupFailure ??= error;
-    }
+    const record = privateErrorRecord(error);
+    if (record?.boundaryOwner !== undefined) throw error;
+    throw annotateValidationError(error, currentPrimaryStage);
   }
-  if (primaryError !== undefined) {
-    if (cleanupFailure !== undefined)
-      fail('validation', 'App validation failed and cleanup did not complete', primaryError);
-    if (primaryError instanceof AppValidationError) throw primaryError;
-    fail('validation', 'App validation failed', primaryError);
-  }
-  if (cleanupFailure !== undefined)
-    fail('validation', 'App validation cleanup failed', cleanupFailure);
-  if (result?.summary === undefined) fail('validation', 'App validation produced no summary');
-  await writeValidationSummary(result.summary, environment.runnerTemp, [
-    environment.privateKey,
-    environment.webhookSecret,
-  ]);
-  return result.summary;
+}
+
+export function validationExitCodeFor(error) {
+  return privateErrorRecord(error)?.code === 'preflight'
+    ? VALIDATION_EXIT_CODES.preflight
+    : VALIDATION_EXIT_CODES.validation;
 }
 
 function isDirectInvocation() {
@@ -1682,11 +2275,14 @@ if (isDirectInvocation()) {
     try {
       await runValidation({ arguments_: process.argv.slice(2) });
     } catch (error) {
-      console.error(sanitizeMessage(errorForOperator(error)));
-      process.exitCode =
-        error instanceof AppValidationError && error.code === 'preflight'
-          ? VALIDATION_EXIT_CODES.preflight
-          : VALIDATION_EXIT_CODES.validation;
+      const record = privateErrorRecord(error);
+      const safeError =
+        record?.boundaryOwner === undefined
+          ? annotateValidationError(error, record?.stage ?? VALIDATION_PRIMARY_STAGES.GENERIC)
+          : error;
+      const diagnostics = formatValidationDiagnostics(safeError);
+      if (diagnostics.length > 0) console.error(diagnostics);
+      process.exitCode = validationExitCodeFor(safeError);
     }
   })();
 }
