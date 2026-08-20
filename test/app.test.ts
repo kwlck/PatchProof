@@ -1,4 +1,3 @@
-import { createServer } from 'node:http';
 import { generateKeyPairSync, verify as verifySignature } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -303,12 +302,22 @@ test('issue_comment fetches refs from GitHub after authorization and handles API
 test('GitHub transport fetches and validates pull request refs through the least-privilege GET path', async () => {
   let invalid = false;
   let headRepository: string | null = 'octo/example';
-  const server = createServer((request, response) => {
-    assert.equal(request.method, 'GET');
-    assert.equal(request.url, '/repos/octo/example/pulls/7');
-    assert.equal(request.headers.authorization, 'Bearer test-token');
-    response.setHeader('content-type', 'application/json');
-    response.end(
+  const originalFetch = globalThis.fetch;
+  const requestedUrls: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    requestedUrls.push(url.toString());
+    assert.equal(url.origin, 'https://api.github.com');
+    assert.equal(url.pathname, '/repos/octo/example/pulls/7');
+    assert.equal(url.search, '');
+    assert.equal(url.hash, '');
+    assert.equal(init?.method, 'GET');
+    assert.equal(init?.redirect, 'error');
+    assert.equal(
+      init?.headers && new Headers(init.headers).get('authorization'),
+      'Bearer test-token',
+    );
+    return new Response(
       JSON.stringify({
         number: 7,
         state: 'open',
@@ -318,12 +327,10 @@ test('GitHub transport fetches and validates pull request refs through the least
           repo: headRepository === null ? null : { full_name: headRepository },
         },
       }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
     );
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  assert.ok(address !== null && typeof address === 'object');
-  const transport = new GitHubApiTransport('test-token', `http://127.0.0.1:${address.port}`);
+  };
+  const transport = new GitHubApiTransport('test-token');
   try {
     assert.deepEqual(await transport.getPullRequest('octo/example', 7), {
       number: 7,
@@ -353,17 +360,27 @@ test('GitHub transport fetches and validates pull request refs through the least
       () => transport.getPullRequest('octo/example', 7),
       /invalid pull request refs/u,
     );
+    assert.deepEqual(requestedUrls, [
+      'https://api.github.com/repos/octo/example/pulls/7',
+      'https://api.github.com/repos/octo/example/pulls/7',
+      'https://api.github.com/repos/octo/example/pulls/7',
+      'https://api.github.com/repos/octo/example/pulls/7',
+    ]);
   } finally {
-    await new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve())),
-    );
+    globalThis.fetch = originalFetch;
   }
 });
 
 test('GitHub mutation transport forwards and honors AbortSignal', async () => {
   const originalFetch = globalThis.fetch;
   const observed: Array<AbortSignal | undefined> = [];
-  globalThis.fetch = async (_input, init) => {
+  const observedUrls: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    observedUrls.push(url.toString());
+    assert.equal(url.origin, 'https://api.github.com');
+    assert.equal(url.hash, '');
+    assert.equal(init?.redirect, 'error');
     observed.push(init?.signal);
     if (init?.signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
     return new Response(JSON.stringify({ id: 17, body: 'managed' }), {
@@ -371,7 +388,7 @@ test('GitHub mutation transport forwards and honors AbortSignal', async () => {
       headers: { 'content-type': 'application/json' },
     });
   };
-  const transport = new GitHubApiTransport('test-token', 'http://github.test');
+  const transport = new GitHubApiTransport('test-token');
   const controller = new AbortController();
   const payload = {
     name: 'PatchProof' as const,
@@ -399,8 +416,59 @@ test('GitHub mutation transport forwards and honors AbortSignal', async () => {
       /aborted/u,
     );
     assert.equal(observed[1], controller.signal);
+    assert.deepEqual(observedUrls, [
+      'https://api.github.com/repos/octo/example/check-runs',
+      'https://api.github.com/repos/octo/example/issues/7/comments',
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('GitHub transport ignores attacker API-base environment values and rejects redirects', async () => {
+  const originalFetch = globalThis.fetch;
+  const previousApiBase = process.env.PATCHPROOF_GITHUB_API_BASE;
+  process.env.PATCHPROOF_GITHUB_API_BASE = 'https://attacker.test';
+  const attemptedUrls: string[] = [];
+  const redirects = [
+    { status: 301, location: 'https://api.github.com/repos/octo/example/issues/7/comments' },
+    { status: 302, location: 'https://attacker.test/steal' },
+    { status: 307, location: 'https://api.github.com/repos/octo/example/issues/7/comments' },
+    { status: 308, location: 'https://attacker.test/steal' },
+  ];
+  let responseIndex = 0;
+  const provider = {
+    requiresInstallationId: false as const,
+    appId: 123,
+    getToken: async () => 'development-token',
+  };
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    attemptedUrls.push(url.toString());
+    assert.equal(url.origin, 'https://api.github.com');
+    assert.equal(init?.redirect, 'error');
+    const redirect = redirects[responseIndex] ?? redirects.at(-1);
+    assert.ok(redirect);
+    return new Response('', {
+      status: redirect.status,
+      headers: { location: redirect.location },
+    });
+  };
+  try {
+    const transport = new GitHubApiTransport(provider);
+    for (const redirect of redirects) {
+      await assert.rejects(
+        () => transport.createComment('octo/example', 7, { body: 'managed' }),
+        /request failed/u,
+      );
+      assert.equal(attemptedUrls.length, redirects.indexOf(redirect) + 1);
+      responseIndex += 1;
+    }
+    assert.ok(attemptedUrls.every((url) => !url.startsWith('https://attacker.test')));
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousApiBase === undefined) delete process.env.PATCHPROOF_GITHUB_API_BASE;
+    else process.env.PATCHPROOF_GITHUB_API_BASE = previousApiBase;
   }
 });
 
@@ -433,10 +501,17 @@ test('GitHub App JWTs are signed with bounded claims and installation tokens are
   const originalFetch = globalThis.fetch;
   let calls = 0;
   const requestedInstallations: number[] = [];
+  const requestedUrls: string[] = [];
   globalThis.fetch = async (input, init) => {
     calls += 1;
+    requestedUrls.push(String(input));
+    const url = new URL(String(input));
+    assert.equal(url.origin, 'https://api.github.com');
+    assert.equal(url.search, '');
+    assert.equal(url.hash, '');
     requestedInstallations.push(Number(String(input).match(/installations\/(\d+)/u)?.[1]));
     assert.equal(init?.method, 'POST');
+    assert.equal(init?.redirect, 'error');
     if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError');
     return new Response(
       JSON.stringify({
@@ -449,7 +524,7 @@ test('GitHub App JWTs are signed with bounded claims and installation tokens are
   try {
     const auth = new GitHubAppAuth(
       { appId: 123, privateKey: privatePem },
-      { apiBase: 'http://github.test', safetyMarginMs: 60_000, clock: () => now },
+      { safetyMarginMs: 60_000, clock: () => now },
     );
     assert.equal(await auth.getToken(10), 'installation-token-10');
     assert.equal(await auth.getToken(10), 'installation-token-10');
@@ -459,10 +534,95 @@ test('GitHub App JWTs are signed with bounded claims and installation tokens are
     assert.equal(await auth.getToken(10), 'installation-token-10');
     assert.equal(calls, 3);
     assert.deepEqual(requestedInstallations, [10, 11, 10]);
+    assert.equal(
+      await auth.getToken(Number.MAX_SAFE_INTEGER),
+      'installation-token-9007199254740991',
+    );
+    assert.equal(
+      requestedUrls.at(-1),
+      'https://api.github.com/app/installations/9007199254740991/access_tokens',
+    );
+    assert.equal(calls, 4);
 
     const controller = new AbortController();
     controller.abort();
     await assert.rejects(() => auth.getToken(12, { signal: controller.signal }), /aborted/u);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('GitHub App authentication rejects hostile identities and token responses', async () => {
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const auth = new GitHubAppAuth(
+    { appId: 123, privateKey: privatePem },
+    { safetyMarginMs: 60_000, clock: () => now },
+  );
+  assert.throws(
+    () =>
+      new GitHubAppAuth({ appId: 123, privateKey: privatePem }, {
+        apiBase: 'https://attacker.test',
+      } as never),
+    /API origin is fixed/u,
+  );
+  for (const value of [
+    '10',
+    new Number(10),
+    { valueOf: () => 10 },
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    assert.throws(
+      () => auth.getToken(value as unknown as number),
+      /installation identity is invalid/u,
+    );
+  }
+
+  const originalFetch = globalThis.fetch;
+  const responses: Response[] = [];
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    assert.equal(init?.redirect, 'error');
+    const response = responses.shift();
+    if (response === undefined) throw new Error('unexpected authentication request');
+    return response;
+  };
+  const responseBody = (body: unknown, status = 201): Response =>
+    new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
+  const validExpiry = new Date(now.getTime() + 300_000).toISOString();
+  const assertInvalidResponse = async (body: unknown, status = 201): Promise<void> => {
+    responses.push(responseBody(body, status));
+    await assert.rejects(() => auth.getToken(1), /GitHub .*authentication/u);
+  };
+  try {
+    await assertInvalidResponse('{');
+    await assertInvalidResponse(null);
+    await assertInvalidResponse([]);
+    await assertInvalidResponse({ expires_at: validExpiry });
+    await assertInvalidResponse({ token: '', expires_at: validExpiry });
+    await assertInvalidResponse({ token: '   ', expires_at: validExpiry });
+    await assertInvalidResponse({ token: 'x'.repeat(16_385), expires_at: validExpiry });
+    await assertInvalidResponse({ token: 'safe-token', expires_at: 123 });
+    await assertInvalidResponse({ token: 'safe-token', expires_at: '2026-01-01' });
+    await assertInvalidResponse({ token: 'safe-token', expires_at: '2026-02-30T00:00:00Z' });
+    await assertInvalidResponse({ token: 'safe-token', expires_at: now.toISOString() });
+    await assertInvalidResponse({
+      token: 'safe-token',
+      expires_at: new Date(now.getTime() + 60_000).toISOString(),
+    });
+    for (const status of [301, 302, 307, 308, 400, 500])
+      await assertInvalidResponse({ token: 'safe-token', expires_at: validExpiry }, status);
+    assert.equal(calls, 18);
+    responses.push(responseBody({ token: 'safe-token', expires_at: validExpiry }));
+    assert.equal(await auth.getToken(1), 'safe-token');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -528,7 +688,7 @@ test('GitHub transport uses external_id and fails closed on spoofed managed comm
     return new Response(JSON.stringify({ id: 1, body: 'ok' }), { status: 200 });
   };
   try {
-    const transport = new GitHubApiTransport(provider, 'http://github.test');
+    const transport = new GitHubApiTransport(provider);
     const payload = {
       name: 'PatchProof' as const,
       status: 'completed' as const,
@@ -600,7 +760,7 @@ test('GitHub Check reconciliation recovers an accepted create after an ambiguous
     throw new Error(`unexpected GitHub request: ${init?.method ?? 'GET'} ${url.pathname}`);
   };
   try {
-    const transport = new GitHubApiTransport(provider, 'http://github.test', 1);
+    const transport = new GitHubApiTransport(provider, 1);
     await assert.rejects(
       () =>
         transport.createCheck('octo/example', headSha, {
@@ -658,7 +818,7 @@ test('managed comment reconciliation paginates to page two and stops at a hard b
     return new Response(JSON.stringify([]), { status: 200 });
   };
   try {
-    const transport = new GitHubApiTransport(provider, 'http://github.test');
+    const transport = new GitHubApiTransport(provider);
     assert.equal((await transport.findManagedComment('octo/example', 7))?.id, 202);
     assert.deepEqual(pages, [1, 2]);
 
@@ -722,7 +882,7 @@ test('managed Check reconciliation follows total_count beyond the first 100 runs
     );
   };
   try {
-    const transport = new GitHubApiTransport(provider, 'http://github.test');
+    const transport = new GitHubApiTransport(provider);
     assert.equal((await transport.findManagedCheck('octo/example', 7, headSha))?.id, 202);
     assert.deepEqual(pages, [1, 2]);
   } finally {

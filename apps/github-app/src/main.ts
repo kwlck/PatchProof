@@ -12,7 +12,6 @@ import {
 
 const port = Number(process.env.PORT ?? 3000);
 const secret = process.env.PATCHPROOF_WEBHOOK_SECRET;
-const apiBase = process.env.PATCHPROOF_GITHUB_API_BASE ?? 'https://api.github.com';
 let credentials: GitHubAppCredentials | undefined;
 try {
   credentials = appCredentialsFromEnvironment();
@@ -34,7 +33,7 @@ if (secret === undefined || secret.length < 16 || credentials === undefined) {
   await mkdir(dirname(sqlitePath), { recursive: true, mode: 0o700 });
   const store = new SqliteStateStore(sqlitePath);
   const queue = new SqliteQueue(sqlitePath, () => new Date(), { requireInstallationId: true });
-  const github = new GitHubApiTransport(new GitHubAppAuth(credentials, { apiBase }), apiBase);
+  const github = new GitHubApiTransport(new GitHubAppAuth(credentials));
   const server = createWebhookServer({
     webhookSecret: secret,
     store,

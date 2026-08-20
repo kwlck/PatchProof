@@ -15,6 +15,7 @@ const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const GITHUB_PAGE_SIZE = 100;
 const MAX_CHECK_PAGES = 20;
 const MAX_COMMENT_PAGES = 20;
+const GITHUB_API_ORIGIN = 'https://api.github.com';
 
 export interface GitHubDevelopmentTokenProvider {
   readonly requiresInstallationId: false;
@@ -54,6 +55,18 @@ function repositoryPath(repository: string): string {
   if (parts.length !== 2 || parts.some((part) => !/^[A-Za-z0-9_.-]+$/u.test(part)))
     throw new GitHubApiError('Repository must be owner/name');
   return `${encodeURIComponent(parts[0] ?? '')}/${encodeURIComponent(parts[1] ?? '')}`;
+}
+
+function apiEndpoint(path: string): URL {
+  const endpoint = new URL(path, GITHUB_API_ORIGIN);
+  if (
+    endpoint.origin !== GITHUB_API_ORIGIN ||
+    endpoint.protocol !== 'https:' ||
+    !endpoint.pathname.startsWith('/repos/') ||
+    endpoint.hash !== ''
+  )
+    throw new GitHubApiError('GitHub API endpoint is invalid');
+  return endpoint;
 }
 
 function assertInstallationId(value: number): void {
@@ -115,7 +128,6 @@ export class GitHubApiTransport implements GitHubTransport {
     GitHubInstallationTokenProvider | GitHubDevelopmentTokenProvider | undefined;
   private readonly staticToken: string | undefined;
   public readonly appId?: number;
-  private readonly apiBase: string;
   private readonly requestTimeoutMs: number;
 
   /**
@@ -124,7 +136,6 @@ export class GitHubApiTransport implements GitHubTransport {
    */
   public constructor(
     credentials: GitHubApiCredentials,
-    apiBase = 'https://api.github.com',
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ) {
     if (
@@ -133,7 +144,6 @@ export class GitHubApiTransport implements GitHubTransport {
       requestTimeoutMs > DEFAULT_REQUEST_TIMEOUT_MS
     )
       throw new GitHubApiError('GitHub API request timeout is invalid');
-    this.apiBase = apiBase.replace(/\/$/u, '');
     if (typeof credentials === 'string') {
       if (!credentials || credentials.length > 16_384)
         throw new GitHubApiError('Development static token is invalid');
@@ -185,7 +195,7 @@ export class GitHubApiTransport implements GitHubTransport {
     let response: Response;
     try {
       try {
-        response = await fetch(`${this.apiBase}${path}`, {
+        response = await fetch(apiEndpoint(path), {
           method,
           headers: {
             Accept: 'application/vnd.github+json',
@@ -195,6 +205,7 @@ export class GitHubApiTransport implements GitHubTransport {
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           signal: requestSignal,
+          redirect: 'error',
         });
       } catch (error) {
         safeApiError(error, requestSignal);

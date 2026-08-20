@@ -4,6 +4,11 @@ import type { GitHubMutationOptions } from '@patchproof/github';
 const DEFAULT_TOKEN_SAFETY_MARGIN_MS = 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_PRIVATE_KEY_BYTES = 128 * 1024;
+const MAX_TOKEN_LENGTH = 16_384;
+const GITHUB_API_ORIGIN = 'https://api.github.com';
+const GITHUB_INSTALLATION_TOKEN_PATH = '/app/installations/';
+const RFC3339_TIMESTAMP_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/u;
 
 export interface GitHubAppCredentials {
   appId: number;
@@ -34,7 +39,6 @@ export class GitHubAuthError extends Error {
 }
 
 export interface GitHubAppAuthOptions {
-  apiBase?: string;
   safetyMarginMs?: number;
   requestTimeoutMs?: number;
   clock?: () => Date;
@@ -45,19 +49,14 @@ interface CachedToken {
   expiresAtMs: number;
 }
 
-interface TokenResponse {
-  token: unknown;
-  expires_at: unknown;
-}
-
-function assertInstallationId(value: number): number {
-  if (!Number.isSafeInteger(value) || value < 1)
+function assertInstallationId(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0)
     throw new GitHubAuthError('configuration', 'GitHub installation identity is invalid');
   return value;
 }
 
 export function parseInstallationId(value: unknown): number | undefined {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) return undefined;
   return value;
 }
 
@@ -83,6 +82,70 @@ function boundedInteger(value: number | undefined, fallback: number, max: number
   if (!Number.isSafeInteger(value) || value < 1 || value > max)
     throw new GitHubAuthError('configuration', 'GitHub authentication timing is invalid');
   return value;
+}
+
+function parseRfc3339Timestamp(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = RFC3339_TIMESTAMP_PATTERN.exec(value);
+  if (match === null) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth =
+    month === 2 ? (isLeapYear ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  )
+    return undefined;
+
+  const timezone = match[8] ?? '';
+  let offsetMinutes = 0;
+  if (timezone !== 'Z') {
+    const offsetHours = Number(timezone.slice(1, 3));
+    const offsetMinutesPart = Number(timezone.slice(4, 6));
+    if (offsetHours > 23 || offsetMinutesPart > 59) return undefined;
+    offsetMinutes = (timezone.startsWith('-') ? -1 : 1) * (offsetHours * 60 + offsetMinutesPart);
+  }
+  const fraction = match[7] ?? '';
+  const milliseconds = fraction.length === 0 ? 0 : Number(fraction.slice(0, 3).padEnd(3, '0'));
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, milliseconds);
+  const timestamp = date.getTime() - offsetMinutes * 60_000;
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function installationTokenEndpoint(installationId: number): URL {
+  const canonicalId = String(assertInstallationId(installationId));
+  const expectedPath = `${GITHUB_INSTALLATION_TOKEN_PATH}${canonicalId}/access_tokens`;
+  const endpoint = new URL(
+    `${GITHUB_INSTALLATION_TOKEN_PATH}${encodeURIComponent(canonicalId)}/access_tokens`,
+    GITHUB_API_ORIGIN,
+  );
+  if (
+    endpoint.origin !== GITHUB_API_ORIGIN ||
+    endpoint.pathname !== expectedPath ||
+    endpoint.search !== '' ||
+    endpoint.hash !== ''
+  )
+    throw new GitHubAuthError('configuration', 'GitHub authentication endpoint is invalid');
+  return endpoint;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 function combineSignals(
@@ -136,7 +199,6 @@ export function createGitHubAppJwt(credentials: GitHubAppCredentials, now = new 
 export class GitHubAppAuth implements GitHubInstallationTokenProvider {
   public readonly requiresInstallationId = true as const;
   public readonly appId: number;
-  private readonly apiBase: string;
   private readonly safetyMarginMs: number;
   private readonly requestTimeoutMs: number;
   private readonly clock: () => Date;
@@ -145,12 +207,13 @@ export class GitHubAppAuth implements GitHubInstallationTokenProvider {
   private readonly pending = new Map<number, Promise<string>>();
 
   public constructor(credentials: GitHubAppCredentials, options: GitHubAppAuthOptions = {}) {
+    if (Object.prototype.hasOwnProperty.call(options, 'apiBase'))
+      throw new GitHubAuthError('configuration', 'GitHub authentication API origin is fixed');
     this.credentials = {
       appId: assertAppId(credentials.appId),
       privateKey: normalizePrivateKey(credentials.privateKey),
     };
     this.appId = this.credentials.appId;
-    this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/u, '');
     this.safetyMarginMs = boundedInteger(
       options.safetyMarginMs,
       DEFAULT_TOKEN_SAFETY_MARGIN_MS,
@@ -170,11 +233,12 @@ export class GitHubAppAuth implements GitHubInstallationTokenProvider {
   ): Promise<string> {
     const id = assertInstallationId(installationId);
     const jwt = createGitHubAppJwt(this.credentials, this.clock());
+    const endpoint = installationTokenEndpoint(id);
     const combined = combineSignals(options?.signal, this.requestTimeoutMs);
     try {
       let response: Response;
       try {
-        response = await fetch(`${this.apiBase}/app/installations/${id}/access_tokens`, {
+        response = await fetch(endpoint, {
           method: 'POST',
           headers: {
             Accept: 'application/vnd.github+json',
@@ -182,6 +246,7 @@ export class GitHubAppAuth implements GitHubInstallationTokenProvider {
             'X-GitHub-Api-Version': '2022-11-28',
           },
           signal: combined.signal,
+          redirect: 'error',
         });
       } catch (error) {
         void error;
@@ -189,30 +254,35 @@ export class GitHubAppAuth implements GitHubInstallationTokenProvider {
           throw new GitHubAuthError('aborted', 'GitHub authentication request was aborted');
         throw new GitHubAuthError('request', 'GitHub authentication request failed');
       }
-      if (!response.ok)
+      if (!Number.isInteger(response.status) || response.status < 200 || response.status > 299)
         throw new GitHubAuthError(
           'response',
           `GitHub installation authentication failed (${response.status})`,
         );
-      let result: TokenResponse;
+      let decoded: unknown;
       try {
-        result = (await response.json()) as TokenResponse;
+        decoded = await response.json();
       } catch (error) {
         void error;
         throw new GitHubAuthError('response', 'GitHub authentication response was invalid');
       }
-      const token = result.token;
-      const expiresAt = result.expires_at;
+      const result = recordValue(decoded);
+      const token = result?.token;
+      const expiresAt = result?.expires_at;
       if (
         typeof token !== 'string' ||
-        token.length < 1 ||
-        token.length > 16_384 ||
+        token.trim().length < 1 ||
+        token.length > MAX_TOKEN_LENGTH ||
         typeof expiresAt !== 'string'
       )
         throw new GitHubAuthError('response', 'GitHub authentication response was invalid');
-      const expiresAtMs = Date.parse(expiresAt);
+      const expiresAtMs = parseRfc3339Timestamp(expiresAt);
       const nowMs = this.clock().getTime();
-      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs)
+      if (
+        expiresAtMs === undefined ||
+        !Number.isFinite(nowMs) ||
+        expiresAtMs <= nowMs + this.safetyMarginMs
+      )
         throw new GitHubAuthError('response', 'GitHub authentication response expiry was invalid');
       this.cache.set(id, { token, expiresAtMs });
       return token;

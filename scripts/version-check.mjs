@@ -27,30 +27,74 @@ for (let index = 0; index < process.argv.length; index += 1) {
 }
 
 const errors = [];
-const changelogVersionPattern = (releaseVersion) =>
-  new RegExp(
-    `^##\\s+${releaseVersion.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}(?:\\s|$)[^\\r\\n]*`,
-    'mu',
-  );
+const semverIdentifierPattern = /^[0-9A-Za-z-]+$/u;
+const numericIdentifierPattern = /^[0-9]+$/u;
+const coreVersionIdentifierPattern = /^(0|[1-9][0-9]*)$/u;
+const changelogHeadingPattern = /^##[ \t]+([^ \t\r\n]+)(?:[ \t]+(.*))?$/u;
 function check(condition, message) {
   if (!condition) errors.push(message);
 }
 
-check(
-  /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u.test(expectedVersion),
-  `Invalid release version: ${expectedVersion}`,
-);
+function isValidSemVer(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  const plusIndex = value.indexOf('+');
+  const withoutBuild = plusIndex < 0 ? value : value.slice(0, plusIndex);
+  const build = plusIndex < 0 ? undefined : value.slice(plusIndex + 1);
+  if (build !== undefined) {
+    const buildIdentifiers = build.split('.');
+    if (
+      buildIdentifiers.some(
+        (identifier) => identifier.length === 0 || !semverIdentifierPattern.test(identifier),
+      )
+    )
+      return false;
+  }
+
+  const hyphenIndex = withoutBuild.indexOf('-');
+  const core = hyphenIndex < 0 ? withoutBuild : withoutBuild.slice(0, hyphenIndex);
+  const prerelease = hyphenIndex < 0 ? undefined : withoutBuild.slice(hyphenIndex + 1);
+  const coreIdentifiers = core.split('.');
+  if (
+    coreIdentifiers.length !== 3 ||
+    coreIdentifiers.some((identifier) => !coreVersionIdentifierPattern.test(identifier))
+  )
+    return false;
+  if (prerelease === undefined) return true;
+  const prereleaseIdentifiers = prerelease.split('.');
+  return prereleaseIdentifiers.every((identifier) => {
+    if (identifier.length === 0 || !semverIdentifierPattern.test(identifier)) return false;
+    return (
+      !numericIdentifierPattern.test(identifier) || identifier === '0' || identifier[0] !== '0'
+    );
+  });
+}
+
+const validExpectedVersion = isValidSemVer(expectedVersion);
+if (!validExpectedVersion) {
+  console.error('Version consistency check failed');
+  console.error(`- Invalid release version: ${expectedVersion}`);
+  process.exit(1);
+}
 if (requestedTag !== undefined && requestedTag.length > 0)
   check(
     requestedTag === `v${expectedVersion}`,
     `Requested tag ${requestedTag} must be v${expectedVersion}`,
   );
 const changelog = await readFile(join(root, 'CHANGELOG.md'), 'utf8');
-const changelogMatch = changelog.match(changelogVersionPattern(expectedVersion));
-check(changelogMatch !== null, `CHANGELOG.md must contain a ${expectedVersion} marker`);
-if (requestedTag !== undefined && changelogMatch !== null)
+let changelogHeading;
+if (validExpectedVersion) {
+  for (const line of changelog.split(/\r?\n/u)) {
+    const heading = changelogHeadingPattern.exec(line);
+    if (heading !== null && heading[1] === expectedVersion) {
+      changelogHeading = heading;
+      break;
+    }
+  }
+}
+check(changelogHeading !== undefined, `CHANGELOG.md must contain a ${expectedVersion} marker`);
+if (requestedTag !== undefined && changelogHeading !== undefined)
   check(
-    !/-\s*unreleased\b/iu.test(changelogMatch[0]),
+    !/-\s*unreleased\b/iu.test(changelogHeading[2] ?? ''),
     `CHANGELOG.md ${expectedVersion} entry must be released before tagging ${requestedTag}`,
   );
 

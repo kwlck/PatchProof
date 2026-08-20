@@ -39,12 +39,11 @@ if (credentials === undefined) {
   const outputRoot = resolve(process.env.PATCHPROOF_EVIDENCE_ROOT ?? 'work/github-evidence');
   await mkdir(dirname(sqlitePath), { recursive: true, mode: 0o700 });
   const store = new SqliteStateStore(sqlitePath);
-  const apiBase = process.env.PATCHPROOF_GITHUB_API_BASE ?? 'https://api.github.com';
-  const auth = new GitHubAppAuth(credentials, { apiBase });
+  const auth = new GitHubAppAuth(credentials);
   const queue = new SqliteQueue(sqlitePath, () => new Date(), {
     requireInstallationId: true,
   });
-  const github = new GitHubApiTransport(auth, apiBase);
+  const github = new GitHubApiTransport(auth);
   const worker = new PatchProofWorker({
     queue,
     source: new GitHubSourceAdapter(auth),
