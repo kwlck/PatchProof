@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -77,17 +77,20 @@ test('Docker workspace preparation opens only the generated workspace tree', asy
 });
 
 test('Docker command encodes the isolation policy and scenario environment', () => {
-  const command = buildDockerCommand({
-    revision: 'head',
-    workspace: 'C:/workspace',
-    command: ['node', 'scenario.mjs'],
-    cwd: '.',
-    environment: { PATH: 'host-path', PATCHPROOF_REVISION: 'head' },
-    timeoutMs: 2000,
-    outputBytes: 4096,
-    secrets: [],
-    policy,
-  });
+  const command = buildDockerCommand(
+    {
+      revision: 'head',
+      workspace: 'C:/workspace',
+      command: ['node', 'scenario.mjs'],
+      cwd: '.',
+      environment: { PATH: 'host-path', PATCHPROOF_REVISION: 'head' },
+      timeoutMs: 2000,
+      outputBytes: 4096,
+      secrets: [],
+      policy,
+    },
+    { scenarioEnvFile: 'C:/tmp/scenario.env' },
+  );
   assert.equal(command[0], 'docker');
   assert.ok(command.includes('--network'));
   assert.ok(command.includes('none'));
@@ -96,10 +99,31 @@ test('Docker command encodes the isolation policy and scenario environment', () 
   assert.ok(command.includes('--cap-drop'));
   assert.ok(command.includes('ALL'));
   assert.ok(command.includes('no-new-privileges:true'));
-  assert.ok(command.includes('PATCHPROOF_REVISION=head'));
+  // Scenario values travel through --env-file so they never appear in argv.
+  assert.ok(command.includes('--memory-swap'));
+  assert.ok(command.includes('--env-file'));
+  assert.equal(
+    command.some((item) => item.includes('PATCHPROOF_REVISION=')),
+    false,
+  );
   assert.equal(
     command.some((item) => item.includes('docker.sock')),
     false,
+  );
+  assert.throws(
+    () =>
+      buildDockerCommand({
+        revision: 'head',
+        workspace: 'C:/workspace',
+        command: ['node'],
+        cwd: '.',
+        environment: { SCENARIO_ONLY: 'inside' },
+        timeoutMs: 2000,
+        outputBytes: 4096,
+        secrets: [],
+        policy,
+      }),
+    /scenarioEnvFile/u,
   );
   assert.throws(
     () =>
@@ -173,7 +197,11 @@ test('Docker command encodes the isolation policy and scenario environment', () 
       secrets: [],
       policy,
     },
-    { containerName: 'patchproof-test-container', cidFile: 'C:/tmp/patchproof.cid' },
+    {
+      containerName: 'patchproof-test-container',
+      cidFile: 'C:/tmp/patchproof.cid',
+      scenarioEnvFile: 'C:/tmp/scenario.env',
+    },
   );
   assert.ok(nested.includes('--pull'));
   assert.ok(nested.includes('never'));
@@ -296,6 +324,12 @@ test('Docker backend keeps scenario env out of launcher env and always cleans a 
         const cidFile = spec.command[cidIndex + 1];
         assert.ok(cidFile);
         await writeFile(cidFile, `${'a'.repeat(64)}\n`, 'utf8');
+        const envIndex = spec.command.indexOf('--env-file');
+        const envFile = spec.command[envIndex + 1];
+        assert.ok(envFile);
+        const envContents = await readFile(envFile, 'utf8');
+        assert.match(envContents, /^SCENARIO_ONLY=inside$/mu);
+        assert.equal(envContents.includes('host-path'), false);
         return fakeExecution({ exitCode: 42 });
       }
       return fakeExecution();
@@ -319,7 +353,11 @@ test('Docker backend keeps scenario env out of launcher env and always cleans a 
   assert.ok(runCall);
   assert.deepEqual(runCall.environment, {});
   assert.deepEqual(runCall.launcherEnvironment, { PATH: 'host-path', SystemRoot: 'system' });
-  assert.ok(runCall.command.includes('SCENARIO_ONLY=inside'));
+  assert.ok(runCall.command.includes('--env-file'));
+  assert.equal(
+    runCall.command.some((item) => item.includes('SCENARIO_ONLY=')),
+    false,
+  );
   assert.equal(
     runCall.command.some((item) => item.includes('host-secret')),
     false,
