@@ -14,6 +14,18 @@ export class PatternDeadlineExceededError extends Error {
   }
 }
 
+/**
+ * Raised when the evaluation worker exited without reporting a result, for
+ * example after an external kill or a load failure. Distinct from the deadline
+ * error so diagnostics do not blame the pattern's speed.
+ */
+export class PatternWorkerCrashedError extends Error {
+  public constructor() {
+    super('Regular expression worker exited before reporting a result');
+    this.name = 'PatternWorkerCrashedError';
+  }
+}
+
 // Eval workers default to CommonJS regardless of the package module type.
 const MATCHER_SOURCE = `
 const { parentPort } = require('node:worker_threads');
@@ -71,7 +83,7 @@ export function matchesWithinDeadline(
       settle(() => rejectPromise(error instanceof Error ? error : new Error(String(error))));
     });
     worker.once('exit', () => {
-      settle(() => rejectPromise(new PatternDeadlineExceededError()));
+      settle(() => rejectPromise(new PatternWorkerCrashedError()));
     });
     worker.postMessage({ pattern, flags, input });
   });

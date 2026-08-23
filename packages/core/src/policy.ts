@@ -70,10 +70,12 @@ function matchesExpectedFailure(
   return true;
 }
 
-function classifyOutcomeWith(
-  input: ClassificationInput,
-  match: ExpectedMatcher,
-): ClassificationResult {
+/**
+ * Decisions that never depend on configured patterns. Running them first lets
+ * guarded classification skip regular-expression evaluation entirely for
+ * outcomes such as timeouts, errors, or incomplete evidence.
+ */
+function earlyClassification(input: ClassificationInput): ClassificationResult | undefined {
   if (input.policyDenied !== undefined) {
     return {
       outcome: 'POLICY_DENIED',
@@ -110,12 +112,13 @@ function classifyOutcomeWith(
       reason: 'Required evidence fields or artifacts are missing',
     };
   }
-  const baseExpectedFailure = matchesExpectedFailure(
-    input.base.exitCode,
-    input.base.output,
-    input.expectedFailure,
-    match,
-  );
+  return undefined;
+}
+
+function matchedClassification(
+  input: ClassificationInput,
+  baseExpectedFailure: boolean,
+): ClassificationResult {
   const headSuccess = input.head.exitCode === 0;
   if (!baseExpectedFailure) {
     return {
@@ -147,19 +150,37 @@ function classifyOutcomeWith(
   };
 }
 
+function classifyOutcomeWith(
+  input: ClassificationInput,
+  match: ExpectedMatcher,
+): ClassificationResult {
+  const early = earlyClassification(input);
+  if (early !== undefined) return early;
+  const baseExpectedFailure = matchesExpectedFailure(
+    input.base.exitCode,
+    input.base.output,
+    input.expectedFailure,
+    match,
+  );
+  return matchedClassification(input, baseExpectedFailure);
+}
+
 export function classifyOutcome(input: ClassificationInput): ClassificationResult {
   return classifyOutcomeWith(input, defaultMatcher);
 }
 
 /**
  * Deterministic classification when the pattern or the output may be hostile,
- * such as outcome recomputation during evidence verification. Every pattern
- * evaluation runs inside a worker thread that is terminated at the deadline.
+ * such as outcome recomputation during evidence verification. Pattern
+ * evaluation runs inside a worker thread terminated at the deadline, and only
+ * when the decision actually depends on the patterns.
  */
 export async function classifyOutcomeGuarded(
   input: ClassificationInput,
   options: GuardedClassificationOptions = {},
 ): Promise<ClassificationResult> {
+  const early = earlyClassification(input);
+  if (early !== undefined) return early;
   const deadlineMs = options.deadlineMs ?? PATTERN_DEADLINE_MS;
   const decisions = new Map<string, boolean>();
   for (const pattern of [input.expectedFailure.reasonPattern, input.expectedFailure.reasonClass]) {
@@ -169,5 +190,11 @@ export async function classifyOutcomeGuarded(
       await matchesWithinDeadline(pattern, 'm', input.base.output, deadlineMs),
     );
   }
-  return classifyOutcomeWith(input, (candidate) => decisions.get(candidate) ?? false);
+  const baseExpectedFailure = matchesExpectedFailure(
+    input.base.exitCode,
+    input.base.output,
+    input.expectedFailure,
+    (candidate) => decisions.get(candidate) ?? false,
+  );
+  return matchedClassification(input, baseExpectedFailure);
 }

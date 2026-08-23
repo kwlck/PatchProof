@@ -584,3 +584,29 @@ test('verification fails closed when outcome recomputation exceeds the pattern d
     result.errors.some((error) => error.includes('regular-expression evaluation deadline')),
   );
 });
+
+test('verification skips pattern evaluation when the outcome cannot depend on it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'patchproof-core-lazy-'));
+  const bundle = await createValidBundle(root);
+  const timedOut = cloneBundle(bundle);
+  // A timeout decides the outcome before any pattern is consulted, so even a
+  // pathological pattern must not invalidate or delay verification.
+  timedOut.executions.base.timedOut = true;
+  timedOut.scenario.expectedFailure.reasonPattern = '(?:a+)+$';
+  timedOut.outcome = 'INCONCLUSIVE';
+  timedOut.verdict = 'The scenario timed out before a trustworthy comparison completed.';
+  const hostileBaseStderr = `${'a'.repeat(1800)}EXPECTED_BUG parser-regression\n`;
+  await writeFile(join(root, 'artifacts', 'base.stderr.log'), hostileBaseStderr, 'utf8');
+  const baseStderrArtifact = timedOut.artifacts.find((artifact) => artifact.id === 'base-stderr')!;
+  baseStderrArtifact.sha256 = sha256(Buffer.from(hostileBaseStderr, 'utf8'));
+  baseStderrArtifact.sizeBytes = Buffer.byteLength(hostileBaseStderr, 'utf8');
+  timedOut.executions.base.stderr.preview = hostileBaseStderr;
+  timedOut.executions.base.stderr.sizeBytes = Buffer.byteLength(hostileBaseStderr, 'utf8');
+  // Mutations happened after signing, so recompute the canonical integrity.
+  const resigned = cloneBundle(timedOut);
+  const timedOutPath = await writeBundle(root, resigned);
+  const startedAt = Date.now();
+  const result = await verifyEvidenceBundle(timedOutPath);
+  assert.equal(result.valid, true, result.errors.join('; '));
+  assert.ok(Date.now() - startedAt < 5_000, 'pattern evaluation must be skipped');
+});

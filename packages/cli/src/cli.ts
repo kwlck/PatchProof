@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import {
   classifyOutcomeGuarded,
   PatternDeadlineExceededError,
+  PatternWorkerCrashedError,
   verifyEvidenceBundle,
   type EvidenceBundle,
 } from '@patchproof/core';
@@ -62,7 +63,9 @@ function printError(error: unknown, json: boolean): number {
   const message = error instanceof Error ? error.message : String(error);
   if (json) jsonOutput({ ok: false, error: message });
   else console.error(`PatchProof error: ${message}`);
-  return 2;
+  // Host-side infrastructure failures are tagged by the runner so CI can
+  // distinguish them from inconclusive input (documented exit code 4).
+  return message.startsWith('INFRA_ERROR:') ? 4 : 2;
 }
 
 async function initCommand(args: ParsedArgs): Promise<number> {
@@ -356,7 +359,15 @@ function probeSqlite(): DoctorCheck {
       `node:sqlite open/close probe failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   } finally {
-    database?.close();
+    if (database !== undefined) {
+      // A secondary close failure must not mask the probe diagnostic above.
+      try {
+        database.close();
+      } catch {
+        // Ignore; the primary result already reports the failure.
+      }
+      database = undefined;
+    }
   }
 }
 
@@ -456,8 +467,11 @@ async function replayCommand(args: ParsedArgs): Promise<number> {
       complete: true,
     });
   } catch (error) {
-    if (!(error instanceof PatternDeadlineExceededError)) throw error;
-    const reason = 'Regular-expression evaluation exceeded its deadline during replay';
+    const deadline = error instanceof PatternDeadlineExceededError;
+    if (!deadline && !(error instanceof PatternWorkerCrashedError)) throw error;
+    const reason = deadline
+      ? 'Regular-expression evaluation exceeded its deadline during replay'
+      : 'Regular-expression evaluation failed during replay';
     if (hasOption(args, 'json')) jsonOutput({ ok: false, plan, outcome: 'INCONCLUSIVE', reason });
     else console.log(`Replay inconclusive: ${reason}`);
     return 2;
