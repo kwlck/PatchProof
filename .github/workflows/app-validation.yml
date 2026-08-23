@@ -43,6 +43,15 @@ jobs:
           [[ "$PATCHPROOF_VALIDATION_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PATCHPROOF_VALIDATION_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PATCHPROOF_VALIDATION_PATCHPROOF_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$GITHUB_SHA" != "$PATCHPROOF_VALIDATION_PATCHPROOF_SHA" ]; then
+            echo 'The harness pin does not match this run.' >&2
+            echo "PATCHPROOF_VALIDATION_PATCHPROOF_SHA=$PATCHPROOF_VALIDATION_PATCHPROOF_SHA" >&2
+            echo "GITHUB_SHA=$GITHUB_SHA" >&2
+            echo 'Review the harness diff between these two commits on main, then update the' >&2
+            echo 'app-validation environment variable PATCHPROOF_VALIDATION_PATCHPROOF_SHA to the' >&2
+            echo 'commit you reviewed and dispatch the workflow again.' >&2
+            exit 1
+          fi
           test "$GITHUB_SHA" = "$PATCHPROOF_VALIDATION_PATCHPROOF_SHA"
           [[ "$PATCHPROOF_VALIDATION_APP_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$PATCHPROOF_VALIDATION_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]]
