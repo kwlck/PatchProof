@@ -3,10 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import {
   canonicalize,
-  classifyOutcome,
+  classifyOutcomeGuarded,
   createIntegrity,
+  PatternDeadlineExceededError,
+  PatternWorkerCrashedError,
   redactText,
   sha256,
+  type ClassificationResult,
   type EvidenceBundle,
   type DependencyLockIdentity,
   type ExecutionEvidence,
@@ -266,23 +269,41 @@ export async function writeEvidenceBundle(
     cleanup: run?.cleanedUp ?? true,
   };
   const complete = Object.values(completenessChecks).every(Boolean);
-  const classification = classifyOutcome({
-    base: {
-      exitCode: baseExecution.exitCode,
-      timedOut: baseExecution.timedOut,
-      ...(baseExecution.error === undefined ? {} : { error: baseExecution.error }),
-      output: `${baseExecution.stdout}\n${baseExecution.stderr}`,
-    },
-    head: {
-      exitCode: headExecution.exitCode,
-      timedOut: headExecution.timedOut,
-      ...(headExecution.error === undefined ? {} : { error: headExecution.error }),
-      output: `${headExecution.stdout}\n${headExecution.stderr}`,
-    },
-    expectedFailure: options.config.scenario.expectedFailure,
-    ...(denialReason === undefined ? {} : { policyDenied: denialReason }),
-    complete,
-  });
+  let classification: ClassificationResult;
+  try {
+    classification = await classifyOutcomeGuarded({
+      base: {
+        exitCode: baseExecution.exitCode,
+        timedOut: baseExecution.timedOut,
+        ...(baseExecution.error === undefined ? {} : { error: baseExecution.error }),
+        output: `${baseExecution.stdout}\n${baseExecution.stderr}`,
+      },
+      head: {
+        exitCode: headExecution.exitCode,
+        timedOut: headExecution.timedOut,
+        ...(headExecution.error === undefined ? {} : { error: headExecution.error }),
+        output: `${headExecution.stdout}\n${headExecution.stderr}`,
+      },
+      expectedFailure: options.config.scenario.expectedFailure,
+      ...(denialReason === undefined ? {} : { policyDenied: denialReason }),
+      complete,
+    });
+  } catch (error) {
+    // A hostile or pathological configured pattern must degrade to an honest
+    // INCONCLUSIVE bundle instead of blocking the writer or the worker.
+    classification = {
+      outcome: 'INCONCLUSIVE',
+      verdict: 'Evidence is incomplete; no fix claim is made.',
+      baseExpectedFailure: false,
+      headSuccess: false,
+      reason:
+        error instanceof PatternDeadlineExceededError
+          ? 'Expected-failure patterns exceeded their evaluation deadline'
+          : error instanceof PatternWorkerCrashedError
+            ? 'Expected-failure patterns could not be evaluated'
+            : `Outcome classification failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
   const completeness = {
     complete,
     checks: completenessChecks,

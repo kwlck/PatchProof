@@ -28,7 +28,7 @@
     "sbom:check": "node scripts/sbom-check.mjs",
     "release:checksums": "node scripts/checksums.mjs",
     "version:check": "node scripts/version-check.mjs",
-    "fixture:run": "pnpm patchproof run fixtures/pass/.patchproof.yml --base fixtures/pass/base --head fixtures/pass/head --backend local --allow-unsafe-local --output work/fixture-pass",
+    "fixture:run": "pnpm patchproof run fixtures/pass/local.patchproof.yml --base fixtures/pass/base --head fixtures/pass/head --backend local --allow-unsafe-local --output work/fixture-pass",
     "fixture:verify": "pnpm patchproof verify work/fixture-pass/patchproof.evidence.json"
   },
   "devDependencies": {

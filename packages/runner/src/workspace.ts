@@ -128,8 +128,21 @@ export async function sourceIdentity(
   fallbackRef: string,
 ): Promise<{ sha256: string; kind: 'git-commit' | 'directory-tree'; ref: string }> {
   try {
+    // The checkout is untrusted repository content, so git runs with a
+    // minimal environment: no inherited secrets and no repo- or system-level
+    // config that a future subcommand change could turn into code execution.
     const result = await execFileAsync('git', ['-C', root, 'rev-parse', 'HEAD'], {
       windowsHide: true,
+      timeout: 10_000,
+      maxBuffer: 4_194_304,
+      env: {
+        PATH: process.env.PATH ?? '',
+        ...(process.env.SystemRoot === undefined ? {} : { SystemRoot: process.env.SystemRoot }),
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        LC_ALL: 'C',
+      },
     });
     const ref = result.stdout.trim();
     if (/^[0-9a-f]{40}$/i.test(ref)) return { sha256: ref, kind: 'git-commit', ref };

@@ -131,12 +131,25 @@ export async function runTwoRevisions(
 
   const basePath = resolve(options.basePath);
   const headPath = resolve(options.headPath);
-  const workRoot = await mkdtemp(join(tmpdir(), 'patchproof-'));
+  let workRoot: string;
+  try {
+    workRoot = await mkdtemp(join(tmpdir(), 'patchproof-'));
+  } catch (error) {
+    throw new Error(
+      `INFRA_ERROR: cannot create the execution workspace: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const baseWork = join(workRoot, 'base');
   const headWork = join(workRoot, 'head');
   try {
-    await copyWorkspaceSafe(basePath, baseWork);
-    await copyWorkspaceSafe(headPath, headWork);
+    try {
+      await copyWorkspaceSafe(basePath, baseWork);
+      await copyWorkspaceSafe(headPath, headWork);
+    } catch (error) {
+      throw new Error(
+        `INFRA_ERROR: workspace preparation failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     let scenarioFileSha256: string | undefined;
     if (options.config.scenario.file !== undefined) {
       const safeFile = assertSafeRelativePath(options.config.scenario.file, 'scenario.file');

@@ -209,7 +209,9 @@ export class StreamingRedactor {
         continue;
       }
       if (Buffer.byteLength(this.carry, 'utf8') > STREAM_PENDING_LIMIT_BYTES) {
-        output += '[REDACTED]';
+        // The configured replacement already avoids every configured secret,
+        // including a literal marker listed by an operator.
+        output += this.replacement;
         this.carry = '';
       }
       break;

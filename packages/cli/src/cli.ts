@@ -5,7 +5,13 @@ import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { dirname, extname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { classifyOutcome, verifyEvidenceBundle, type EvidenceBundle } from '@patchproof/core';
+import {
+  classifyOutcomeGuarded,
+  PatternDeadlineExceededError,
+  PatternWorkerCrashedError,
+  verifyEvidenceBundle,
+  type EvidenceBundle,
+} from '@patchproof/core';
 import {
   ConfigValidationError,
   formatDiagnostics,
@@ -57,7 +63,9 @@ function printError(error: unknown, json: boolean): number {
   const message = error instanceof Error ? error.message : String(error);
   if (json) jsonOutput({ ok: false, error: message });
   else console.error(`PatchProof error: ${message}`);
-  return 2;
+  // Host-side infrastructure failures are tagged by the runner so CI can
+  // distinguish them from inconclusive input (documented exit code 4).
+  return message.startsWith('INFRA_ERROR:') ? 4 : 2;
 }
 
 async function initCommand(args: ParsedArgs): Promise<number> {
@@ -351,7 +359,15 @@ function probeSqlite(): DoctorCheck {
       `node:sqlite open/close probe failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   } finally {
-    database?.close();
+    if (database !== undefined) {
+      // A secondary close failure must not mask the probe diagnostic above.
+      try {
+        database.close();
+      } catch {
+        // Ignore; the primary result already reports the failure.
+      }
+      database = undefined;
+    }
   }
 }
 
@@ -432,22 +448,34 @@ async function replayCommand(args: ParsedArgs): Promise<number> {
     else console.log(`Replay denied: ${run.reason}`);
     return 3;
   }
-  const classification = classifyOutcome({
-    base: {
-      exitCode: run.base.execution.exitCode,
-      timedOut: run.base.execution.timedOut,
-      ...(run.base.execution.error === undefined ? {} : { error: run.base.execution.error }),
-      output: `${run.base.execution.stdout}\n${run.base.execution.stderr}`,
-    },
-    head: {
-      exitCode: run.head.execution.exitCode,
-      timedOut: run.head.execution.timedOut,
-      ...(run.head.execution.error === undefined ? {} : { error: run.head.execution.error }),
-      output: `${run.head.execution.stdout}\n${run.head.execution.stderr}`,
-    },
-    expectedFailure: config.scenario.expectedFailure,
-    complete: true,
-  });
+  let classification;
+  try {
+    classification = await classifyOutcomeGuarded({
+      base: {
+        exitCode: run.base.execution.exitCode,
+        timedOut: run.base.execution.timedOut,
+        ...(run.base.execution.error === undefined ? {} : { error: run.base.execution.error }),
+        output: `${run.base.execution.stdout}\n${run.base.execution.stderr}`,
+      },
+      head: {
+        exitCode: run.head.execution.exitCode,
+        timedOut: run.head.execution.timedOut,
+        ...(run.head.execution.error === undefined ? {} : { error: run.head.execution.error }),
+        output: `${run.head.execution.stdout}\n${run.head.execution.stderr}`,
+      },
+      expectedFailure: config.scenario.expectedFailure,
+      complete: true,
+    });
+  } catch (error) {
+    const deadline = error instanceof PatternDeadlineExceededError;
+    if (!deadline && !(error instanceof PatternWorkerCrashedError)) throw error;
+    const reason = deadline
+      ? 'Regular-expression evaluation exceeded its deadline during replay'
+      : 'Regular-expression evaluation failed during replay';
+    if (hasOption(args, 'json')) jsonOutput({ ok: false, plan, outcome: 'INCONCLUSIVE', reason });
+    else console.log(`Replay inconclusive: ${reason}`);
+    return 2;
+  }
   if (hasOption(args, 'json'))
     jsonOutput({
       ok: true,

@@ -38,7 +38,9 @@ jobs:
       - run: pnpm package:check
       - name: Hash Linux package
         shell: bash
-        run: sha256sum work/release/patchproof-$(node -p "require('./package.json').version").tgz | awk '{print tolower($1)}' > work/release/linux-SHA256SUM
+        run: |
+          set -euo pipefail
+          sha256sum "work/release/patchproof-$(node -p "require('./package.json').version").tgz" | awk '{print tolower($1)}' > work/release/linux-SHA256SUM
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: package-hash-linux-${{ matrix.node-version }}
@@ -168,7 +170,9 @@ jobs:
             cp -a "packages/$workspace/dist" "$bundle/node_modules/@patchproof/$workspace/dist"
           done
           cp -aL node_modules/yaml/. "$bundle/node_modules/yaml/"
-          if find "$bundle" -type l -print -quit | grep -q .; then
+          # The assignment keeps the step fail-closed when find itself errors.
+          symlink_probe="$(find "$bundle" -type l -print -quit)"
+          if [[ -n "$symlink_probe" ]]; then
             echo 'validation bundle must not contain symbolic links' >&2
             exit 1
           fi

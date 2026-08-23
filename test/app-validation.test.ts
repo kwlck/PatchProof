@@ -923,6 +923,11 @@ test('Docker image inspection dispatch separates the executable from its argumen
       runId: '123e4567-e89b-12d3-a456-426614174000',
       command: async (file, args) => {
         calls.push({ file, args });
+        // A real compiler writes the -o output; buildValidationImage expects the
+        // probe binary to exist before its non-Windows chmod step.
+        const outputIndex = file === 'cc' || file === 'gcc' ? args.indexOf('-o') : -1;
+        if (outputIndex !== -1 && typeof args[outputIndex + 1] === 'string')
+          await writeFile(args[outputIndex + 1], 'static probe binary');
         if (file === 'docker' && args[0] === 'image' && args[1] === 'inspect')
           return { stdout: `sha256:${'a'.repeat(64)}\n`, stderr: '' };
         return { stdout: '', stderr: '' };

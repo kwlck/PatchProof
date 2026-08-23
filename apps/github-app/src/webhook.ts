@@ -459,14 +459,22 @@ export async function handleWebhook(
     const userAssociation = stringValue(comment?.author_association);
     const body = stringValue(comment?.body);
     const command = body === undefined ? undefined : parseIssueCommentCommand(body);
+    const authorizedAssociation = [
+      'OWNER',
+      'MEMBER',
+      'COLLABORATOR',
+      'CONTRIBUTOR',
+      'NONE',
+    ].includes(userAssociation ?? '')
+      ? (userAssociation as 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR' | 'NONE')
+      : undefined;
     if (
       pullRequestMarker === undefined ||
       command?.command !== 'run' ||
       command.argument !== undefined ||
       !isAuthorizedCommand({
         login: 'webhook-actor',
-        association: userAssociation as
-          'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR' | 'NONE',
+        association: authorizedAssociation ?? 'NONE',
       })
     )
       return markIgnored(dependencies.store, request.deliveryId, 'comment ignored');

@@ -1,0 +1,22 @@
+version: 1
+name: Fixed parser regression
+scenario:
+  id: parser-regression
+  name: Parser rejects the old malformed token and accepts the fixed token
+  command: [node, scenario.mjs]
+  cwd: .
+  file: scenario.mjs
+  expectedFailure:
+    exitCode: 1
+    reasonPattern: EXPECTED_BUG
+policy:
+  # Local development copy of .patchproof.yml for hosts without Docker.
+  # The unsafe local process backend requires this explicit opt-in here and
+  # the matching CLI flags. Production execution uses the Docker fixture.
+  backend: local
+  allowUnsafeLocal: true
+  network: none
+  timeoutMs: 30000
+  outputBytes: 8192
+redaction:
+  secrets: []

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, win32 } from 'node:path';
 import { tmpdir } from 'node:os';
 import { assertSafeRelativePath } from '@patchproof/config';
@@ -17,6 +17,12 @@ const DOCKER_LAUNCHER_GRACE_MS = 1_000;
 export interface DockerCommandOptions {
   containerName?: string;
   cidFile?: string;
+  /**
+   * Absolute path to a 0600 env file holding scenario variables. When
+   * supplied, scenario values travel through `--env-file` instead of
+   * per-variable `--env` arguments, keeping them out of host process argv.
+   */
+  scenarioEnvFile?: string;
 }
 
 export interface DockerBackendOptions {
@@ -43,6 +49,30 @@ function assertCidFile(file: string): void {
     /[\r\n]/u.test(file)
   )
     throw new Error('Docker cidfile must be an absolute path without NUL bytes');
+}
+
+function assertScenarioEnvFile(file: string): void {
+  if (
+    (!isAbsolute(file) && !win32.isAbsolute(file)) ||
+    file.includes('\u0000') ||
+    /[\r\n]/u.test(file)
+  )
+    throw new Error('Docker scenario env file must be an absolute path without NUL bytes');
+}
+
+/**
+ * Scenario values are validated (no NUL, CR, or LF) before this point, so
+ * each entry is exactly one `KEY=VALUE` line for the Docker env-file parser.
+ */
+async function writeScenarioEnvFile(
+  file: string,
+  environment: Record<string, string>,
+): Promise<void> {
+  const contents = Object.entries(environment)
+    .filter(([key]) => key !== 'PATH')
+    .map(([key, value]) => `${key}=${value}\n`)
+    .join('');
+  await writeFile(file, contents, { encoding: 'utf8', mode: 0o600 });
 }
 
 function dockerWorkdir(cwd: string): string {
@@ -91,14 +121,24 @@ export function buildDockerCommand(
   if (!/^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$/u.test(spec.policy.dockerImage))
     throw new Error('Docker image must be a bounded image reference and must not begin with -');
   validateEnvironment(spec.environment);
-  const containerName = options.containerName ?? generatedContainerName(spec.revision);
-  assertContainerName(containerName);
-  if (options.cidFile !== undefined) assertCidFile(options.cidFile);
   const scenarioEnvironment = Object.entries(spec.environment)
     // PATH is supplied as a fixed container value. A repository must not
     // smuggle a host executable search path into the container.
-    .filter(([key]) => key !== 'PATH')
-    .flatMap(([key, value]) => ['--env', `${key}=${value}`]);
+    .filter(([key]) => key !== 'PATH');
+  if (options.scenarioEnvFile === undefined && scenarioEnvironment.length > 0)
+    throw new Error(
+      'Docker scenario environment requires a scenarioEnvFile so values never enter host argv',
+    );
+  if (options.scenarioEnvFile !== undefined) assertScenarioEnvFile(options.scenarioEnvFile);
+  const containerName = options.containerName ?? generatedContainerName(spec.revision);
+  assertContainerName(containerName);
+  if (options.cidFile !== undefined) assertCidFile(options.cidFile);
+  const scenarioEnvironmentArgs =
+    options.scenarioEnvFile === undefined
+      ? []
+      : // Values live in a private state file rather than argv, where they
+        // would be readable host-wide through /proc or process listings.
+        ['--env-file', options.scenarioEnvFile];
   const args = [
     'run',
     '--pull',
@@ -117,7 +157,10 @@ export function buildDockerCommand(
     'no-new-privileges:true',
     '--cpus',
     String(spec.policy.cpuCount),
+    // memory-swap equal to memory disables swap so the ceiling is exact.
     '--memory',
+    `${spec.policy.memoryMb}m`,
+    '--memory-swap',
     `${spec.policy.memoryMb}m`,
     '--pids-limit',
     String(spec.policy.pids),
@@ -125,7 +168,7 @@ export function buildDockerCommand(
     '/tmp:rw,noexec,nosuid,size=64m',
     '--env',
     'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-    ...scenarioEnvironment,
+    ...scenarioEnvironmentArgs,
     '--mount',
     `type=bind,src=${spec.workspace},dst=/workspace,readonly`,
     '--mount',
@@ -422,6 +465,9 @@ export class DockerBackend implements ExecutionBackend {
       name = generatedContainerName(spec.revision);
       assertContainerName(name);
       cidFile = join(stateRoot, 'container.cid');
+      validateEnvironment(spec.environment);
+      const scenarioEnvFile = join(stateRoot, 'scenario.env');
+      await writeScenarioEnvFile(scenarioEnvFile, spec.environment);
       const provisioningError = await this.provisionImage(spec, launcherEnvironment);
       if (provisioningError !== undefined)
         return infrastructureExecution(
@@ -430,7 +476,11 @@ export class DockerBackend implements ExecutionBackend {
           provisioningError,
           spec.signal?.aborted ? { cancelled: true } : {},
         );
-      const command = buildDockerCommand(spec, { containerName: name, cidFile });
+      const command = buildDockerCommand(spec, {
+        containerName: name,
+        cidFile,
+        scenarioEnvFile,
+      });
       let runResult: BackendExecution;
       try {
         runResult = await hardRun(

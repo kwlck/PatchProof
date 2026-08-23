@@ -1,6 +1,7 @@
-import { lstat, readFile, realpath } from 'node:fs/promises';
+import { lstat, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path';
-import { classifyOutcome } from './policy.js';
+import { classifyOutcomeGuarded } from './policy.js';
+import { PatternDeadlineExceededError } from './regex-guard.js';
 import { evidenceDigest, sha256 } from './canonical.js';
 import {
   EVIDENCE_SCHEMA_VERSION,
@@ -1289,6 +1290,11 @@ export async function verifyEvidenceBundle(bundlePath: string): Promise<Verifica
         errors.push(`Symbolic-link artifacts are not accepted: ${artifact.relativePath}`);
         continue;
       }
+      if (!(await stat(artifactPath)).isFile()) {
+        artifactsValid = false;
+        errors.push(`Artifact must be a regular file: ${artifact.relativePath}`);
+        continue;
+      }
       const bytes = await readFile(artifactPath);
       if (bytes.byteLength !== artifact.sizeBytes) {
         artifactsValid = false;
@@ -1346,35 +1352,44 @@ export async function verifyEvidenceBundle(bundlePath: string): Promise<Verifica
     headStdout !== undefined &&
     headStderr !== undefined
   ) {
-    const classification = classifyOutcome({
-      base: {
-        exitCode: bundle.executions.base.exitCode,
-        timedOut: bundle.executions.base.timedOut,
-        ...(bundle.executions.base.error === undefined
+    try {
+      const classification = await classifyOutcomeGuarded({
+        base: {
+          exitCode: bundle.executions.base.exitCode,
+          timedOut: bundle.executions.base.timedOut,
+          ...(bundle.executions.base.error === undefined
+            ? {}
+            : { error: bundle.executions.base.error }),
+          output: `${baseStdout}\n${baseStderr}`,
+        },
+        head: {
+          exitCode: bundle.executions.head.exitCode,
+          timedOut: bundle.executions.head.timedOut,
+          ...(bundle.executions.head.error === undefined
+            ? {}
+            : { error: bundle.executions.head.error }),
+          output: `${headStdout}\n${headStderr}`,
+        },
+        expectedFailure: bundle.scenario.expectedFailure,
+        ...(bundle.policy.denialReason === undefined
           ? {}
-          : { error: bundle.executions.base.error }),
-        output: `${baseStdout}\n${baseStderr}`,
-      },
-      head: {
-        exitCode: bundle.executions.head.exitCode,
-        timedOut: bundle.executions.head.timedOut,
-        ...(bundle.executions.head.error === undefined
-          ? {}
-          : { error: bundle.executions.head.error }),
-        output: `${headStdout}\n${headStderr}`,
-      },
-      expectedFailure: bundle.scenario.expectedFailure,
-      ...(bundle.policy.denialReason === undefined
-        ? {}
-        : { policyDenied: bundle.policy.denialReason }),
-      complete: bundle.completeness.complete,
-    });
-    if (classification.outcome !== bundle.outcome)
-      errors.push(
-        `Outcome does not match executions and policy: expected ${classification.outcome}, found ${bundle.outcome}`,
-      );
-    if (classification.verdict !== bundle.verdict)
-      errors.push('Verdict does not match the deterministic outcome classification');
+          : { policyDenied: bundle.policy.denialReason }),
+        complete: bundle.completeness.complete,
+      });
+      if (classification.outcome !== bundle.outcome)
+        errors.push(
+          `Outcome does not match executions and policy: expected ${classification.outcome}, found ${bundle.outcome}`,
+        );
+      if (classification.verdict !== bundle.verdict)
+        errors.push('Verdict does not match the deterministic outcome classification');
+    } catch (error) {
+      if (error instanceof PatternDeadlineExceededError)
+        errors.push('Outcome recomputation exceeded the regular-expression evaluation deadline');
+      else
+        errors.push(
+          `Cannot recompute the deterministic outcome: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
   }
 
   const completenessValid = errors.every((error) => !error.startsWith('completeness.'));

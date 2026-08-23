@@ -6,8 +6,11 @@ import assert from 'node:assert/strict';
 import {
   canonicalize,
   classifyOutcome,
+  classifyOutcomeGuarded,
   createIntegrity,
   evidenceDigest,
+  matchesWithinDeadline,
+  PatternDeadlineExceededError,
   redactAndBound,
   sha256,
   StreamingRedactor,
@@ -526,4 +529,84 @@ test('streaming redaction survives every adversarial split and keeps output boun
     assert.equal(output.includes(secret), false, `replacement marker leaked ${secret}`);
   }
   assert.equal(redactAndBound('AKIA' + '0'.repeat(16) + ' and unicode ✓', [], 10).truncated, true);
+});
+
+test('guarded pattern matching bounds hostile regular expressions without blocking the caller', async () => {
+  assert.equal(await matchesWithinDeadline('a+b', '', 'aaaab', 1_000), true);
+  assert.equal(await matchesWithinDeadline('a+c', '', 'aaab', 1_000), false);
+  await assert.rejects(matchesWithinDeadline('a', '', 'a', 0), TypeError);
+  await assert.rejects(matchesWithinDeadline('a', '', 'a', Number.NaN), TypeError);
+  await assert.rejects(
+    matchesWithinDeadline('(a+)+$', '', `${'a'.repeat(64)}b`, 25),
+    PatternDeadlineExceededError,
+  );
+});
+
+test('guarded classification mirrors synchronous classification decisions', async () => {
+  const base = { exitCode: 1, timedOut: false, output: 'EXPECTED_BUG parser-regression' };
+  const head = { exitCode: 0, timedOut: false, output: 'fixed' };
+  const input = {
+    base,
+    head,
+    expectedFailure: { exitCode: 1, reasonPattern: 'EXPECTED_BUG' },
+    complete: true,
+  } as const;
+  const guarded = await classifyOutcomeGuarded(input);
+  const synchronous = classifyOutcome(input);
+  assert.equal(guarded.outcome, synchronous.outcome);
+  assert.equal(guarded.verdict, synchronous.verdict);
+  assert.equal(guarded.outcome, 'PASS');
+  const duplicatePatterns = await classifyOutcomeGuarded({
+    base,
+    head,
+    expectedFailure: { exitCode: 1, reasonPattern: 'EXPECTED_BUG', reasonClass: 'EXPECTED_BUG' },
+    complete: true,
+  });
+  assert.equal(duplicatePatterns.outcome, 'PASS');
+});
+
+test('verification fails closed when outcome recomputation exceeds the pattern deadline', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'patchproof-core-redos-'));
+  const bundle = await createValidBundle(root);
+  await writeBundle(root, bundle);
+  assert.equal((await verifyEvidenceBundle(join(root, 'patchproof.evidence.json'))).valid, true);
+  const hostile = cloneBundle(bundle);
+  hostile.scenario.expectedFailure.reasonPattern = '(?:a+)+$';
+  const hostileBaseStderr = `${'a'.repeat(96)}EXPECTED_BUG parser-regression\n`;
+  await writeFile(join(root, 'artifacts', 'base.stderr.log'), hostileBaseStderr, 'utf8');
+  const baseStderrArtifact = hostile.artifacts.find((artifact) => artifact.id === 'base-stderr')!;
+  baseStderrArtifact.sha256 = sha256(Buffer.from(hostileBaseStderr, 'utf8'));
+  baseStderrArtifact.sizeBytes = Buffer.byteLength(hostileBaseStderr, 'utf8');
+  const hostilePath = await writeBundle(root, hostile);
+  const result = await verifyEvidenceBundle(hostilePath);
+  assert.equal(result.valid, false);
+  assert.ok(
+    result.errors.some((error) => error.includes('regular-expression evaluation deadline')),
+  );
+});
+
+test('verification skips pattern evaluation when the outcome cannot depend on it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'patchproof-core-lazy-'));
+  const bundle = await createValidBundle(root);
+  const timedOut = cloneBundle(bundle);
+  // A timeout decides the outcome before any pattern is consulted, so even a
+  // pathological pattern must not invalidate or delay verification.
+  timedOut.executions.base.timedOut = true;
+  timedOut.scenario.expectedFailure.reasonPattern = '(?:a+)+$';
+  timedOut.outcome = 'INCONCLUSIVE';
+  timedOut.verdict = 'The scenario timed out before a trustworthy comparison completed.';
+  const hostileBaseStderr = `${'a'.repeat(1800)}EXPECTED_BUG parser-regression\n`;
+  await writeFile(join(root, 'artifacts', 'base.stderr.log'), hostileBaseStderr, 'utf8');
+  const baseStderrArtifact = timedOut.artifacts.find((artifact) => artifact.id === 'base-stderr')!;
+  baseStderrArtifact.sha256 = sha256(Buffer.from(hostileBaseStderr, 'utf8'));
+  baseStderrArtifact.sizeBytes = Buffer.byteLength(hostileBaseStderr, 'utf8');
+  timedOut.executions.base.stderr.preview = hostileBaseStderr;
+  timedOut.executions.base.stderr.sizeBytes = Buffer.byteLength(hostileBaseStderr, 'utf8');
+  // Mutations happened after signing, so recompute the canonical integrity.
+  const resigned = cloneBundle(timedOut);
+  const timedOutPath = await writeBundle(root, resigned);
+  const startedAt = Date.now();
+  const result = await verifyEvidenceBundle(timedOutPath);
+  assert.equal(result.valid, true, result.errors.join('; '));
+  assert.ok(Date.now() - startedAt < 5_000, 'pattern evaluation must be skipped');
 });
