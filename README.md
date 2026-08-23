@@ -28,6 +28,30 @@ A pull request that claims to fix a bug usually comes with a screenshot or a sen
 
 A PASS has a narrow meaning: the trusted scenario produced the configured expected failure on base, passed on head, and produced complete evidence. A hash provides integrity for the bundle. It does not identify a signer or provide remote attestation.
 
+## One-command install
+
+macOS or Linux:
+
+```text
+curl -fsSL https://raw.githubusercontent.com/kwlck/PatchProof/main/install/install.sh -o install-patchproof.sh
+bash install-patchproof.sh
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/kwlck/PatchProof/main/install/install.ps1 -OutFile install-patchproof.ps1
+powershell -ExecutionPolicy Bypass -File .\install-patchproof.ps1
+```
+
+The installer verifies every download against published SHA-256 checksums, installs Node.js 22 automatically when no suitable Node is present, places the standalone `patchproof` executable on PATH, and finishes with an environment check. Nothing else is required to try PatchProof:
+
+```text
+patchproof setup --demo
+```
+
+That single command runs a self-contained bug scenario against two revisions, writes the evidence bundle, verifies it, and prints next steps in about 30 seconds. Production runs use Docker; install it from [Docker Desktop](https://www.docker.com/products/docker-desktop/) whenever you are ready. Installers resolve the latest GitHub Release, so create a release first or pin `PATCHPROOF_VERSION=<tag>`.
+
 ## Five-minute local quickstart
 
 Requirements are Node.js 22 or newer and pnpm 11.16.0. Docker is the production backend. The run below uses a checked-in development configuration that opts into the local process backend so it works without Docker; the pull-request fixture itself still declares Docker.

@@ -23,6 +23,7 @@ import { isPolicyDeniedRun, runTwoRevisions, sourceIdentity } from '@patchproof/
 import { outcomeExitCode, renderMarkdownReport, renderTerminalReport } from '@patchproof/report';
 import { hasOption, option, parseArgs, type ParsedArgs } from './args.js';
 import { writeEvidenceBundle } from './bundle.js';
+import { runSetup } from './setup.js';
 
 const execFileAsync = promisify(execFile);
 const DOCTOR_TIMEOUT_MS = 5_000;
@@ -42,6 +43,12 @@ Usage:
   patchproof verify <patchproof.evidence.json> [--json]
   patchproof replay <patchproof.evidence.json> [--yes] [--backend docker|local] [--base <dir> --head <dir>]
   patchproof doctor [--json]
+  patchproof setup [--check | --demo] [--demo-dir <dir>] [--json]
+
+Setup options:
+  --check                   Report the environment without running the demo
+  --demo                    Run the self-contained fail-to-pass demo (~30 seconds)
+  --demo-dir <dir>          Demo workspace location (default: ./patchproof-demo)
 
 Run options:
   --output <dir|file>       Evidence output location (default: ./work/patchproof-run)
@@ -563,6 +570,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     if (args.command === 'verify') return await verifyCommand(args);
     if (args.command === 'replay') return await replayCommand(args);
     if (args.command === 'doctor') return await doctorCommand(args);
+    if (args.command === 'setup') return await runSetup(args);
     throw new Error(`Unknown command: ${args.command}`);
   } catch (error) {
     return printError(error, hasOption(args, 'json'));
