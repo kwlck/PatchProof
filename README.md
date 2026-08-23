@@ -1,14 +1,15 @@
 <div align="center">
 
-# PatchProof
+<img src="docs/brand/patchproof-mark.svg" alt="PatchProof wordmark" width="720">
 
-<img src="docs/brand/patchproof-mark.svg" alt="PatchProof wordmark" width="860">
+# PatchProof
 
 **Replayable proof that a bug fails before the patch and passes after it.**
 
 [![CI](https://github.com/kwlck/PatchProof/actions/workflows/ci.yml/badge.svg)](https://github.com/kwlck/PatchProof/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/kwlck/PatchProof/actions/workflows/codeql.yml/badge.svg)](https://github.com/kwlck/PatchProof/actions/workflows/codeql.yml)
 [![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-5FA04E?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![pnpm 11.16.0](https://img.shields.io/badge/pnpm-11.16.0-F69220?logo=pnpm&logoColor=white)](https://pnpm.io/)
 [![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-6EA8FE)](LICENSE)
 
 One trusted reproduction. Two exact revisions. One evidence bundle.
@@ -17,27 +18,33 @@ One trusted reproduction. Two exact revisions. One evidence bundle.
 | :--------------: | :-----------: | :---------------: |
 | Expected failure |     Pass      | Verified evidence |
 
+[Quickstart](#five-minute-local-quickstart) · [Evidence](#evidence-at-a-glance) · [Architecture](#how-the-product-is-split) · [Security](#security-model) · [Docs](#documentation) · [Roadmap](#roadmap)
+
 </div>
 
-PatchProof gives maintainers replayable evidence for a pull request that claims to fix a bug. It runs one trusted reproduction against the base and head revisions, records what happened, and publishes the result as a GitHub Check and one managed pull request comment.
+## Why PatchProof
+
+A pull request that claims to fix a bug usually comes with a screenshot or a sentence. PatchProof replaces that with something stronger: it runs **one trusted reproduction**, loaded from the base revision, against both the base and head revisions, records everything, and publishes the result as a GitHub Check plus one managed pull-request comment.
 
 A PASS has a narrow meaning: the trusted scenario produced the configured expected failure on base, passed on head, and produced complete evidence. A hash provides integrity for the bundle. It does not identify a signer or provide remote attestation.
 
 ## Five-minute local quickstart
 
-Requirements are Node.js 22 or newer and pnpm 11.16.0. Docker is the production backend. The deterministic fixture below opts into the local process backend so it can run without Docker.
+Requirements are Node.js 22 or newer and pnpm 11.16.0. Docker is the production backend. The run below uses a checked-in development configuration that opts into the local process backend so it works without Docker; the pull-request fixture itself still declares Docker.
 
 ```text
 pnpm install --frozen-lockfile
 pnpm build
 pnpm patchproof -- --help
 pnpm patchproof validate fixtures/pass/.patchproof.yml
-pnpm patchproof run fixtures/pass/.patchproof.yml --base fixtures/pass/base --head fixtures/pass/head --backend local --allow-unsafe-local --output work/pass
+pnpm patchproof run fixtures/pass/local.patchproof.yml --base fixtures/pass/base --head fixtures/pass/head --backend local --allow-unsafe-local --output work/pass
 pnpm patchproof verify work/pass/patchproof.evidence.json
 pnpm patchproof replay work/pass/patchproof.evidence.json
 ```
 
-The local backend is unsafe and must be named explicitly. A production run uses the configured Docker image and refuses to fall back to a host process. `pnpm test:e2e` runs the fixture sequence, tamper check, replay plan, and outcome matrix.
+The final `replay` step prints the replay plan and exits without executing; add `--yes --base <dir> --head <dir>` to actually re-run the scenario. `pnpm test:e2e` runs the fixture sequence, tamper check, replay plan, and outcome matrix.
+
+## Real terminal output
 
 Example output from a real fixture run is kept in [`docs/examples/terminal-pass.txt`](docs/examples/terminal-pass.txt):
 
@@ -51,6 +58,34 @@ Evidence   schema=1 sha256=4341d958d8423925... artifacts=4
 Policy     backend=local network=none trusted-config=base
 Replay     patchproof replay patchproof.evidence.json --yes --base <base-dir> --head <head-dir>
 ```
+
+## Evidence at a glance
+
+Every run writes a versioned bundle with canonical JSON, SHA-256 integrity over the whole document, and hashed log artifacts. Values below come from the fixture run above.
+
+```json
+{
+  "schemaVersion": 1,
+  "outcome": "PASS",
+  "verdict": "The trusted scenario failed on base and passed on head.",
+  "scenario": { "id": "parser-regression", "trustedSource": "base" },
+  "policy": { "backend": "local", "network": "none", "trustedConfigRevision": "base" },
+  "artifacts": [
+    {
+      "id": "artifacts_base.stderr.log",
+      "relativePath": "artifacts/base.stderr.log",
+      "mediaType": "text/plain"
+    }
+  ],
+  "integrity": {
+    "algorithm": "sha256",
+    "canonicalSha256": "7231d4d12ba37fb72e230ffe015916464a527d12abb8dd94c668eeaf26d8c0c7",
+    "signer": null
+  }
+}
+```
+
+`patchproof verify` recomputes all of it without executing repository code, and `patchproof replay` re-runs the recorded scenario against operator-supplied source directories.
 
 ## How the product is split
 
@@ -69,15 +104,18 @@ flowchart LR
   E --> C[Check and managed comment]
 ```
 
-- `packages/core` owns the versioned evidence model, canonical JSON, SHA-256 integrity, redaction, state classification, and policy decisions.
-- `packages/config` parses `.patchproof.yml`, validates semantics, and keeps executable configuration on the trusted base side of the boundary.
-- `packages/runner` copies clean revisions and runs the identical argv through Docker. The local process backend exists for explicit development and test use.
-- `packages/cli` provides `init`, `validate`, `run`, `verify`, `replay`, and `doctor` through the `patchproof` binary.
-- `packages/report` renders terminal and Markdown output. `packages/github` keeps Checks, comments, commands, and webhook signatures testable without credentials.
-- `apps/github-app` contains the webhook process, SQLite run state, durable queue, exact-ref source adapter, and separate worker process. The HTTP process never executes repository code.
-- `packages/testkit` and `fixtures/` provide deterministic fail-to-pass, failure, timeout, policy, malformed-config, tamper, and redaction cases.
+| Package            | Role                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------ |
+| `packages/core`    | Versioned evidence model, canonical JSON, SHA-256 integrity, redaction, classification     |
+| `packages/config`  | `.patchproof.yml` parsing, semantic validation, trusted-base executable configuration      |
+| `packages/runner`  | Clean revision copies, identical argv through Docker, explicit local development backend   |
+| `packages/cli`     | `init`, `validate`, `run`, `verify`, `replay`, and `doctor` behind the `patchproof` binary |
+| `packages/report`  | Terminal and Markdown rendering                                                            |
+| `packages/github`  | Checks, managed comments, slash commands, webhook signatures without credentials           |
+| `apps/github-app`  | Webhook process, SQLite run state, durable queue, exact-ref adapter, separate worker       |
+| `packages/testkit` | Deterministic fail-to-pass, failure, timeout, policy, tamper, and redaction cases          |
 
-For a local GitHub App deployment, start the two processes with the same `PATCHPROOF_SQLITE_PATH`:
+The HTTP process never executes repository code. For a local GitHub App deployment, start the two processes with the same `PATCHPROOF_SQLITE_PATH`:
 
 ```text
 pnpm --filter @patchproof/github-app start:webhook
@@ -88,13 +126,38 @@ The webhook process verifies HMAC signatures, authorizes commands, creates the q
 
 ## Security model
 
-Pull request content, comments, configuration, logs, archives, and GitHub API responses are untrusted. Fork metadata is handled fail-closed. The worker keeps the GitHub token in the source-fetch process and never passes it to an execution container. The scenario sees only explicit environment values. Launcher variables such as host `PATH` and `SystemRoot` are omitted from evidence and represented by key and hash metadata.
+Pull request content, comments, configuration, logs, archives, and GitHub API responses are untrusted.
 
-Docker runs with network disabled by default, a numeric non-root user, dropped capabilities, `no-new-privileges`, read-only root where configured, CPU, memory, PID, timeout, and output limits, and explicit writable scratch space. Executed containers receive no Docker socket or host secret mount. Commands use argv arrays with `shell: false`. Artifact verification rejects traversal, absolute paths, and symlink escapes.
+**Execution isolation**
+Docker runs argv arrays with no shell, network disabled by default, a numeric non-root user, dropped capabilities, `no-new-privileges`, read-only root where configured, CPU, memory, swap, PID, timeout, and output limits, and explicit writable scratch space. Executed containers receive no Docker socket and no host secret mount. Commands never pass through a shell.
 
-Logs are redacted as streams before output limits are applied. `patchproof verify` performs strict recursive schema validation, checks cross-references and artifact hashes, recomputes the deterministic outcome, and never executes repository code.
+**Untrusted input handling**
+Fork metadata fails closed. Executable configuration always comes from the trusted base revision. Artifact verification rejects traversal, absolute paths, symbolic links, and special files. Outcome recomputation evaluates configured patterns under a wall-clock deadline, so catastrophic regular expressions fail verification instead of blocking it.
+
+**Secret containment**
+The worker keeps installation tokens in its source-fetch process and never passes them to an execution container. Scenario environment values travel through a private env file instead of process arguments. Launcher variables such as host `PATH` are omitted from evidence and represented by key and hash metadata. Logs are redacted as streams before output limits are applied.
+
+**Verifiable evidence**
+`patchproof verify` performs strict recursive schema validation, checks cross-references and artifact hashes, recomputes the deterministic outcome, and never executes repository code.
 
 See [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) for the threat model and residual risks.
+
+## Documentation
+
+| Guide                                                      | Covers                                        |
+| ---------------------------------------------------------- | --------------------------------------------- |
+| [Quickstart](docs/quickstart.md)                           | First local run, step by step                 |
+| [CLI reference](docs/cli-reference.md)                     | Every command, flag, and exit code            |
+| [Configuration reference](docs/configuration-reference.md) | `.patchproof.yml` fields and limits           |
+| [Evidence format](docs/evidence-format.md)                 | Bundle schema, integrity, and artifacts       |
+| [Replay model](docs/replay-model.md)                       | What replay proves and what it asks of you    |
+| [Architecture](docs/architecture.md)                       | Process boundaries and design decisions       |
+| [Deployment](docs/deployment.md)                           | Production processes, variables, and ceilings |
+| [GitHub App setup](docs/github-app-setup.md)               | App registration, permissions, events         |
+| [Manual validation](docs/github-app-validation.md)         | Protected credential validation procedure     |
+| [Threat model](docs/threat-model.md)                       | Adversaries, controls, residual risks         |
+| [Troubleshooting](docs/troubleshooting.md)                 | Outcomes, errors, and recovery                |
+| [Contributor guide](docs/contributor-guide.md)             | Day-to-day development workflow               |
 
 ## Current limitations
 
@@ -107,15 +170,28 @@ See [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) 
 
 ## Roadmap
 
-1. Add optional signed evidence envelopes with explicit signer identity semantics.
-2. Pin and verify OCI image digests in the runner policy.
-3. Add a remote evidence store with retention controls.
-4. Add installation health reporting and a small historical run index.
+- [ ] Add optional signed evidence envelopes with explicit signer identity semantics.
+- [ ] Add a remote evidence store with retention controls.
+- [ ] Add installation health reporting and a small historical run index.
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md), then run `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm test:e2e`, `pnpm build`, and `pnpm docs:check`. Security-sensitive changes should include a regression test and a threat-model update. The contributor and release guides are in [docs](docs/).
+Read [CONTRIBUTING.md](CONTRIBUTING.md), then run:
 
-## License
+```text
+pnpm format:check
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm test:e2e
+pnpm build
+pnpm docs:check
+```
+
+Security-sensitive changes should include a regression test and a threat-model update. The contributor and release guides are in [docs](docs/).
+
+<div align="center">
 
 PatchProof is available under the [Apache License 2.0](LICENSE).
+
+</div>
