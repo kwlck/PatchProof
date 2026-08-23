@@ -9,3 +9,5 @@ import './docs-check.test.ts';
 import './release-workflow.test.ts';
 import './app-validation.test.ts';
 import './app-validation-workflow.test.ts';
+import './setup.test.ts';
+import './install-scripts.test.ts';
