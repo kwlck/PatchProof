@@ -15,3 +15,7 @@ The base may already pass, the configured reason may not match, a timeout may ha
 ## Invalid evidence
 
 Do not edit the JSON by hand. Re-run the producing command or restore the exact artifacts. `verify` reports digest, completeness, and artifact-specific failures without executing repository code.
+
+## Webhook refuses to start with `PATCHPROOF_GITHUB_DEV_STATIC_TOKEN`
+
+The production webhook entrypoint intentionally does not support a static token. Remove the variable and provide `PATCHPROOF_GITHUB_APP_ID` plus `PATCHPROOF_GITHUB_APP_PRIVATE_KEY`; offline tests use explicit fakes instead of this variable.

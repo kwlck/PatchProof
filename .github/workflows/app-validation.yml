@@ -263,7 +263,9 @@ jobs:
           set -euo pipefail
           summary='work/app-validation/summary.json'
           test -f "$summary"
-          if rg -q --no-messages \
+          # Fail closed when the scanner itself is unavailable.
+          command -v rg >/dev/null
+          if rg --quiet --no-messages \
             -e '-----BEGIN [A-Z ]+PRIVATE KEY-----' \
             -e 'gh[pousr]_[A-Za-z0-9_]{20,}' \
             -e 'github_pat_[A-Za-z0-9_]{20,}' \
