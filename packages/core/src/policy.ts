@@ -4,6 +4,22 @@ import type {
   ExpectedFailure,
   RunOutcome,
 } from './types.js';
+import { PATTERN_DEADLINE_MS, matchesWithinDeadline } from './regex-guard.js';
+
+type ExpectedMatcher = (pattern: string, text: string) => boolean;
+
+function defaultMatcher(pattern: string, text: string): boolean {
+  try {
+    return new RegExp(pattern, 'm').test(text);
+  } catch {
+    return false;
+  }
+}
+
+export interface GuardedClassificationOptions {
+  /** Wall-clock budget for each pattern evaluation. */
+  deadlineMs?: number;
+}
 
 export interface PolicyInput {
   backend: 'docker' | 'local';
@@ -46,23 +62,18 @@ function matchesExpectedFailure(
   exitCode: number | null,
   output: string,
   expected: ExpectedFailure,
+  match: ExpectedMatcher,
 ): boolean {
   if (exitCode !== expected.exitCode) return false;
-  try {
-    if (
-      expected.reasonPattern !== undefined &&
-      !new RegExp(expected.reasonPattern, 'm').test(output)
-    )
-      return false;
-    if (expected.reasonClass !== undefined && !new RegExp(expected.reasonClass, 'm').test(output))
-      return false;
-    return true;
-  } catch {
-    return false;
-  }
+  if (expected.reasonPattern !== undefined && !match(expected.reasonPattern, output)) return false;
+  if (expected.reasonClass !== undefined && !match(expected.reasonClass, output)) return false;
+  return true;
 }
 
-export function classifyOutcome(input: ClassificationInput): ClassificationResult {
+function classifyOutcomeWith(
+  input: ClassificationInput,
+  match: ExpectedMatcher,
+): ClassificationResult {
   if (input.policyDenied !== undefined) {
     return {
       outcome: 'POLICY_DENIED',
@@ -103,6 +114,7 @@ export function classifyOutcome(input: ClassificationInput): ClassificationResul
     input.base.exitCode,
     input.base.output,
     input.expectedFailure,
+    match,
   );
   const headSuccess = input.head.exitCode === 0;
   if (!baseExpectedFailure) {
@@ -133,4 +145,29 @@ export function classifyOutcome(input: ClassificationInput): ClassificationResul
     headSuccess: false,
     reason: 'Head did not satisfy the assertion',
   };
+}
+
+export function classifyOutcome(input: ClassificationInput): ClassificationResult {
+  return classifyOutcomeWith(input, defaultMatcher);
+}
+
+/**
+ * Deterministic classification when the pattern or the output may be hostile,
+ * such as outcome recomputation during evidence verification. Every pattern
+ * evaluation runs inside a worker thread that is terminated at the deadline.
+ */
+export async function classifyOutcomeGuarded(
+  input: ClassificationInput,
+  options: GuardedClassificationOptions = {},
+): Promise<ClassificationResult> {
+  const deadlineMs = options.deadlineMs ?? PATTERN_DEADLINE_MS;
+  const decisions = new Map<string, boolean>();
+  for (const pattern of [input.expectedFailure.reasonPattern, input.expectedFailure.reasonClass]) {
+    if (pattern === undefined || decisions.has(pattern)) continue;
+    decisions.set(
+      pattern,
+      await matchesWithinDeadline(pattern, 'm', input.base.output, deadlineMs),
+    );
+  }
+  return classifyOutcomeWith(input, (candidate) => decisions.get(candidate) ?? false);
 }
