@@ -2,7 +2,7 @@
 
 Create an internal or public GitHub App with the smallest permissions needed by the deployment:
 
-- Pull requests: read (to read base/head metadata).
+- Pull requests: read/write (to read base/head metadata and manage the pull request conversation).
 - Issues: read/write (to create/update the one managed summary comment).
 - Checks: read/write (to create/update the PatchProof Check Run).
 - Contents: read (to fetch the trusted base and head sources through a worker).

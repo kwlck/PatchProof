@@ -12,7 +12,7 @@ Configure these App permissions:
 
 - Metadata: read
 - Contents: read
-- Pull requests: read
+- Pull requests: read/write
 - Checks: read/write
 - Issues: read/write
 
