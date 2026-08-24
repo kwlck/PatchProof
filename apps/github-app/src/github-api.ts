@@ -9,7 +9,7 @@ import type {
 } from '@patchproof/github';
 import { isManagedComment, managedCheckExternalName } from '@patchproof/github';
 import https from 'node:https';
-import type { IncomingMessage } from 'node:http';
+import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
 import type { GitHubInstallationTokenProvider } from './github-auth.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -71,6 +71,88 @@ export class GitHubApiError extends Error {
     this.name = 'GitHubApiError';
     this.status = status;
   }
+}
+
+const SECONDARY_RETRY_DEFAULT_MS = 2_000;
+const SECONDARY_RETRY_MAX_MS = 5_000;
+
+/**
+ * Non-2xx API failure carrying bounded rate-limit diagnostics. The message
+ * includes the request method and path plus retry/ratelimit header values;
+ * response bodies and credentials are never retained.
+ */
+class GitHubApiStatusError extends GitHubApiError {
+  public readonly retryAfterMs: number | undefined;
+
+  public constructor(message: string, status: number, retryAfterMs: number | undefined) {
+    super(message, status);
+    this.name = 'GitHubApiError';
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function rawHeaderValue(headers: IncomingHttpHeaders, name: string): string | undefined {
+  const value = headers[name];
+  if (value === undefined) return undefined;
+  const text = Array.isArray(value) ? value.join(', ') : value;
+  return text === '' ? undefined : text;
+}
+
+function boundedSecondaryRetryMs(headers: IncomingHttpHeaders): number | undefined {
+  const text = rawHeaderValue(headers, 'retry-after');
+  if (text === undefined) return SECONDARY_RETRY_DEFAULT_MS;
+  if (!/^[1-9][0-9]*$/u.test(text)) return undefined;
+  const waitMs = Number(text) * 1000;
+  return waitMs > SECONDARY_RETRY_MAX_MS ? undefined : waitMs;
+}
+
+/**
+ * A 403/429 never mutated remote state, so content-creation requests rejected
+ * by a secondary rate limit are replayed once after the advised delay.
+ * Primary exhaustion (remaining=0) and advised waits beyond the bound fail
+ * closed with the diagnostic context attached to the error message.
+ */
+function statusFailure(
+  endpoint: GitHubApiEndpoint,
+  status: number,
+  headers: IncomingHttpHeaders,
+): GitHubApiStatusError {
+  const retryAfterText = rawHeaderValue(headers, 'retry-after');
+  const remainingText = rawHeaderValue(headers, 'x-ratelimit-remaining');
+  const notes: string[] = [];
+  if (retryAfterText !== undefined) notes.push(`retry-after=${retryAfterText}s`);
+  if (remainingText !== undefined) notes.push(`ratelimit-remaining=${remainingText}`);
+  let retryAfterMs: number | undefined;
+  if ((status === 403 || status === 429) && endpoint.method === 'POST' && remainingText !== '0') {
+    retryAfterMs = boundedSecondaryRetryMs(headers);
+    if (retryAfterMs !== undefined) notes.push('replaying once after the advised delay');
+    else notes.push('advised wait exceeds the replay bound');
+  }
+  const suffix = notes.length === 0 ? '' : ` [${notes.join(', ')}]`;
+  return new GitHubApiStatusError(
+    `GitHub API request failed (${status}) for ${endpoint.method} ${endpoint.path}${suffix}`,
+    status,
+    retryAfterMs,
+  );
+}
+
+async function boundedWait(ms: number, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reject(new DOMException('The GitHub API request was aborted', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
@@ -454,72 +536,87 @@ export class GitHubApiTransport implements GitHubTransport {
         ? options.signal
         : combined.signal;
     try {
-      let requestBody: string | undefined;
       try {
-        requestBody = body === undefined ? undefined : JSON.stringify(body);
+        return await this.#attempt<T>(safeEndpoint, body, token, requestSignal);
       } catch (error) {
-        safeApiError(error, requestSignal);
-      }
-      const response = await new Promise<IncomingMessage>((resolve, reject) => {
-        const request = https.request(
-          {
-            protocol: GITHUB_API_PROTOCOL,
-            hostname: GITHUB_API_HOSTNAME,
-            port: GITHUB_API_PORT,
-            servername: GITHUB_API_HOSTNAME,
-            method: safeEndpoint.method,
-            path: safeEndpoint.path,
-            headers: {
-              Accept: 'application/vnd.github+json',
-              'User-Agent': GITHUB_USER_AGENT,
-              Authorization: `Bearer ${token}`,
-              'X-GitHub-Api-Version': '2022-11-28',
-              ...(requestBody === undefined ? {} : { 'Content-Type': 'application/json' }),
-            },
-            signal: requestSignal,
-          },
-          resolve,
-        );
-        request.once('error', reject);
-        if (requestBody !== undefined) request.write(requestBody);
-        request.end();
-      }).catch((error: unknown) => safeApiError(error, requestSignal));
-      const status = response.statusCode;
-      if (status === undefined || !Number.isInteger(status) || status < 200 || status > 299) {
-        response.destroy();
-        throw new GitHubApiError(
-          status === undefined
-            ? 'GitHub API request failed'
-            : `GitHub API request failed (${status})`,
-          status,
-        );
-      }
-      const headers = headersFromResponse(response);
-      if (status === 204) {
-        response.resume();
-        return { body: undefined as T, headers };
-      }
-      const contentLength = headers.get('content-length');
-      if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES) {
-        response.destroy();
-        throw new GitHubApiError('GitHub API response was too large', status);
-      }
-      let text: string;
-      try {
-        text = await responseBody(response, status);
-      } catch (error) {
-        if (requestSignal.aborted) safeApiError(error, requestSignal);
-        if (error instanceof GitHubApiError) throw error;
-        safeApiError(error, requestSignal);
-      }
-      try {
-        return { body: JSON.parse(text) as T, headers };
-      } catch (error) {
-        void error;
-        throw new GitHubApiError('GitHub API response was invalid', status);
+        if (!(error instanceof GitHubApiStatusError) || error.retryAfterMs === undefined)
+          throw error;
+        await boundedWait(error.retryAfterMs, requestSignal);
+        return await this.#attempt<T>(safeEndpoint, body, token, requestSignal);
       }
     } finally {
       combined.cleanup();
+    }
+  }
+
+  async #attempt<T>(
+    endpoint: GitHubApiEndpoint,
+    body: unknown,
+    token: string,
+    signal: AbortSignal,
+  ): Promise<{ body: T; headers: Headers }> {
+    let requestBody: string | undefined;
+    try {
+      requestBody = body === undefined ? undefined : JSON.stringify(body);
+    } catch (error) {
+      safeApiError(error, signal);
+    }
+    const response = await new Promise<IncomingMessage>((resolve, reject) => {
+      const request = https.request(
+        {
+          protocol: GITHUB_API_PROTOCOL,
+          hostname: GITHUB_API_HOSTNAME,
+          port: GITHUB_API_PORT,
+          servername: GITHUB_API_HOSTNAME,
+          method: endpoint.method,
+          path: endpoint.path,
+          headers: {
+            Accept: 'application/vnd.github+json',
+            'User-Agent': GITHUB_USER_AGENT,
+            Authorization: `Bearer ${token}`,
+            'X-GitHub-Api-Version': '2022-11-28',
+            ...(requestBody === undefined ? {} : { 'Content-Type': 'application/json' }),
+          },
+          signal,
+        },
+        resolve,
+      );
+      request.once('error', reject);
+      if (requestBody !== undefined) request.write(requestBody);
+      request.end();
+    }).catch((error: unknown) => safeApiError(error, signal));
+    const status = response.statusCode;
+    if (status === undefined) {
+      response.destroy();
+      throw new GitHubApiError('GitHub API request failed');
+    }
+    if (!Number.isInteger(status) || status < 200 || status > 299) {
+      response.destroy();
+      throw statusFailure(endpoint, status, response.headers ?? {});
+    }
+    const headers = headersFromResponse(response);
+    if (status === 204) {
+      response.resume();
+      return { body: undefined as T, headers };
+    }
+    const contentLength = headers.get('content-length');
+    if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES) {
+      response.destroy();
+      throw new GitHubApiError('GitHub API response was too large', status);
+    }
+    let text: string;
+    try {
+      text = await responseBody(response, status);
+    } catch (error) {
+      if (signal.aborted) safeApiError(error, signal);
+      if (error instanceof GitHubApiError) throw error;
+      safeApiError(error, signal);
+    }
+    try {
+      return { body: JSON.parse(text) as T, headers };
+    } catch (error) {
+      void error;
+      throw new GitHubApiError('GitHub API response was invalid', status);
     }
   }
 
