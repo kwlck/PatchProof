@@ -11,6 +11,7 @@ export default tseslint.config(
       'fixtures/**',
       'test/**',
       'scripts/**',
+      'patchproof-demo/**',
       'eslint.config.mjs',
     ],
   },
