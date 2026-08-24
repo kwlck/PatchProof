@@ -2199,12 +2199,15 @@ export async function runValidation(options = {}) {
       result.summary = summary;
     } catch (error) {
       primaryError = annotateValidationError(error, currentPrimaryStage);
-      // AppValidationError messages are fixed operator-facing strings; foreign
-      // errors contribute only their class name so credentials never surface.
+      // Walk to the root cause: primary() wraps stage errors before this
+      // handler runs. AppValidationError messages are fixed operator-facing
+      // strings; foreign errors contribute only their class name.
+      let source = error;
+      while (source instanceof Error && source.cause instanceof Error) source = source.cause;
       const detail =
-        error instanceof AppValidationError
-          ? error.message.replaceAll(/[\r\n]+/gu, ' ').slice(0, 200)
-          : (error?.constructor?.name ?? 'unknown error');
+        source instanceof AppValidationError
+          ? source.message.replaceAll(/[\r\n]+/gu, ' ').slice(0, 200)
+          : (source?.constructor?.name ?? 'unknown error');
       console.error(`APP_VALIDATION_DETAIL stage=${currentPrimaryStage}: ${detail}`);
     } finally {
       const cleanup = await runValidationCleanup({
