@@ -128,16 +128,16 @@ flowchart LR
   E --> C[Check and managed comment]
 ```
 
-| Package            | Role                                                                                       |
-| ------------------ | ------------------------------------------------------------------------------------------ |
-| `packages/core`    | Versioned evidence model, canonical JSON, SHA-256 integrity, redaction, classification     |
-| `packages/config`  | `.patchproof.yml` parsing, semantic validation, trusted-base executable configuration      |
-| `packages/runner`  | Clean revision copies, identical argv through Docker, explicit local development backend   |
+| Package            | Role                                                                                                |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| `packages/core`    | Versioned evidence model, canonical JSON, SHA-256 integrity, redaction, classification              |
+| `packages/config`  | `.patchproof.yml` parsing, semantic validation, trusted-base executable configuration               |
+| `packages/runner`  | Clean revision copies, identical argv through Docker, explicit local development backend            |
 | `packages/cli`     | `init`, `validate`, `run`, `verify`, `replay`, `doctor`, and `setup` behind the `patchproof` binary |
-| `packages/report`  | Terminal and Markdown rendering                                                            |
-| `packages/github`  | Checks, managed comments, slash commands, webhook signatures without credentials           |
-| `apps/github-app`  | Webhook process, SQLite run state, durable queue, exact-ref adapter, separate worker       |
-| `packages/testkit` | Deterministic fail-to-pass, failure, timeout, policy, tamper, and redaction cases          |
+| `packages/report`  | Terminal and Markdown rendering                                                                     |
+| `packages/github`  | Checks, managed comments, slash commands, webhook signatures without credentials                    |
+| `apps/github-app`  | Webhook process, SQLite run state, durable queue, exact-ref adapter, separate worker                |
+| `packages/testkit` | Deterministic fail-to-pass, failure, timeout, policy, tamper, and redaction cases                   |
 
 The HTTP process never executes repository code. For a local GitHub App deployment, start the two processes with the same `PATCHPROOF_SQLITE_PATH`:
 
