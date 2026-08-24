@@ -244,6 +244,7 @@ jobs:
           APP_ID: ${{ vars.PATCHPROOF_VALIDATION_APP_ID }}
           INSTALLATION_ID: ${{ vars.PATCHPROOF_VALIDATION_INSTALLATION_ID }}
           PR_NUMBER: ${{ vars.PATCHPROOF_VALIDATION_PR_NUMBER }}
+          DIAG_ISSUE_NUMBER: ${{ vars.PATCHPROOF_VALIDATION_DIAG_ISSUE }}
         shell: bash
         run: |
           set -euo pipefail
@@ -252,7 +253,9 @@ jobs:
 
           const appId = Number(process.env.APP_ID);
           const installationId = Number(process.env.INSTALLATION_ID);
-          const issueNumber = Number(process.env.PR_NUMBER);
+          const targets = [Number(process.env.PR_NUMBER), Number(process.env.DIAG_ISSUE_NUMBER)].filter(
+            (value) => Number.isSafeInteger(value) && value > 0,
+          );
           const key = process.env.PATCHPROOF_VALIDATION_APP_PRIVATE_KEY.replaceAll('\\n', '\n').trim();
           const api = 'https://api.github.com';
           const baseHeaders = {
@@ -277,26 +280,28 @@ jobs:
             process.exit(0);
           }
           const token = (await mint.json()).token;
-          const created = await fetch(
-            `${api}/repos/kwlck/PatchProof/issues/${issueNumber}/comments`,
-            {
-              method: 'POST',
-              headers: { ...baseHeaders, Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({ body: '<!-- patchproof:diagnostic probe -->' }),
-            },
-          );
-          console.log('probe comment status:', created.status);
-          for (const [name, value] of created.headers)
-            if (/^(retry-after|x-ratelimit)/iu.test(name)) console.log('probe header:', name, value);
-          const text = await created.text();
-          console.log('probe body:', text.slice(0, 600));
-          if (created.status === 201) {
-            const commentId = JSON.parse(text).id;
-            const removed = await fetch(
-              `${api}/repos/kwlck/PatchProof/issues/comments/${commentId}`,
-              { method: 'DELETE', headers: { ...baseHeaders, Authorization: `Bearer ${token}` } },
+          for (const target of targets) {
+            const created = await fetch(
+              `${api}/repos/kwlck/PatchProof/issues/${target}/comments`,
+              {
+                method: 'POST',
+                headers: { ...baseHeaders, Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ body: '<!-- patchproof:diagnostic probe -->' }),
+              },
             );
-            console.log('probe cleanup status:', removed.status);
+            console.log(`probe comment on issue ${target} status:`, created.status);
+            for (const [name, value] of created.headers)
+              if (/^(retry-after|x-ratelimit)/iu.test(name)) console.log('probe header:', name, value);
+            const text = await created.text();
+            console.log(`probe issue ${target} body:`, text.slice(0, 600));
+            if (created.status === 201) {
+              const commentId = JSON.parse(text).id;
+              const removed = await fetch(
+                `${api}/repos/kwlck/PatchProof/issues/comments/${commentId}`,
+                { method: 'DELETE', headers: { ...baseHeaders, Authorization: `Bearer ${token}` } },
+              );
+              console.log(`probe cleanup for issue ${target} status:`, removed.status);
+            }
           }
           NODE
 
