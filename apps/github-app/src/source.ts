@@ -75,8 +75,16 @@ export class GitHubSourceAdapter implements SourceAdapter {
         // Git reads the header from a child-only environment variable. The
         // credential therefore never appears in argv/process listings, while
         // execFile still preserves argv boundary safety (no shell involved).
+        // GitHub's Git transport authenticates installation tokens through the
+        // basic scheme with the x-access-token user name, matching what the
+        // official checkout action sends.
         env: authenticated
-          ? { ...environment, GIT_AUTH_HEADER: `Authorization: Bearer ${token}` }
+          ? {
+              ...environment,
+              GIT_AUTH_HEADER: `Authorization: Basic ${Buffer.from(
+                `x-access-token:${token}`,
+              ).toString('base64')}`,
+            }
           : environment,
         timeout: this.gitTimeoutMs,
         maxBuffer: 1_048_576,

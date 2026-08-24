@@ -2096,7 +2096,9 @@ export async function runValidation(options = {}) {
         console.error(
           `worker attempt state: status=${String(result.status)} jobStatus=${String(
             result.job?.status,
-          )} hasBundle=${result.bundlePath !== undefined} error=${String(result.error ?? 'none')}`,
+          )} hasBundle=${result.bundlePath !== undefined} error=${String(result.error ?? 'none')
+            .replaceAll(/[\r\n]+/gu, ' ')
+            .slice(0, 500)}`,
         );
         fail('validation', 'Production worker did not complete exactly one validation attempt');
       }
