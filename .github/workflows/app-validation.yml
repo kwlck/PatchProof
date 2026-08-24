@@ -342,12 +342,20 @@ jobs:
           test -f "$summary"
           # Fail closed when the scanner itself is unavailable.
           command -v rg >/dev/null
-          if rg --quiet --no-messages \
+          hits="$RUNNER_TEMP/summary-secret-hits.txt"
+          if rg --no-messages \
             -e '-----BEGIN [A-Z ]+PRIVATE KEY-----' \
             -e 'gh[pousr]_[A-Za-z0-9_]{20,}' \
             -e 'github_pat_[A-Za-z0-9_]{20,}' \
             -e 'xox[baprs]-[A-Za-z0-9-]{20,}' \
-            "$summary"; then
+            "$summary" > "$hits"; then
+            # Reveal only the matched shape with the value masked so an
+            # operator can classify the finding without exposing a secret.
+            sed -E \
+              -e 's/(gh[pousr]_[A-Za-z0-9_]{6})[A-Za-z0-9_]*/\1<masked>/g' \
+              -e 's/(github_pat_[A-Za-z0-9_]{6})[A-Za-z0-9_]*/\1<masked>/g' \
+              -e 's/(xox[baprs]-[A-Za-z0-9-]{6})[A-Za-z0-9-]*/\1<masked>/g' \
+              "$hits" | cut -c1-240 >&2 || true
             echo 'validation summary contains a credential-like value' >&2
             exit 1
           fi
