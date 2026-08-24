@@ -11,3 +11,5 @@ outputs/*
 *.log
 *.tsbuildinfo
 .DS_Store
+
+patchproof-demo/
