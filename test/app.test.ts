@@ -9,7 +9,7 @@ import https from 'node:https';
 import { Worker } from 'node:worker_threads';
 import assert from 'node:assert/strict';
 import { handleWebhook } from '../apps/github-app/dist/webhook.js';
-import { GitHubApiTransport } from '../apps/github-app/dist/github-api.js';
+import { GitHubApiError, GitHubApiTransport } from '../apps/github-app/dist/github-api.js';
 import { GitHubAppAuth, createGitHubAppJwt } from '../apps/github-app/dist/github-auth.js';
 import { SqliteStateStore } from '../apps/github-app/dist/sqlite.js';
 import { publishRunFailure, publishRunResult } from '../apps/github-app/dist/publisher.js';
@@ -976,6 +976,90 @@ test('GitHub transport destroys rejected bodies and aborts accepted stalled bodi
     assert.equal(acceptedDestroyed, 1);
   } finally {
     acceptedMock.restore();
+  }
+});
+
+test('GitHub transport replays content creation after a bounded secondary rate limit', async () => {
+  const mock = installMockHttpsRequest((options) => {
+    if (options.method === 'POST' && mock.requests.length === 1)
+      return {
+        status: 403,
+        headers: { 'retry-after': '1', 'x-ratelimit-remaining': '4990' },
+        body: '{"message":"Forbidden"}',
+      };
+    return { status: 201, body: '{"id":77,"body":"managed"}' };
+  });
+  const transport = new GitHubApiTransport('test-token');
+  try {
+    const comment = await transport.createComment('owner/repo', 22, { body: 'managed' });
+    assert.equal(comment.id, 77);
+    assert.equal(mock.requests.length, 2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('GitHub transport surfaces rate-limit diagnostics without replay on primary exhaustion', async () => {
+  const mock = installMockHttpsRequest(() => ({
+    status: 403,
+    headers: { 'x-ratelimit-remaining': '0' },
+    body: '{"message":"Forbidden"}',
+  }));
+  const transport = new GitHubApiTransport('test-token');
+  try {
+    const pending = transport.createComment('owner/repo', 22, { body: 'managed' });
+    await assert.rejects(
+      () => pending,
+      /GitHub API request failed \(403\) for POST \/repos\/owner\/repo\/issues\/22\/comments \[ratelimit-remaining=0\]/u,
+    );
+    const error = (await pending.catch((caught: unknown) => caught)) as GitHubApiError;
+    assert.equal(error.status, 403);
+    assert.equal(mock.requests.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('GitHub transport fails closed when the advised secondary wait exceeds the bound', async () => {
+  const mock = installMockHttpsRequest(() => ({
+    status: 403,
+    headers: { 'retry-after': '60', 'x-ratelimit-remaining': '4990' },
+    body: '{"message":"Forbidden"}',
+  }));
+  const transport = new GitHubApiTransport('test-token');
+  try {
+    const pending = transport.createComment('owner/repo', 22, { body: 'managed' });
+    await assert.rejects(
+      () => pending,
+      /GitHub API request failed \(403\).*retry-after=60s.*advised wait exceeds the replay bound/u,
+    );
+    const error = (await pending.catch((caught: unknown) => caught)) as GitHubApiError;
+    assert.equal(error.status, 403);
+    assert.equal(mock.requests.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('GitHub transport does not replay rejected reads', async () => {
+  const mock = installMockHttpsRequest(() => ({
+    status: 403,
+    headers: { 'retry-after': '1' },
+    body: '[]',
+  }));
+  const transport = new GitHubApiTransport({
+    requiresInstallationId: false as const,
+    appId: 4660890,
+    getToken: async () => 'test-token',
+  });
+  try {
+    await assert.rejects(
+      () => transport.findManagedComment('owner/repo', 22),
+      /GitHub API request failed \(403\) for GET \/repos\/owner\/repo\/issues\/22\/comments\?per_page=100&page=1 \[retry-after=1s\]/u,
+    );
+    assert.equal(mock.requests.length, 1);
+  } finally {
+    mock.restore();
   }
 });
 
