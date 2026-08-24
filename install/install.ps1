@@ -18,7 +18,10 @@ $LibDir = Join-Path $InstallRoot 'lib'
 $RuntimeDir = Join-Path $InstallRoot 'runtime'
 
 function Write-Log([string]$Message) { Write-Host "patchproof-install: $Message" }
-function Fail([string]$Message) { Write-Error "patchproof-install: error: $Message"; exit 1 }
+function Fail([string]$Message) {
+    Write-Host "patchproof-install: error: $Message" -ForegroundColor Red
+    exit 1
+}
 
 function Get-NodeMajor {
     try {
@@ -36,7 +39,11 @@ function Ensure-Node {
         return
     }
     if ($major -eq 0) { Write-Log 'Node.js not found' } else { Write-Log "Node.js v$major is too old" }
-    $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+    $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+        'ARM64' { 'arm64' }
+        'AMD64' { 'x64' }
+        default { 'x86' }
+    }
     $archive = "node-v$NodeVersion-win-$arch.zip"
     $url = "https://nodejs.org/dist/v$NodeVersion/$archive"
     New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
@@ -45,7 +52,7 @@ function Ensure-Node {
     Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing
     $shasumsPath = Join-Path $RuntimeDir 'SHASUMS256.txt'
     Invoke-WebRequest -Uri "https://nodejs.org/dist/v$NodeVersion/SHASUMS256.txt" -OutFile $shasumsPath -UseBasicParsing
-    $entry = (Get-Content $shasumsPath) | Where-Object { $_ -match [regex]::Escape(" $archive") } | Select-Object -First 1
+    $entry = (Get-Content $shasumsPath) | Where-Object { $_ -match ([regex]::Escape(" $archive") + '$') } | Select-Object -First 1
     if (-not $entry) { Fail "Node checksum entry not found for $archive" }
     $expected = ($entry.Trim() -split '\s+')[0].ToLowerInvariant()
     $actual = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToLowerInvariant()
@@ -83,7 +90,7 @@ function Download-Release {
     $sumsPath = Join-Path $LibDir 'SHA256SUMS'
     Invoke-WebRequest -Uri "$base/$tgzName" -OutFile $tgzPath -UseBasicParsing
     Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing
-    $entry = (Get-Content $sumsPath) | Where-Object { $_ -match [regex]::Escape(" $tgzName") } | Select-Object -First 1
+    $entry = (Get-Content $sumsPath) | Where-Object { $_ -match ([regex]::Escape(" $tgzName") + '$') } | Select-Object -First 1
     if (-not $entry) { Fail "checksum entry not found for $tgzName" }
     $expected = ($entry.Trim() -split '\s+')[0].ToLowerInvariant()
     $actual = (Get-FileHash -Algorithm SHA256 -Path $tgzPath).Hash.ToLowerInvariant()
@@ -101,8 +108,12 @@ function Write-Launcher {
     $launcher = Join-Path $BinDir 'patchproof.cmd'
     @"
 @echo off
-"%PATCHPROOF_NODE%" "$LibDir\patchproof.js" %*
-"@ -replace '%PATCHPROOF_NODE%', $NodeExe | Set-Content -LiteralPath $launcher -Encoding ASCII
+if defined PATCHPROOF_NODE (
+  "%PATCHPROOF_NODE%" "$LibDir\patchproof.js" %*
+) else (
+  "$NodeExe" "$LibDir\patchproof.js" %*
+)
+"@ | Set-Content -LiteralPath $launcher -Encoding ASCII
 }
 
 function Add-ToUserPath {
