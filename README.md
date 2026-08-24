@@ -185,9 +185,9 @@ See [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) 
 
 ## Current limitations
 
-- Docker integration depends on a Docker CLI and daemon. This environment does not provide Docker, so the Docker integration test is present but reports its unavailable status rather than passing silently.
+- Docker integration depends on a Docker CLI and daemon. CI runs it against real containers; when run without Docker, the test reports its unavailable status rather than passing silently.
 - The local process backend is not an isolation boundary and is never the production default.
-- Credential-based GitHub validation is documented but tests use offline fakes and a local HTTP fixture.
+- Credential-based GitHub validation runs on demand as a protected manual workflow against the real GitHub API; unit tests use offline fakes and a local HTTP fixture.
 - Node's built-in `node:sqlite` API is experimental in the supported Node line.
 - Replay requires `--base` and `--head` source directories because bundles store stable labels instead of host paths and do not contain full source snapshots.
 - Network allowlists are refused until an enforcing adapter is supplied. The current Docker path supports network `none` only.
