@@ -2034,8 +2034,12 @@ export async function runValidation(options = {}) {
         const deliveryId = randomUUID();
         request = buildWebhookRequest(body, environment.webhookSecret, deliveryId);
         const queuedResponse = await postWebhook(port, request);
-        if (queuedResponse.status !== 202)
+        if (queuedResponse.status !== 202) {
+          console.error(
+            `delivery rejected status=${queuedResponse.status} body=${queuedResponse.body.slice(0, 200)}`,
+          );
           fail('validation', 'Synthetic pull request delivery was not queued');
+        }
         const queuedJobs = await queue.list();
         assertQueueState(queuedJobs, environment, 'queued');
       });
@@ -2195,6 +2199,13 @@ export async function runValidation(options = {}) {
       result.summary = summary;
     } catch (error) {
       primaryError = annotateValidationError(error, currentPrimaryStage);
+      // AppValidationError messages are fixed operator-facing strings; foreign
+      // errors contribute only their class name so credentials never surface.
+      const detail =
+        error instanceof AppValidationError
+          ? error.message.replaceAll(/[\r\n]+/gu, ' ').slice(0, 200)
+          : (error?.constructor?.name ?? 'unknown error');
+      console.error(`APP_VALIDATION_DETAIL stage=${currentPrimaryStage}: ${detail}`);
     } finally {
       const cleanup = await runValidationCleanup({
         [VALIDATION_CLEANUP_STAGES.SERVER]: async () => {
