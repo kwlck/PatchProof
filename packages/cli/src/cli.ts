@@ -36,6 +36,8 @@ interface DoctorCheck {
 
 const HELP = `PatchProof - replayable evidence for pull-request bug fixes
 
+Quick start: patchproof setup --demo proves the full pipeline in about 30 seconds.
+
 Usage:
   patchproof init [directory]
   patchproof validate <.patchproof.yml> [--json]
@@ -86,6 +88,13 @@ async function initCommand(args: ParsedArgs): Promise<number> {
     'utf8',
   );
   console.log(`Created ${target}`);
+  console.log('Next steps:');
+  console.log('  1. Create the scenario file the config runs (scenario.mjs next to the config).');
+  console.log('     It must reproduce the claimed bug: on the unfixed base it exits with code 1.');
+  console.log(`  2. patchproof validate ${args.positional[0] ?? '.patchproof.yml'}`);
+  console.log(
+    `  3. patchproof run ${args.positional[0] ?? '.patchproof.yml'} --base <base-dir> --head <head-dir>`,
+  );
   return 0;
 }
 
