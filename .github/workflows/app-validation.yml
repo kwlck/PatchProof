@@ -341,9 +341,9 @@ jobs:
           summary='work/app-validation/summary.json'
           test -f "$summary"
           # Fail closed when the scanner itself is unavailable.
-          command -v rg >/dev/null
+          command -v grep >/dev/null
           hits="$RUNNER_TEMP/summary-secret-hits.txt"
-          if rg --no-messages \
+          if grep -E -n \
             -e '-----BEGIN [A-Z ]+PRIVATE KEY-----' \
             -e 'gh[pousr]_[A-Za-z0-9_]{20,}' \
             -e 'github_pat_[A-Za-z0-9_]{20,}' \
