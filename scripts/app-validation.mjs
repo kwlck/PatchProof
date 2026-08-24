@@ -2092,8 +2092,14 @@ export async function runValidation(options = {}) {
         result.status !== 'completed' ||
         result.job?.status !== 'running' ||
         result.bundlePath === undefined
-      )
+      ) {
+        console.error(
+          `worker attempt state: status=${String(result.status)} jobStatus=${String(
+            result.job?.status,
+          )} hasBundle=${result.bundlePath !== undefined}`,
+        );
         fail('validation', 'Production worker did not complete exactly one validation attempt');
+      }
       const completedJobs = await primary(VALIDATION_PRIMARY_STAGES.WORKER_EXECUTION, () =>
         queue.list(),
       );
