@@ -1795,6 +1795,9 @@ function assertQueueState(jobs, environment, expectedStatus) {
   if (!Array.isArray(jobs) || jobs.length !== 1)
     fail('validation', 'Validation queue cardinality is invalid');
   const [job] = jobs;
+  // A freshly enqueued job has zero attempts; the attempt counter increments
+  // when a worker claims the job, so only terminal assertions expect one.
+  const expectedAttempts = expectedStatus === 'queued' ? 0 : 1;
   if (
     job.repository !== environment.repository ||
     job.pullRequest !== environment.pullRequest ||
@@ -1802,7 +1805,7 @@ function assertQueueState(jobs, environment, expectedStatus) {
     job.headSha !== environment.headSha ||
     job.installationId !== environment.installationId ||
     job.status !== expectedStatus ||
-    job.attempts !== 1
+    job.attempts !== expectedAttempts
   )
     fail('validation', 'Validation queue identity or attempt state is invalid');
   return job;
