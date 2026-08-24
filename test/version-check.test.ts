@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -54,6 +55,24 @@ test('version check matches exact changelog markers and rejects hostile versions
     assert.match(`${result.stdout}${result.stderr}`, /Invalid release version/u);
   }
   const tagResult = runVersionCheck('--version', '0.1.0', '--tag', 'v0.1.0');
-  assert.notEqual(tagResult.status, 0);
-  assert.match(`${tagResult.stdout}${tagResult.stderr}`, /must be released before tagging/u);
+  assert.equal(tagResult.status, 0);
+  assert.match(tagResult.stdout, /tag: v0\.1\.0/u);
+});
+
+test('tagging rejects an unreleased changelog entry', () => {
+  const changelogPath = resolve(process.cwd(), 'CHANGELOG.md');
+  const original = readFileSync(changelogPath, 'utf8');
+  const unreleased = original.replace(
+    /##[ \t]+0\.1\.0[ \t]+-[ \t]+\d{4}-\d{2}-\d{2}/u,
+    '## 0.1.0 - unreleased',
+  );
+  assert.notEqual(unreleased, original, 'released changelog marker not found');
+  try {
+    writeFileSync(changelogPath, unreleased);
+    const tagResult = runVersionCheck('--version', '0.1.0', '--tag', 'v0.1.0');
+    assert.notEqual(tagResult.status, 0);
+    assert.match(`${tagResult.stdout}${tagResult.stderr}`, /must be released before tagging/u);
+  } finally {
+    writeFileSync(changelogPath, original);
+  }
 });
