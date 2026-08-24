@@ -2030,18 +2030,31 @@ export async function runValidation(options = {}) {
       );
       port = await primary(VALIDATION_PRIMARY_STAGES.WEBHOOK_BIND, () => listenWebhook(server));
       await primary(VALIDATION_PRIMARY_STAGES.WEBHOOK_DELIVERY, async () => {
-        const body = canonicalSyntheticPullRequest(liveMetadata);
-        const deliveryId = randomUUID();
-        request = buildWebhookRequest(body, environment.webhookSecret, deliveryId);
-        const queuedResponse = await postWebhook(port, request);
-        if (queuedResponse.status !== 202) {
+        try {
+          const body = canonicalSyntheticPullRequest(liveMetadata);
+          const deliveryId = randomUUID();
+          request = buildWebhookRequest(body, environment.webhookSecret, deliveryId);
+          const queuedResponse = await postWebhook(port, request);
+          if (queuedResponse.status !== 202) {
+            console.error(
+              `delivery rejected status=${queuedResponse.status} body=${queuedResponse.body.slice(0, 200)}`,
+            );
+            fail('validation', 'Synthetic pull request delivery was not queued');
+          }
+          const queuedJobs = await queue.list();
+          assertQueueState(queuedJobs, environment, 'queued');
+        } catch (error) {
+          // Local-only stage: every producer here emits fixed operator strings,
+          // so printing the message directly stays within the sanitization rule.
           console.error(
-            `delivery rejected status=${queuedResponse.status} body=${queuedResponse.body.slice(0, 200)}`,
+            `delivery raw error: ${
+              error instanceof Error
+                ? error.message.replaceAll(/[\r\n]+/gu, ' ').slice(0, 300)
+                : (error?.constructor?.name ?? 'unknown')
+            }`,
           );
-          fail('validation', 'Synthetic pull request delivery was not queued');
+          throw error;
         }
-        const queuedJobs = await queue.list();
-        assertQueueState(queuedJobs, environment, 'queued');
       });
       worker = await primary(
         VALIDATION_PRIMARY_STAGES.WORKER_EXECUTION,
