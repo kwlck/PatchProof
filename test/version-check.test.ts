@@ -5,6 +5,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 const script = resolve(process.cwd(), 'scripts/version-check.mjs');
+const manifestVersion = (
+  JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8')) as { version: string }
+).version;
 
 function runVersionCheck(...arguments_: string[]): ReturnType<typeof spawnSync> {
   return spawnSync(process.execPath, [script, ...arguments_], {
@@ -15,8 +18,8 @@ function runVersionCheck(...arguments_: string[]): ReturnType<typeof spawnSync> 
 
 test('version check matches exact changelog markers and rejects hostile versions', () => {
   assert.equal(runVersionCheck().status, 0);
-  assert.equal(runVersionCheck('--version', '0.1.0').status, 0);
-  assert.notEqual(runVersionCheck('--version', '0.1.0-alpha').status, 0);
+  assert.equal(runVersionCheck('--version', manifestVersion).status, 0);
+  assert.notEqual(runVersionCheck('--version', `${manifestVersion}-alpha`).status, 0);
   const validSemVers = [
     '0.0.0',
     '1.2.3',
@@ -54,22 +57,26 @@ test('version check matches exact changelog markers and rejects hostile versions
     assert.notEqual(result.status, 0);
     assert.match(`${result.stdout}${result.stderr}`, /Invalid release version/u);
   }
-  const tagResult = runVersionCheck('--version', '0.1.0', '--tag', 'v0.1.0');
+  const tagResult = runVersionCheck('--version', manifestVersion, '--tag', `v${manifestVersion}`);
   assert.equal(tagResult.status, 0);
-  assert.match(tagResult.stdout, /tag: v0\.1\.0/u);
+  assert.match(
+    tagResult.stdout,
+    new RegExp(`tag: v${manifestVersion.replace(/\./gu, '\\.')}`, 'u'),
+  );
 });
 
 test('tagging rejects an unreleased changelog entry', () => {
   const changelogPath = resolve(process.cwd(), 'CHANGELOG.md');
   const original = readFileSync(changelogPath, 'utf8');
+  const escapedVersion = manifestVersion.replace(/\./gu, '\\.');
   const unreleased = original.replace(
-    /##[ \t]+0\.1\.0[ \t]+-[ \t]+\d{4}-\d{2}-\d{2}/u,
-    '## 0.1.0 - unreleased',
+    new RegExp(`##[ \\t]+${escapedVersion}[ \\t]+-[ \\t]+\\d{4}-\\d{2}-\\d{2}`, 'u'),
+    `## ${manifestVersion} - unreleased`,
   );
   assert.notEqual(unreleased, original, 'released changelog marker not found');
   try {
     writeFileSync(changelogPath, unreleased);
-    const tagResult = runVersionCheck('--version', '0.1.0', '--tag', 'v0.1.0');
+    const tagResult = runVersionCheck('--version', manifestVersion, '--tag', `v${manifestVersion}`);
     assert.notEqual(tagResult.status, 0);
     assert.match(`${tagResult.stdout}${tagResult.stderr}`, /must be released before tagging/u);
   } finally {
