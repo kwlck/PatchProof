@@ -293,12 +293,16 @@ export function buildDemoFiles(): Record<string, string> {
   };
 }
 
-const NEXT_STEPS = [
-  'patchproof validate <path/to/.patchproof.yml>',
-  'patchproof run <config> --base <dir> --head <dir> --backend docker   (production; needs Docker)',
-  'patchproof verify <evidence bundle>',
-  'patchproof replay <evidence bundle> --yes --base <dir> --head <dir>',
-];
+function nextSteps(dockerReady: boolean): string[] {
+  return [
+    'patchproof validate <path/to/.patchproof.yml>',
+    dockerReady
+      ? 'patchproof run <config> --base <dir> --head <dir> --backend docker   (production)'
+      : 'patchproof run <config> --base <dir> --head <dir> --allow-unsafe-local   (works now; Docker later for production)',
+    'patchproof verify <evidence bundle>',
+    'patchproof replay <evidence bundle> --yes --base <dir> --head <dir>',
+  ];
+}
 
 async function runDemo(demoDir: string): Promise<{ exitCode: number; bundlePath?: string }> {
   const files = buildDemoFiles();
@@ -369,6 +373,7 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
   const dockerHint = currentChecks.some((check) => check.key === 'docker' && !check.ok)
     ? `Docker install: ${DOCKER_MANUAL_URL}`
     : undefined;
+  const dockerReady = !currentChecks.some((check) => check.key === 'docker' && !check.ok);
   const shouldRunDemo = wantsDemo || (!hasOption(args, 'check') && interactiveDemo);
 
   if (!shouldRunDemo) {
@@ -381,7 +386,7 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
       });
     else
       console.log(
-        `${renderChecks(currentChecks)}\n\nEnvironment is ready.${dockerHint === undefined ? '' : `\n${dockerHint}`}\nNext: patchproof setup --demo   (proves the full pipeline in ~30 seconds)\n     ${NEXT_STEPS.join('\n     ')}`,
+        `${renderChecks(currentChecks)}\n\nEnvironment is ready.${dockerHint === undefined ? '' : `\n${dockerHint}`}\nNext: patchproof setup --demo   (proves the full pipeline in ~30 seconds)\n     ${nextSteps(dockerReady).join('\n     ')}`,
       );
     return 0;
   }
@@ -417,7 +422,7 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
   console.log(`  demo directory: ${demoDir}`);
   const demo = await runDemo(demoDir);
   console.log(
-    `\nPASS - the trusted scenario failed on base and passed on head.\nEvidence: ${demo.bundlePath}\n\nNext steps:\n  ${NEXT_STEPS.join('\n  ')}`,
+    `\nPASS - the trusted scenario failed on base and passed on head.\nEvidence: ${demo.bundlePath}\n\nNext steps:\n  ${nextSteps(dockerReady).join('\n  ')}`,
   );
   return demo.exitCode;
 }

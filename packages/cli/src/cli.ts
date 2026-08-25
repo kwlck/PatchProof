@@ -127,24 +127,54 @@ async function initCommand(args: ParsedArgs): Promise<number> {
     'utf8',
   );
   const scenario = [
-    '// Reproduce the bug here. This file must:',
-    '//   1. exit with code 1 when run against the BROKEN code (base/)',
-    '//   2. exit with code 0 when run against the FIXED code (head/)',
-    '// Put a copy of this file in both base/ and head/, and put your project',
-    '// files next to it in each folder.',
+    '// This scenario must:',
+    '//   1. exit with code 1 against the BROKEN code (base/)',
+    '//   2. exit with code 0 against the FIXED code (head/)',
+    '// The scaffold ships with a tiny working example (sum in lib.cjs).',
+    '// Replace lib.cjs with your project files and point these checks at your bug.',
     '',
-    "console.error('EXPECTED_BUG: replace this line with the real reproduction');",
-    'process.exit(1);',
+    "import { createRequire } from 'node:module';",
+    'const require = createRequire(import.meta.url);',
+    "const { sum } = require('./lib.cjs');",
+    '',
+    'const cases = [',
+    '  [[1, 2, 3], 6],',
+    '  [[10, 20, 30], 60],',
+    '];',
+    '',
+    'for (const [input, expected] of cases) {',
+    '  const actual = sum(input);',
+    '  if (actual !== expected) {',
+    '    console.error(`EXPECTED_BUG: sum(${JSON.stringify(input)}) = ${actual}, expected ${expected}`);',
+    '    process.exit(1);',
+    '  }',
+    '}',
+    "console.log('sum works correctly');",
     '',
   ].join('\n');
+  const brokenLib = [
+    'function sum(numbers) {',
+    '  let total = 0;',
+    '  for (let i = 0; i < numbers.length; i++) {',
+    '    total = numbers[i]; // BUG: "=" instead of "+="',
+    '  }',
+    '  return total;',
+    '}',
+    'module.exports = { sum };',
+    '',
+  ].join('\n');
+  const fixedLib = brokenLib.replace(
+    'total = numbers[i]; // BUG: "=" instead of "+="',
+    'total += numbers[i]; // FIXED',
+  );
+  await writeFile(join(root, 'base', 'lib.cjs'), brokenLib, 'utf8');
+  await writeFile(join(root, 'head', 'lib.cjs'), fixedLib, 'utf8');
   await writeFile(join(root, 'base', 'scenario.mjs'), scenario, 'utf8');
   await writeFile(join(root, 'head', 'scenario.mjs'), scenario, 'utf8');
-  console.log(`Scaffolded ${root}`);
+  console.log(`Scaffolded ${root} with a working example (the first run should be PASS).`);
   console.log('Next steps:');
-  console.log(
-    '  1. Copy your project (with the bug) into base/, and the fixed version into head/.',
-  );
-  console.log('     Keep the scenario.mjs in both folders and edit it to reproduce the bug.');
+  console.log('  1. Run the check as-is to see PASS, then replace lib.cjs with your project');
+  console.log('     (buggy copy in base/, fixed copy in head/) and edit scenario.mjs.');
   console.log(`  2. patchproof validate ${join(root, '.patchproof.yml')}`);
   console.log(
     `  3. patchproof run ${join(root, '.patchproof.yml')} --base ${join(root, 'base')} --head ${join(root, 'head')}`,
@@ -261,6 +291,9 @@ async function runCommand(args: ParsedArgs): Promise<number> {
         console.log(
           'Hint: Docker is unavailable or failed. For a quick local check add --backend local --allow-unsafe-local, or install Docker and retry.',
         );
+      }
+      if (built.bundle.outcome === 'POLICY_DENIED' && isPolicyDeniedRun(run)) {
+        console.log(`Policy reason: ${run.reason}`);
       }
     }
     return outcomeExitCode(built.bundle.outcome);

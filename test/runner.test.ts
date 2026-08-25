@@ -579,3 +579,28 @@ test('git ref parsing accepts only the git: prefix with a payload', () => {
   assert.equal(isGitRef('base-dir'), false);
   assert.equal(gitRefOf('git:HEAD~2'), 'HEAD~2');
 });
+
+test('config opt-in alone permits local execution without a CLI flag', async () => {
+  const config: PatchProofConfig = {
+    version: 1,
+    name: 'local scaffold test',
+    scenario: {
+      id: 'local-scaffold',
+      name: 'local scaffold',
+      command: ['node'],
+      cwd: '.',
+      expectedFailure: { exitCode: 1 },
+      environment: {},
+    },
+    policy: { ...policy, backend: 'local', allowUnsafeLocal: true },
+    redaction: { secrets: [] },
+  };
+  const run = await runTwoRevisions({
+    config,
+    basePath: process.cwd(),
+    headPath: process.cwd(),
+    allowUnsafeLocal: false,
+    trustedConfig: true,
+  });
+  assert.equal(isPolicyDeniedRun(run), false);
+});

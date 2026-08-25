@@ -132,7 +132,7 @@ export function applyOperatorPolicy(
     return denied(
       repositoryPolicy,
       operatorPolicy,
-      'Operator policy requires the Docker backend; local process execution is not permitted',
+      'Operator policy requires the Docker backend; local process execution is not permitted. Install Docker, or run a development check with --allow-unsafe-local and a config that sets policy.allowUnsafeLocal: true',
     );
   if (repositoryPolicy.network === 'allowlist')
     return denied(
