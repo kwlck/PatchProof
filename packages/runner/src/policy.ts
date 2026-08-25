@@ -128,11 +128,11 @@ export function applyOperatorPolicy(
       operatorPolicy,
       'Operator-approved Docker images must all be pinned by sha256 digest',
     );
-if (operatorPolicy.forceDocker && repositoryPolicy.backend !== 'docker')
-return denied(
-repositoryPolicy,
-operatorPolicy,
-'Operator policy requires the Docker backend; local process execution is not permitted. Install Docker, or run a development check with --allow-unsafe-local and a config that sets policy.allowUnsafeLocal: true',
+  if (operatorPolicy.forceDocker && repositoryPolicy.backend !== 'docker')
+    return denied(
+      repositoryPolicy,
+      operatorPolicy,
+      'Operator policy requires the Docker backend; local process execution is not permitted. Install Docker, or run a development check with --allow-unsafe-local and a config that sets policy.allowUnsafeLocal: true',
     );
   if (repositoryPolicy.network === 'allowlist')
     return denied(

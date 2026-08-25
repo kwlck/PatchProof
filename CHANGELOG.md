@@ -6,7 +6,6 @@
 - POLICY_DENIED prints the actual policy reason instead of completeness internals.
 - patchproof init ships a working example (first run is PASS) and setup next steps adapt to whether Docker is available.
 
-
 ## 0.9.1 - 2026-08-25
 
 - patchproof init scaffolds the backend the machine can actually run: local with allowUnsafeLocal when Docker is absent, docker when it is present. An INFRA_ERROR on the docker backend now prints the exact local fallback flag.
