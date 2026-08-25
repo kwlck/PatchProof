@@ -4,7 +4,6 @@
 
 - Added the optional patchproof explain command: it verifies an evidence bundle first and then asks an OpenAI model for a bounded plain language explanation of the outcome and the next action. Strictly bring your own key through OPENAI_API_KEY; without it the command points at the deterministic report and sends nothing anywhere.
 
-
 ## 0.5.0 - 2026-08-25
 
 - Closed the largest test coverage gaps from the code review: webhook handling of undecodable and primitive bodies, fail-closed installation identity, queue maxAttempts bounds, fenced cancelTerminal semantics, and delivery claim takeover timing through an injectable clock.
