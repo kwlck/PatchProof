@@ -39,3 +39,18 @@ test('shell installer fails closed on unset variables and pipeline errors', () =
   assert.ok(sh.includes('verify_line "$line" "$RUNTIME_DIR" || fail'));
   assert.ok(sh.includes('verify_line "$line" "$LIB_DIR" || fail'));
 });
+
+test('installers offer a confirmed Docker install when it is missing', () => {
+  assert.ok(sh.includes('Docker is required for production runs and was not found.'));
+  assert.ok(sh.includes('[ ! -t 0 ]'), 'sh must skip the prompt in non-interactive shells');
+  assert.ok(sh.includes('Install Docker now? [y/N]'));
+  assert.ok(ps1.includes('Docker is required for production runs and was not found.'));
+  assert.ok(
+    ps1.includes('[Console]::IsInputRedirected'),
+    'ps1 must skip the prompt when input is redirected',
+  );
+  assert.ok(ps1.includes('Install Docker Desktop now via winget? [y/N]'));
+  for (const script of [sh, ps1]) {
+    assert.ok(script.includes('docs.docker.com/get-docker/'), 'must link the manual guide');
+  }
+});

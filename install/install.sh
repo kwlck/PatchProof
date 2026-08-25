@@ -151,13 +151,52 @@ persist_path() {
   fi
 }
 
+docker_available() {
+  command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1
+}
+
+offer_docker() {
+  if docker_available; then
+    return 0
+  fi
+  printf '\nDocker is required for production runs and was not found.\n'
+  if [ ! -t 0 ]; then
+    log "non-interactive shell: install Docker from https://docs.docker.com/get-docker/"
+    return 0
+  fi
+  printf 'Install Docker now? [y/N] '
+  read -r answer
+  case "$answer" in
+    y | Y | yes | Yes)
+      if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y docker.io
+      elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y moby-engine
+      elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm docker
+      elif command -v brew >/dev/null 2>&1; then
+        brew install --cask docker && open -a Docker
+      else
+        log "no supported package manager found; install Docker from https://docs.docker.com/get-docker/"
+        return 0
+      fi
+      log "if the daemon is not running yet: sudo systemctl enable --now docker (Linux) or launch Docker Desktop"
+      ;;
+    *)
+      log "skipped. install Docker from https://docs.docker.com/get-docker/"
+      ;;
+  esac
+}
+
 main() {
+
   need_download
   ensure_node
   resolve_version
   download_release
   write_launcher
   persist_path
+  offer_docker
   log "verifying the installation"
   set +e
   patchproof setup --check

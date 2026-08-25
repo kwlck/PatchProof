@@ -129,11 +129,42 @@ function Add-ToUserPath {
     Write-Log "added $BinDir to your user PATH (open a new terminal to pick it up)"
 }
 
+function Test-DockerReady {
+    try {
+        $null = & docker version 2>$null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Offer-Docker {
+    if (Test-DockerReady) { return }
+    Write-Host ''
+    Write-Log 'Docker is required for production runs and was not found.'
+    if ([Console]::IsInputRedirected) {
+        Write-Log 'non-interactive shell: install Docker from https://docs.docker.com/get-docker/'
+        return
+    }
+    $answer = Read-Host 'Install Docker Desktop now via winget? [y/N]'
+    if ($answer -match '^(y|yes)$') {
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            & winget install --id Docker.DockerDesktop -e --accept-source-agreements --accept-package-agreements
+            Write-Log 'launch Docker Desktop once and accept its license; a sign-out may be required'
+        } else {
+            Write-Log 'winget unavailable; install Docker from https://docs.docker.com/get-docker/'
+        }
+    } else {
+        Write-Log 'skipped. install Docker from https://docs.docker.com/get-docker/'
+    }
+}
+
 Ensure-Node
 Resolve-Version
 Download-Release
 Write-Launcher
 Add-ToUserPath
+Offer-Docker
 
 Write-Log 'verifying the installation'
 patchproof setup --check
