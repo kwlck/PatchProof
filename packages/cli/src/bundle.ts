@@ -1,4 +1,4 @@
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, rename, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -373,6 +373,19 @@ export async function writeEvidenceBundle(
     ...withoutIntegrity,
     integrity: createIntegrity(withoutIntegrity),
   };
-  await writeFile(bundlePath, `${canonicalize(bundle)}\n`, 'utf8');
+  // Atomic replace: a crash mid-write must never leave a truncated evidence
+  // file that later verifies as INVALID through no fault of the run.
+  const temporaryPath = `${bundlePath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${canonicalize(bundle)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
+    await rename(temporaryPath, bundlePath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
   return { bundle, bundlePath };
 }

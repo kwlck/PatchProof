@@ -32,6 +32,30 @@ export class WorkerPolicyConfigurationError extends Error {
   }
 }
 
+/**
+ * Upper bounds keep an operator typo from silently disabling exactly the
+ * ceilings that back workload isolation.
+ */
+const OPERATOR_LIMIT_MAXIMA = Object.freeze({
+  maxTimeoutMs: 3_600_000,
+  maxOutputBytes: 1_073_741_824,
+  maxMemoryMb: 65_536,
+  maxCpuCount: 1_024,
+  maxPids: 65_536,
+  provisioningTimeoutMs: 3_600_000,
+});
+
+function boundedInteger(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+  maximum: number,
+): number {
+  const value = positiveInteger(environment, name, fallback);
+  if (value > maximum) throw new WorkerPolicyConfigurationError();
+  return value;
+}
+
 function positiveInteger(environment: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const raw = environment[name];
   if (raw === undefined) return fallback;
@@ -68,23 +92,41 @@ export function parseWorkerOperatorPolicy(
     requireDigestPinnedImages: true,
     requireReadOnlyRoot: true,
     approvedDockerImages: approvedImages(environment),
-    maxTimeoutMs: positiveInteger(
+    maxTimeoutMs: boundedInteger(
       environment,
       WORKER_OPERATOR_ENV.maxTimeoutMs,
       limits.maxTimeoutMs,
+      OPERATOR_LIMIT_MAXIMA.maxTimeoutMs,
     ),
-    maxOutputBytes: positiveInteger(
+    maxOutputBytes: boundedInteger(
       environment,
       WORKER_OPERATOR_ENV.maxOutputBytes,
       limits.maxOutputBytes,
+      OPERATOR_LIMIT_MAXIMA.maxOutputBytes,
     ),
-    maxMemoryMb: positiveInteger(environment, WORKER_OPERATOR_ENV.maxMemoryMb, limits.maxMemoryMb),
-    maxCpuCount: positiveInteger(environment, WORKER_OPERATOR_ENV.maxCpuCount, limits.maxCpuCount),
-    maxPids: positiveInteger(environment, WORKER_OPERATOR_ENV.maxPids, limits.maxPids),
-    provisioningTimeoutMs: positiveInteger(
+    maxMemoryMb: boundedInteger(
+      environment,
+      WORKER_OPERATOR_ENV.maxMemoryMb,
+      limits.maxMemoryMb,
+      OPERATOR_LIMIT_MAXIMA.maxMemoryMb,
+    ),
+    maxCpuCount: boundedInteger(
+      environment,
+      WORKER_OPERATOR_ENV.maxCpuCount,
+      limits.maxCpuCount,
+      OPERATOR_LIMIT_MAXIMA.maxCpuCount,
+    ),
+    maxPids: boundedInteger(
+      environment,
+      WORKER_OPERATOR_ENV.maxPids,
+      limits.maxPids,
+      OPERATOR_LIMIT_MAXIMA.maxPids,
+    ),
+    provisioningTimeoutMs: boundedInteger(
       environment,
       WORKER_OPERATOR_ENV.provisioningTimeoutMs,
       limits.provisioningTimeoutMs,
+      OPERATOR_LIMIT_MAXIMA.provisioningTimeoutMs,
     ),
   };
 }

@@ -1609,3 +1609,61 @@ test('lease reclaim isolates attempts and unique owners from stale workers', asy
     queue.close();
   }
 });
+
+test('runForever keeps polling after queue faults instead of dying', async () => {
+  const queue = new SqliteQueue(':memory:');
+  const flakyQueue = Object.create(queue) as typeof queue;
+  let faults = 0;
+  flakyQueue.claim = async (owner: Parameters<SqliteQueue['claim']>[0], leaseMs?: number) => {
+    faults += 1;
+    if (faults <= 2) throw new Error('database is locked');
+    return queue.claim(owner, leaseMs);
+  };
+  const github = {
+    async getPullRequest() {
+      return {
+        number: 7,
+        baseSha,
+        headSha,
+        headRepository: 'octo/example',
+        fork: false,
+        state: 'open' as const,
+      };
+    },
+    async createCheck() {
+      return { id: 1 };
+    },
+    async updateCheck() {},
+    async createComment() {
+      return { id: 2, body: 'managed' };
+    },
+    async updateComment() {},
+  };
+  const worker = new PatchProofWorker({
+    queue: flakyQueue,
+    source: new FixtureSourceAdapter(),
+    store: new MemoryStateStore(),
+    github,
+    outputRoot: join('work', 'worker-flaky-unused'),
+    workerId: 'worker-flaky',
+  });
+  const running = worker.runForever(1);
+  await new Promise((resolvePause) => setTimeout(resolvePause, 80));
+  worker.stop();
+  await running;
+  assert.ok(faults >= 3, `expected repeated claim attempts, got ${faults}`);
+  queue.close();
+});
+
+test('worker operator limits fail closed above hard maxima', () => {
+  const environment = {
+    PATCHPROOF_APPROVED_DOCKER_IMAGES: 'ghcr.io/patchproof/scenario@sha256:' + 'a'.repeat(64),
+    PATCHPROOF_MAX_MEMORY_MB: '99999999',
+  };
+  assert.throws(() => parseWorkerOperatorPolicy(environment), WorkerPolicyConfigurationError);
+  const within = parseWorkerOperatorPolicy({
+    PATCHPROOF_APPROVED_DOCKER_IMAGES: 'ghcr.io/patchproof/scenario@sha256:' + 'a'.repeat(64),
+    PATCHPROOF_MAX_MEMORY_MB: '4096',
+  });
+  assert.equal(within.maxMemoryMb, 4096);
+});
