@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0 - 2026-08-25
+
+- Added a lease takeover chaos test: an attempt abandoned by a killed worker is reclaimed after the lease expires and still completes with an accurate attempt count.
+- Refreshed the README: the Docker setup offer, the two click App wizard, and the optional bring your own key AI commands are now part of the install story.
+
 ## 0.6.0 - 2026-08-25
 
 - Added the optional patchproof explain command: it verifies an evidence bundle first and then asks an OpenAI model for a bounded plain language explanation of the outcome and the next action. Strictly bring your own key through OPENAI_API_KEY; without it the command points at the deterministic report and sends nothing anywhere.

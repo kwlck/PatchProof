@@ -50,7 +50,16 @@ The installer verifies every download against published SHA-256 checksums, insta
 patchproof setup --demo
 ```
 
-That single command runs a self-contained bug scenario against two revisions, writes the evidence bundle, verifies it, and prints next steps in about 30 seconds. Production runs use Docker; install it from [Docker Desktop](https://www.docker.com/products/docker-desktop/) whenever you are ready. Installers resolve the latest GitHub Release, so create a release first or pin `PATCHPROOF_VERSION=<tag>`.
+That single command runs a self-contained bug scenario against two revisions, writes the evidence bundle, verifies it, and prints next steps in about 30 seconds. Production runs use Docker; install it from [Docker Desktop](https://www.docker.com/products/docker-desktop/) whenever you are ready - the setup wizard offers to do it for you. Installers resolve the latest GitHub Release, so create a release first or pin `PATCHPROOF_VERSION=<tag>`.
+
+Setting up the GitHub App deployment is a two click wizard too: `patchproof setup --app` drives the official App Manifest flow and writes a private env file for you.
+
+Two optional AI commands help you write and read scenarios. Both are strictly bring your own key through `OPENAI_API_KEY`; without a key they only point at the manual path and send nothing anywhere:
+
+```text
+patchproof draft --diff fix.diff --issue report.md    # draft a scenario from the fix
+patchproof explain work/pass/patchproof.evidence.json # plain language outcome summary
+```
 
 ## Run from source
 
