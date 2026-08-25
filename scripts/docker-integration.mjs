@@ -405,7 +405,14 @@ try {
   await runCliFixture();
   await runContainmentProbes();
   await runWorkerFixture();
-  const after = await patchproofContainers();
+  // The daemon tears a force-removed container down asynchronously: `rm -f`
+  // can return while the container is still listed for a short window. Wait
+  // bounded before asserting so the check tests cleanup, not daemon timing.
+  let after = await patchproofContainers();
+  for (let attempt = 0; after.length > 0 && attempt < 20; attempt += 1) {
+    await new Promise((resolvePause) => setTimeout(resolvePause, 500));
+    after = await patchproofContainers();
+  }
   assert.deepEqual(after, [], 'Docker integration leaves no residual PatchProof containers');
   console.log('docker integration: PASS (CLI, worker, and residual-container checks passed)');
 } catch (error) {
