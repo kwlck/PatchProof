@@ -1,4 +1,5 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
@@ -100,6 +101,142 @@ function probeSqlite(): SetupCheck {
 /** Environment probes used by both the interactive wizard and `--check`. */
 export async function collectSetupChecks(): Promise<SetupCheck[]> {
   return [probeNode(), await probeDocker(), probeSqlite()];
+}
+
+export interface DockerInstallStep {
+  command: string;
+  args: string[];
+}
+
+export interface DockerInstallPlan {
+  label: string;
+  steps: DockerInstallStep[];
+  postInstall: string;
+}
+
+export const DOCKER_MANUAL_URL = 'https://docs.docker.com/get-docker/';
+
+/**
+ * Official package manager commands only. The plan is offered interactively
+ * and always requires explicit confirmation before anything runs.
+ */
+export function dockerInstallPlan(
+  platform: NodeJS.Platform = process.platform,
+  exists: (path: string) => boolean = existsSync,
+): DockerInstallPlan | undefined {
+  if (platform === 'win32') {
+    return {
+      label: 'winget (Docker Desktop)',
+      steps: [
+        {
+          command: 'winget',
+          args: [
+            'install',
+            '--id',
+            'Docker.DockerDesktop',
+            '-e',
+            '--accept-source-agreements',
+            '--accept-package-agreements',
+          ],
+        },
+      ],
+      postInstall:
+        'Launch Docker Desktop once and accept its license. Windows may require signing out and back in before the daemon is reachable.',
+    };
+  }
+  if (platform === 'darwin') {
+    return {
+      label: 'Homebrew (Docker Desktop)',
+      steps: [
+        { command: 'brew', args: ['install', '--cask', 'docker'] },
+        { command: 'open', args: ['-a', 'Docker'] },
+      ],
+      postInstall:
+        'Docker Desktop finishes setup on first launch; grant the requested permissions.',
+    };
+  }
+  if (platform === 'linux') {
+    if (exists('/usr/bin/apt-get')) {
+      return {
+        label: 'apt (Docker Engine)',
+        steps: [
+          { command: 'sudo', args: ['apt-get', 'update'] },
+          { command: 'sudo', args: ['apt-get', 'install', '-y', 'docker.io'] },
+        ],
+        postInstall:
+          'Enable and start the daemon: sudo systemctl enable --now docker. To run docker without sudo: sudo usermod -aG docker $USER, then sign out and back in.',
+      };
+    }
+    if (exists('/usr/bin/dnf')) {
+      return {
+        label: 'dnf (moby engine)',
+        steps: [{ command: 'sudo', args: ['dnf', 'install', '-y', 'moby-engine'] }],
+        postInstall:
+          'Enable and start the daemon: sudo systemctl enable --now docker. To run docker without sudo: sudo usermod -aG docker $USER, then sign out and back in.',
+      };
+    }
+    if (exists('/usr/bin/pacman')) {
+      return {
+        label: 'pacman (Docker Engine)',
+        steps: [{ command: 'sudo', args: ['pacman', '-S', '--noconfirm', 'docker'] }],
+        postInstall:
+          'Enable and start the daemon: sudo systemctl enable --now docker. To run docker without sudo: sudo usermod -aG docker $USER, then sign out and back in.',
+      };
+    }
+  }
+  return undefined;
+}
+
+function runInstallStep(step: DockerInstallStep): Promise<number> {
+  return new Promise((resolveCode) => {
+    const child = spawn(step.command, step.args, {
+      stdio: 'inherit',
+      shell: false,
+      windowsHide: true,
+    });
+    child.on('error', () => resolveCode(1));
+    child.on('close', (code) => resolveCode(code ?? 1));
+  });
+}
+
+async function offerDockerInstall(checks: SetupCheck[]): Promise<SetupCheck[]> {
+  const docker = checks.find((check) => check.key === 'docker');
+  if (docker === undefined || docker.ok) return checks;
+  const plan = dockerInstallPlan();
+  if (plan === undefined) {
+    console.log(`Install Docker manually: ${DOCKER_MANUAL_URL}`);
+    return checks;
+  }
+  const readline = await import('node:readline/promises');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let confirmed = false;
+  try {
+    const answer = (
+      await rl.question(`Docker is missing. Install it now via ${plan.label}? [y/N] `)
+    )
+      .trim()
+      .toLowerCase();
+    confirmed = answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+  if (!confirmed) {
+    console.log(`Skipped. Install Docker manually: ${DOCKER_MANUAL_URL}`);
+    return checks;
+  }
+  for (const step of plan.steps) {
+    console.log(`> ${step.command} ${step.args.join(' ')}`);
+    const code = await runInstallStep(step);
+    if (code !== 0) {
+      console.log(
+        `The ${step.command} step exited with code ${code}. Finish the Docker install manually: ${DOCKER_MANUAL_URL}`,
+      );
+      return checks;
+    }
+  }
+  console.log(plan.postInstall);
+  const refreshed = await collectSetupChecks();
+  return checks.map((check) => refreshed.find((item) => item.key === check.key) ?? check);
 }
 
 function renderChecks(checks: SetupCheck[]): string {
@@ -217,7 +354,9 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
   const demoDirOption = option(args, 'demo-dir');
   const wantsDemo = hasOption(args, 'demo');
   let interactiveDemo = false;
+  let currentChecks = checks;
   if (!wantsDemo && !hasOption(args, 'check') && !json && process.stdin.isTTY) {
+    currentChecks = await offerDockerInstall(checks);
     const readline = await import('node:readline/promises');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
@@ -227,13 +366,22 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
       rl.close();
     }
   }
+  const dockerHint = currentChecks.some((check) => check.key === 'docker' && !check.ok)
+    ? `Docker install: ${DOCKER_MANUAL_URL}`
+    : undefined;
   const shouldRunDemo = wantsDemo || (!hasOption(args, 'check') && interactiveDemo);
 
   if (!shouldRunDemo) {
-    if (json) jsonOutput({ ok: true, mode: 'check', checks });
+    if (json)
+      jsonOutput({
+        ok: true,
+        mode: 'check',
+        checks: currentChecks,
+        ...(dockerHint === undefined ? {} : { dockerInstall: dockerHint }),
+      });
     else
       console.log(
-        `${renderChecks(checks)}\n\nEnvironment is ready.\nNext: patchproof setup --demo   (proves the full pipeline in ~30 seconds)\n     ${NEXT_STEPS.join('\n     ')}`,
+        `${renderChecks(currentChecks)}\n\nEnvironment is ready.${dockerHint === undefined ? '' : `\n${dockerHint}`}\nNext: patchproof setup --demo   (proves the full pipeline in ~30 seconds)\n     ${NEXT_STEPS.join('\n     ')}`,
       );
     return 0;
   }
@@ -246,7 +394,7 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
       jsonOutput({
         ok: true,
         mode: 'demo',
-        checks,
+        checks: currentChecks,
         demoDir,
         ...(demo.bundlePath === undefined ? {} : { bundlePath: demo.bundlePath }),
         outcome: 'PASS',
@@ -256,7 +404,7 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
       jsonOutput({
         ok: false,
         mode: 'demo',
-        checks,
+        checks: currentChecks,
         demoDir,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -264,7 +412,7 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
     }
   }
   console.log(
-    `${renderChecks(checks)}\n\nRunning the self-contained demo (development local backend)...`,
+    `${renderChecks(currentChecks)}\n\nRunning the self-contained demo (development local backend)...`,
   );
   console.log(`  demo directory: ${demoDir}`);
   const demo = await runDemo(demoDir);
