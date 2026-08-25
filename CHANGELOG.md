@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 - 2026-08-25
+
+- Added a `/healthz` liveness endpoint to the webhook process and periodic worker metric snapshots (`PATCHPROOF_METRICS_INTERVAL_MS`) counting every run outcome, giving operators a window into claims, retries, and failures without touching the store.
+- Added direct tests for the webhook HTTP surface: liveness, 404 fail-closed routing, and oversize body rejection, closing the largest coverage gap from the code review.
+
 ## 0.3.0 - 2026-08-25
 
 - Added the interactive GitHub App wizard: `patchproof setup --app` drives the official App Manifest flow, exchanges the one-time callback code for App credentials, writes a 0600 env file, and detects the installation automatically, turning a fifteen minute documented procedure into two clicks.

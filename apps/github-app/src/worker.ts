@@ -330,6 +330,13 @@ export class PatchProofWorker {
   private reaperCursor: QueueCleanupCursor | undefined;
   private lastPruneAt = 0;
   private runOnceTail: Promise<void> = Promise.resolve();
+  private metricsCounters: Record<WorkerRunResult['status'], number> = {
+    idle: 0,
+    completed: 0,
+    retried: 0,
+    failed: 0,
+    cancelled: 0,
+  };
 
   public constructor(private readonly dependencies: PatchProofWorkerDependencies) {
     this.leaseMs = dependencies.leaseMs ?? 60_000;
@@ -1216,12 +1223,23 @@ export class PatchProofWorker {
       () => turn,
     );
     return previous.then(
-      () => this.runOnceExclusive().finally(release),
+      () =>
+        this.runOnceExclusive()
+          .then((result) => {
+            this.metricsCounters[result.status] += 1;
+            return result;
+          })
+          .finally(release),
       (error) => {
         release();
         throw error;
       },
     );
+  }
+
+  /** Frozen counters snapshot for operators; every runOnce outcome counts once. */
+  public metrics(): Readonly<Record<WorkerRunResult['status'], number>> {
+    return { ...this.metricsCounters };
   }
 
   public async runUntilIdle(): Promise<WorkerRunResult[]> {
