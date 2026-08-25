@@ -24,6 +24,7 @@ import { outcomeExitCode, renderMarkdownReport, renderTerminalReport } from '@pa
 import { hasOption, option, parseArgs, type ParsedArgs } from './args.js';
 import { writeEvidenceBundle } from './bundle.js';
 import { runSetup } from './setup.js';
+import { runSetupApp } from './setup-app.js';
 import { runDraft } from './draft.js';
 
 const execFileAsync = promisify(execFile);
@@ -47,6 +48,7 @@ Usage:
   patchproof replay <patchproof.evidence.json> [--yes] [--backend docker|local] [--base <dir> --head <dir>]
   patchproof doctor [--json]
   patchproof setup [--check | --demo] [--demo-dir <dir>] [--json]
+  patchproof setup --app [--env-file <path>] [--name <name>] [--no-open]   (GitHub App wizard)
   patchproof draft --diff <file-or-text> --issue <file-or-text> [--out <dir>] [--force]   (needs OPENAI_API_KEY)
 
 Setup options:
@@ -586,7 +588,7 @@ const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
   verify: ['json', 'help'],
   replay: ['yes', 'backend', 'base', 'head', 'allow-unsafe-local', 'json', 'help'],
   doctor: ['json', 'help'],
-  setup: ['check', 'demo', 'demo-dir', 'json', 'help'],
+  setup: ['check', 'demo', 'demo-dir', 'app', 'env-file', 'name', 'no-open', 'json', 'help'],
   draft: ['diff', 'issue', 'out', 'force', 'json', 'help'],
 });
 
@@ -618,7 +620,10 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     if (args.command === 'verify') return await verifyCommand(args);
     if (args.command === 'replay') return await replayCommand(args);
     if (args.command === 'doctor') return await doctorCommand(args);
-    if (args.command === 'setup') return await runSetup(args);
+    if (args.command === 'setup') {
+      if (hasOption(args, 'app')) return await runSetupApp(args);
+      return await runSetup(args);
+    }
     if (args.command === 'draft') return await runDraft(args);
     throw new Error(`Unknown command: ${args.command}`);
   } catch (error) {

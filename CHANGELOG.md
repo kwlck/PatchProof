@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0 - 2026-08-25
+
+- Added the interactive GitHub App wizard: `patchproof setup --app` drives the official App Manifest flow, exchanges the one-time callback code for App credentials, writes a 0600 env file, and detects the installation automatically, turning a fifteen minute documented procedure into two clicks.
+
 ## 0.2.0 - 2026-08-25
 
 - Added the optional `patchproof draft` command: given a fix diff and a bug report, an OpenAI model drafts a `.patchproof.yml` and scenario file, which are validated before use. Strictly bring your own key through `OPENAI_API_KEY`; without it the command only explains the manual path and nothing is sent anywhere.

@@ -12,3 +12,4 @@ import './app-validation-workflow.test.ts';
 import './setup.test.ts';
 import './draft.test.ts';
 import './install-scripts.test.ts';
+import './setup-app.test.ts';
