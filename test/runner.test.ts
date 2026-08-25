@@ -543,7 +543,9 @@ test('git revisions materialize as worktrees and clean up after themselves', asy
   const execGit = (args: string[], cwd = root) =>
     new Promise<void>((resolveGit, rejectGit) => {
       const { execFile } = require('node:child_process') as typeof import('node:child_process');
-      execFile('git', args, { cwd, windowsHide: true }, (error) => (error ? rejectGit(error) : resolveGit()));
+      execFile('git', args, { cwd, windowsHide: true }, (error) =>
+        error ? rejectGit(error) : resolveGit(),
+      );
     });
   try {
     await execGit(['init']);

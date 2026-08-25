@@ -123,7 +123,9 @@ async function initCommand(args: ParsedArgs): Promise<number> {
   await writeFile(join(root, 'head', 'scenario.mjs'), scenario, 'utf8');
   console.log(`Scaffolded ${root}`);
   console.log('Next steps:');
-  console.log('  1. Copy your project (with the bug) into base/, and the fixed version into head/.');
+  console.log(
+    '  1. Copy your project (with the bug) into base/, and the fixed version into head/.',
+  );
   console.log('     Keep the scenario.mjs in both folders and edit it to reproduce the bug.');
   console.log(`  2. patchproof validate ${join(root, '.patchproof.yml')}`);
   console.log(
@@ -213,20 +215,20 @@ async function runCommand(args: ParsedArgs): Promise<number> {
       ? await Promise.all([sourceIdentity(basePath, 'base'), sourceIdentity(headPath, 'head')])
       : undefined;
     const output = option(args, 'output');
-  const built = await writeEvidenceBundle({
-    outputPath: typeof output === 'string' ? output : resolve('work', 'patchproof-run'),
-    configResult: result,
-    config: result.config,
-    run,
-    backend,
-    fork: hasOption(args, 'fork'),
-    ...(deniedSources === undefined
-      ? {}
-      : {
-          baseSource: { revision: 'base' as const, ...deniedSources[0], location: basePath },
-          headSource: { revision: 'head' as const, ...deniedSources[1], location: headPath },
-        }),
-  });
+    const built = await writeEvidenceBundle({
+      outputPath: typeof output === 'string' ? output : resolve('work', 'patchproof-run'),
+      configResult: result,
+      config: result.config,
+      run,
+      backend,
+      fork: hasOption(args, 'fork'),
+      ...(deniedSources === undefined
+        ? {}
+        : {
+            baseSource: { revision: 'base' as const, ...deniedSources[0], location: basePath },
+            headSource: { revision: 'head' as const, ...deniedSources[1], location: headPath },
+          }),
+    });
     if (hasOption(args, 'json'))
       jsonOutput({
         ok: true,
