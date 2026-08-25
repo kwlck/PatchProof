@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <img src="docs/brand/patchproof-mark.svg" alt="PatchProof wordmark" width="720">
 
@@ -18,7 +18,7 @@ One trusted reproduction. Two exact revisions. One evidence bundle.
 | :--------------: | :-----------: | :---------------: |
 | Expected failure |     Pass      | Verified evidence |
 
-[Quickstart](#five-minute-local-quickstart) В· [Evidence](#evidence-at-a-glance) В· [Architecture](#how-the-product-is-split) В· [Security](#security-model) В· [Docs](#documentation) В· [Roadmap](#roadmap)
+[Install](#one-command-install) В· [Evidence](#evidence-at-a-glance) В· [Architecture](#how-the-product-is-split) В· [Security](#security-model) В· [Docs](#documentation) В· [Roadmap](#roadmap)
 
 </div>
 
@@ -52,21 +52,9 @@ patchproof setup --demo
 
 That single command runs a self-contained bug scenario against two revisions, writes the evidence bundle, verifies it, and prints next steps in about 30 seconds. Production runs use Docker; install it from [Docker Desktop](https://www.docker.com/products/docker-desktop/) whenever you are ready. Installers resolve the latest GitHub Release, so create a release first or pin `PATCHPROOF_VERSION=<tag>`.
 
-## Five-minute local quickstart
+## Run from source
 
-Requirements are Node.js 22 or newer and pnpm 11.16.0. Docker is the production backend. The run below uses a checked-in development configuration that opts into the local process backend so it works without Docker; the pull-request fixture itself still declares Docker.
-
-```text
-pnpm install --frozen-lockfile
-pnpm build
-pnpm patchproof -- --help
-pnpm patchproof validate fixtures/pass/.patchproof.yml
-pnpm patchproof run fixtures/pass/local.patchproof.yml --base fixtures/pass/base --head fixtures/pass/head --backend local --allow-unsafe-local --output work/pass
-pnpm patchproof verify work/pass/patchproof.evidence.json
-pnpm patchproof replay work/pass/patchproof.evidence.json
-```
-
-The final `replay` step prints the replay plan and exits without executing; add `--yes --base <dir> --head <dir>` to actually re-run the scenario. `pnpm test:e2e` runs the fixture sequence, tamper check, replay plan, and outcome matrix.
+Contributors and anyone evaluating against a checkout run PatchProof from source with pnpm. The step-by-step sequence lives in [docs/quickstart.md](docs/quickstart.md), and the day-to-day development workflow, including every required check, lives in [CONTRIBUTING.md](CONTRIBUTING.md). Users should prefer the one-command install above.
 
 ## Real terminal output
 
