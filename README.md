@@ -309,6 +309,7 @@ See [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) 
 ## Roadmap
 
 - [x] Add optional signed evidence envelopes with explicit signer identity semantics.
+- [ ] Ship a desktop `.exe` application: bundled CLI plus one window for scenarios, runs, and evidence, so installation is a double click.
 - [ ] Add a remote evidence store with retention controls.
 - [ ] Add installation health reporting and a small historical run index.
 
