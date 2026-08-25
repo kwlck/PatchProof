@@ -1841,3 +1841,33 @@ test('delivery claims keep active locks and take over stale ones', async () => {
   const completed = await store.claimDelivery('delivery-clock', 60_000);
   assert.equal(completed, 'completed');
 });
+
+test('an abandoned attempt is reclaimed after lease expiry and still completes', async () => {
+  let now = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const queue = new SqliteQueue(':memory:', () => new Date(now));
+  await queue.enqueue({
+    repository: 'octo/example',
+    pullRequest: 7,
+    baseSha,
+    headSha,
+    reason: 'pull_request',
+  });
+  const killed = await queue.claim('worker-killed', 60_000);
+  assert.ok(killed);
+  assert.equal(killed.status, 'running');
+  assert.equal(await queue.claim('worker-b', 60_000), undefined);
+  now += 120_000;
+  const reclaimed = await queue.claim('worker-b', 60_000);
+  assert.ok(reclaimed);
+  assert.equal(reclaimed.attempts, 2);
+  const done = await queue.complete(
+    reclaimed.id,
+    { owner: reclaimed.leaseOwner as string, generation: reclaimed.leaseGeneration },
+    { evidencePath: 'work/chaos/evidence.json', outcome: 'PASS' },
+  );
+  assert.ok(done);
+  const listed = await queue.list();
+  assert.equal(listed[0]?.status, 'succeeded');
+  assert.equal(listed[0]?.attempts, 2);
+  queue.close();
+});
