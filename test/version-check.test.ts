@@ -8,6 +8,7 @@ const script = resolve(process.cwd(), 'scripts/version-check.mjs');
 const manifestVersion = (
   JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8')) as { version: string }
 ).version;
+const escapedManifestVersion = manifestVersion.replaceAll('\\', '\\\\').replaceAll('.', '\\.');
 
 function runVersionCheck(...arguments_: string[]): ReturnType<typeof spawnSync> {
   return spawnSync(process.execPath, [script, ...arguments_], {
@@ -59,16 +60,13 @@ test('version check matches exact changelog markers and rejects hostile versions
   }
   const tagResult = runVersionCheck('--version', manifestVersion, '--tag', `v${manifestVersion}`);
   assert.equal(tagResult.status, 0);
-  assert.match(
-    tagResult.stdout,
-    new RegExp(`tag: v${manifestVersion.replace(/\./gu, '\\.')}`, 'u'),
-  );
+  assert.match(tagResult.stdout, new RegExp(`tag: v${escapedManifestVersion}`, 'u'));
 });
 
 test('tagging rejects an unreleased changelog entry', () => {
   const changelogPath = resolve(process.cwd(), 'CHANGELOG.md');
   const original = readFileSync(changelogPath, 'utf8');
-  const escapedVersion = manifestVersion.replaceAll('\\', '\\\\').replaceAll('.', '\\.');
+  const escapedVersion = escapedManifestVersion;
   const unreleased = original.replace(
     new RegExp(`##[ \\t]+${escapedVersion}[ \\t]+-[ \\t]+\\d{4}-\\d{2}-\\d{2}`, 'u'),
     `## ${manifestVersion} - unreleased`,
