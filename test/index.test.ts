@@ -15,3 +15,4 @@ import './install-scripts.test.ts';
 import './setup-app.test.ts';
 import './server.test.ts';
 import './explain.test.ts';
+import './signature.test.ts';

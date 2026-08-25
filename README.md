@@ -191,7 +191,7 @@ See [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) 
 
 ## Roadmap
 
-- [ ] Add optional signed evidence envelopes with explicit signer identity semantics.
+- [x] Add optional signed evidence envelopes with explicit signer identity semantics.
 - [ ] Add a remote evidence store with retention controls.
 - [ ] Add installation health reporting and a small historical run index.
 

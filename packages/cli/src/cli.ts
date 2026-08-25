@@ -11,6 +11,8 @@ import {
   PatternWorkerCrashedError,
   verifyEvidenceBundle,
   type EvidenceBundle,
+  signEvidenceFile,
+  verifyEvidenceSignature,
 } from '@patchproof/core';
 import {
   ConfigValidationError,
@@ -52,6 +54,8 @@ Usage:
   patchproof setup --app [--env-file <path>] [--name <name>] [--no-open]   (GitHub App wizard)
   patchproof draft --diff <file-or-text> --issue <file-or-text> [--out <dir>] [--force]   (needs OPENAI_API_KEY)
   patchproof explain <patchproof.evidence.json> [--json]   (needs OPENAI_API_KEY)
+  patchproof sign <patchproof.evidence.json> --key <private.pem> [--out <sig>]
+  patchproof verify <patchproof.evidence.json> [--signature <sig> --key <public.pem>]
 
 Setup options:
   --check                   Report the environment without running the demo
@@ -196,12 +200,48 @@ async function verifyCommand(args: ParsedArgs): Promise<number> {
   const bundlePath = args.positional[0];
   if (bundlePath === undefined) throw new Error('verify requires an evidence bundle path');
   const result = await verifyEvidenceBundle(bundlePath);
-  if (hasOption(args, 'json')) jsonOutput(result);
-  else
+  const signaturePath = option(args, 'signature');
+  const keyPath = option(args, 'key');
+  let signature: { valid: boolean; errors: string[] } | undefined;
+  if (typeof signaturePath === 'string' || typeof keyPath === 'string') {
+    if (typeof signaturePath !== 'string' || typeof keyPath !== 'string')
+      throw new Error(
+        'Signature verification requires both --signature <file> and --key <public.pem>',
+      );
+    const publicKey = await readFile(keyPath, 'utf8');
+    signature = await verifyEvidenceSignature(bundlePath, signaturePath, publicKey);
+    result.errors.push(...signature.errors);
+    if (!signature.valid) result.valid = false;
+  }
+  if (hasOption(args, 'json'))
+    jsonOutput({ ...result, ...(signature === undefined ? {} : { signature }) });
+  else {
     console.log(
       `${result.valid ? 'VALID' : 'INVALID'} evidence bundle\n${result.errors.map((error) => `- ${error}`).join('\n')}`,
     );
+    if (signature !== undefined && signature.valid) console.log('Signature: VALID');
+  }
   return result.valid ? 0 : 2;
+}
+
+export async function runSign(args: ParsedArgs, privateKeyOverride?: string): Promise<number> {
+  const bundlePath = args.positional[0];
+  const keyPath = option(args, 'key');
+  if (bundlePath === undefined || typeof keyPath !== 'string')
+    throw new Error('sign requires an evidence bundle path and --key <private.pem>');
+  const privateKey = privateKeyOverride ?? (await readFile(keyPath, 'utf8'));
+  const outOption = option(args, 'out');
+  const envelope = await signEvidenceFile(
+    bundlePath,
+    privateKey,
+    typeof outOption === 'string' ? outOption : undefined,
+  );
+  if (hasOption(args, 'json')) jsonOutput({ ok: true, ...envelope });
+  else
+    console.log(
+      `Signed ${bundlePath}\nAlgorithm: ${envelope.algorithm}\nKey fingerprint: ${envelope.keyFingerprint}`,
+    );
+  return 0;
 }
 
 function configFromEvidence(bundle: EvidenceBundle): PatchProofConfig {
@@ -629,6 +669,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     }
     if (args.command === 'draft') return await runDraft(args);
     if (args.command === 'explain') return await runExplain(args);
+    if (args.command === 'sign') return await runSign(args);
     throw new Error(`Unknown command: ${args.command}`);
   } catch (error) {
     return printError(error, hasOption(args, 'json'));

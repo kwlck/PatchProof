@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.0 - 2026-08-25
+
+- Added signed evidence envelopes: `patchproof sign` signs the exact bundle bytes with an RSA key and writes a bounded envelope carrying the canonical key fingerprint, and `patchproof verify --signature --key` checks both the envelope and the fingerprint. This closes the first roadmap item with explicit semantics: a signature identifies the publisher of these bytes, nothing more.
+
 ## 0.7.0 - 2026-08-25
 
 - Added a lease takeover chaos test: an attempt abandoned by a killed worker is reclaimed after the lease expires and still completes with an accurate attempt count.

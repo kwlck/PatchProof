@@ -4,3 +4,4 @@ export * from './redaction.js';
 export * from './regex-guard.js';
 export * from './policy.js';
 export * from './evidence.js';
+export * from './signature.js';
