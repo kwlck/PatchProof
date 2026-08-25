@@ -68,7 +68,7 @@ test('version check matches exact changelog markers and rejects hostile versions
 test('tagging rejects an unreleased changelog entry', () => {
   const changelogPath = resolve(process.cwd(), 'CHANGELOG.md');
   const original = readFileSync(changelogPath, 'utf8');
-  const escapedVersion = manifestVersion.replace(/\./gu, '\\.');
+  const escapedVersion = manifestVersion.replaceAll('\\', '\\\\').replaceAll('.', '\\.');
   const unreleased = original.replace(
     new RegExp(`##[ \\t]+${escapedVersion}[ \\t]+-[ \\t]+\\d{4}-\\d{2}-\\d{2}`, 'u'),
     `## ${manifestVersion} - unreleased`,

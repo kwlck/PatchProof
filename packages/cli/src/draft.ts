@@ -49,8 +49,17 @@ export function buildDraftPrompt(
 
 /** Extracts the drafted files from a model response that may wrap them in prose or fences. */
 export function parseDraftResponse(text: string): { config: string; scenario: string } | undefined {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/u);
-  const candidates = [fenced?.[1], text].filter((item): item is string => item !== undefined);
+  const candidates: string[] = [text];
+  // Fence extraction by index scans only: a regex over uncontrolled model
+  // output can backtrack polynomially on adversarial repetition.
+  const opener = text.indexOf('```');
+  if (opener >= 0) {
+    const lineEnd = text.indexOf('\n', opener + 3);
+    if (lineEnd > opener + 3) {
+      const closer = text.indexOf('```', lineEnd + 1);
+      if (closer > lineEnd + 1) candidates.unshift(text.slice(lineEnd + 1, closer));
+    }
+  }
   for (const candidate of candidates) {
     const start = candidate.indexOf('{');
     const end = candidate.lastIndexOf('}');
