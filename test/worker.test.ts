@@ -1667,3 +1667,68 @@ test('worker operator limits fail closed above hard maxima', () => {
   });
   assert.equal(within.maxMemoryMb, 4096);
 });
+
+test('worker metrics count every outcome exactly once', async () => {
+  const queue = new SqliteQueue(':memory:');
+  await queue.enqueue({
+    repository: 'octo/example',
+    pullRequest: 7,
+    baseSha,
+    headSha,
+    reason: 'pull_request',
+  });
+  const store = new MemoryStateStore();
+  const github = {
+    async getPullRequest() {
+      return {
+        number: 7,
+        baseSha,
+        headSha,
+        headRepository: 'octo/example',
+        fork: false,
+        state: 'open' as const,
+      };
+    },
+    async createCheck() {
+      return { id: 1 };
+    },
+    async updateCheck() {},
+    async createComment() {
+      return { id: 2, body: 'managed' };
+    },
+    async updateComment() {},
+  };
+  const outputRoot = await mkdtemp(join(process.cwd(), 'work', 'worker-metrics-'));
+  try {
+    const worker = new PatchProofWorker({
+      queue,
+      source: new FixtureSourceAdapter(),
+      store,
+      github,
+      outputRoot,
+      workerId: 'worker-metrics',
+      backendOverride: 'local',
+      allowUnsafeLocal: true,
+      executeScenario: async (input: WorkerRunInput) =>
+        runTwoRevisions({
+          config: input.configResult.config,
+          basePath: input.basePath,
+          headPath: input.headPath,
+          backendOverride: 'local',
+          allowUnsafeLocal: true,
+          trustedConfig: true,
+        }),
+    });
+    const completed = await worker.runOnce();
+    assert.equal(completed.status, 'completed');
+    const idle = await worker.runOnce();
+    assert.equal(idle.status, 'idle');
+    const metrics = worker.metrics();
+    assert.equal(metrics.completed, 1);
+    assert.equal(metrics.idle, 1);
+    assert.equal(metrics.retried, 0);
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+    queue.close();
+  }
+});

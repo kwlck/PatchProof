@@ -31,10 +31,19 @@ function firstHeader(value: string | string[] | undefined): string | undefined {
 }
 
 export function createWebhookServer(dependencies: WebhookDependencies) {
+  const startedAt = Date.now();
   const handleRequest = async (
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> => {
+    // Liveness probe for orchestrators: no internals, no store access.
+    if (request.method === 'GET' && request.url === '/healthz') {
+      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      response.end(
+        JSON.stringify({ ok: true, uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000) }),
+      );
+      return;
+    }
     if (request.method !== 'POST' || request.url !== '/webhooks/github') {
       response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       response.end('not found');

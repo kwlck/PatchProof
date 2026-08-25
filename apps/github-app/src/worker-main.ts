@@ -65,9 +65,18 @@ if (credentials === undefined) {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  const metricsRaw = Number(process.env.PATCHPROOF_METRICS_INTERVAL_MS ?? 0);
+  let metricsTimer: ReturnType<typeof setInterval> | undefined;
+  if (Number.isSafeInteger(metricsRaw) && metricsRaw >= 10_000) {
+    metricsTimer = setInterval(() => {
+      console.log(JSON.stringify({ workerMetrics: worker.metrics() }));
+    }, metricsRaw);
+    metricsTimer.unref();
+  }
   try {
     await worker.runForever();
   } finally {
+    if (metricsTimer !== undefined) clearInterval(metricsTimer);
     queue.close();
     store.close();
   }
