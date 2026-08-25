@@ -24,6 +24,7 @@ import { outcomeExitCode, renderMarkdownReport, renderTerminalReport } from '@pa
 import { hasOption, option, parseArgs, type ParsedArgs } from './args.js';
 import { writeEvidenceBundle } from './bundle.js';
 import { runSetup } from './setup.js';
+import { runDraft } from './draft.js';
 
 const execFileAsync = promisify(execFile);
 const DOCTOR_TIMEOUT_MS = 5_000;
@@ -46,6 +47,7 @@ Usage:
   patchproof replay <patchproof.evidence.json> [--yes] [--backend docker|local] [--base <dir> --head <dir>]
   patchproof doctor [--json]
   patchproof setup [--check | --demo] [--demo-dir <dir>] [--json]
+  patchproof draft --diff <file-or-text> --issue <file-or-text> [--out <dir>] [--force]   (needs OPENAI_API_KEY)
 
 Setup options:
   --check                   Report the environment without running the demo
@@ -585,6 +587,7 @@ const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
   replay: ['yes', 'backend', 'base', 'head', 'allow-unsafe-local', 'json', 'help'],
   doctor: ['json', 'help'],
   setup: ['check', 'demo', 'demo-dir', 'json', 'help'],
+  draft: ['diff', 'issue', 'out', 'force', 'json', 'help'],
 });
 
 function assertKnownOptions(args: ParsedArgs): void {
@@ -616,6 +619,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     if (args.command === 'replay') return await replayCommand(args);
     if (args.command === 'doctor') return await doctorCommand(args);
     if (args.command === 'setup') return await runSetup(args);
+    if (args.command === 'draft') return await runDraft(args);
     throw new Error(`Unknown command: ${args.command}`);
   } catch (error) {
     return printError(error, hasOption(args, 'json'));
