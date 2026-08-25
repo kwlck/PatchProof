@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0 - 2026-08-25
+
+- Added git backed sources: `--base git:HEAD --head .` materializes revisions through detached worktrees, so checking an uncommitted fix in any repository is one command with zero folder juggling. Any ref works (`git:main`, `git:<sha>`, `git:HEAD~1`), scratch worktrees are cleaned up on success and failure, and `--git-repo` selects the repository.
+- `patchproof init` now scaffolds the full skeleton for non git projects: `base/` and `head/` folders plus a ready to edit scenario in both.
+- Rewrote the README usage guide around the two paths (git repository and scaffold) with a plain words verdict table and a tighter command cheat sheet.
+
 ## 0.8.1 - 2026-08-25
 
 - Both installers now offer a confirmed Docker install when the daemon is missing: winget on Windows, apt, dnf, pacman, or Homebrew elsewhere. The prompt is skipped in non-interactive shells, which only get the manual guide link.

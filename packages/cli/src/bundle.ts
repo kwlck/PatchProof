@@ -322,7 +322,7 @@ export async function writeEvidenceBundle(
     );
   const withoutIntegrity: Omit<EvidenceBundle, 'integrity'> = {
     schemaVersion: 1,
-    product: { name: 'PatchProof', version: '0.8.1' },
+    product: { name: 'PatchProof', version: '0.9.0' },
     bundleId: randomUUID(),
     createdAt: new Date().toISOString(),
     outcome: classification.outcome,

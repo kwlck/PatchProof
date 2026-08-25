@@ -3,7 +3,7 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
-import { dirname, extname, resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   classifyOutcomeGuarded,
@@ -21,7 +21,15 @@ import {
   loadTrustedConfig,
   type PatchProofConfig,
 } from '@patchproof/config';
-import { isPolicyDeniedRun, runTwoRevisions, sourceIdentity } from '@patchproof/runner';
+import {
+  exportGitRevision,
+  gitRefOf,
+  isGitRef,
+  isPolicyDeniedRun,
+  runTwoRevisions,
+  sourceIdentity,
+  type GitRevision,
+} from '@patchproof/runner';
 import { outcomeExitCode, renderMarkdownReport, renderTerminalReport } from '@patchproof/report';
 import { hasOption, option, parseArgs, type ParsedArgs } from './args.js';
 import { writeEvidenceBundle } from './bundle.js';
@@ -46,7 +54,8 @@ Quick start: patchproof setup --demo proves the full pipeline in about 30 second
 Usage:
   patchproof init [directory]
   patchproof validate <.patchproof.yml> [--json]
-  patchproof run <.patchproof.yml> --base <dir> --head <dir> [options]
+  patchproof run <.patchproof.yml> --base <dir|git:ref> --head <dir|git:ref> [options]
+    git refs: --base git:HEAD~1 --head .   (check uncommitted work against last commit)
   patchproof verify <patchproof.evidence.json> [--json]
   patchproof replay <patchproof.evidence.json> [--yes] [--backend docker|local] [--base <dir> --head <dir>]
   patchproof doctor [--json]
@@ -90,20 +99,39 @@ function printError(error: unknown, json: boolean): number {
 async function initCommand(args: ParsedArgs): Promise<number> {
   const root = resolve(args.positional[0] ?? process.cwd());
   await mkdir(root, { recursive: true });
-  const target = resolve(root, '.patchproof.yml');
+  await mkdir(join(root, 'base'), { recursive: true });
+  await mkdir(join(root, 'head'), { recursive: true });
+  const target = join(root, '.patchproof.yml');
   if (existsSync(target)) throw new Error(`${target} already exists; refusing to overwrite`);
   await writeFile(
     target,
     `version: 1\nname: Reproduction scenario\nscenario:\n  id: bug-reproduction\n  name: Reproduce the claimed bug\n  command: [node, scenario.mjs]\n  cwd: .\n  file: scenario.mjs\n  expectedFailure:\n    exitCode: 1\npolicy:\n  backend: docker\n  network: none\nredaction:\n  secrets: []\n`,
     'utf8',
   );
-  console.log(`Created ${target}`);
+  const scenario = [
+    '// Reproduce the bug here. This file must:',
+    '//   1. exit with code 1 when run against the BROKEN code (base/)',
+    '//   2. exit with code 0 when run against the FIXED code (head/)',
+    '// Put a copy of this file in both base/ and head/, and put your project',
+    '// files next to it in each folder.',
+    '',
+    "console.error('EXPECTED_BUG: replace this line with the real reproduction');",
+    'process.exit(1);',
+    '',
+  ].join('\n');
+  await writeFile(join(root, 'base', 'scenario.mjs'), scenario, 'utf8');
+  await writeFile(join(root, 'head', 'scenario.mjs'), scenario, 'utf8');
+  console.log(`Scaffolded ${root}`);
   console.log('Next steps:');
-  console.log('  1. Create the scenario file the config runs (scenario.mjs next to the config).');
-  console.log('     It must reproduce the claimed bug: on the unfixed base it exits with code 1.');
-  console.log(`  2. patchproof validate ${args.positional[0] ?? '.patchproof.yml'}`);
+  console.log('  1. Copy your project (with the bug) into base/, and the fixed version into head/.');
+  console.log('     Keep the scenario.mjs in both folders and edit it to reproduce the bug.');
+  console.log(`  2. patchproof validate ${join(root, '.patchproof.yml')}`);
   console.log(
-    `  3. patchproof run ${args.positional[0] ?? '.patchproof.yml'} --base <base-dir> --head <head-dir>`,
+    `  3. patchproof run ${join(root, '.patchproof.yml')} --base ${join(root, 'base')} --head ${join(root, 'head')}`,
+  );
+  console.log('  In a git repository you can skip the folders entirely:');
+  console.log(
+    `     patchproof run ${join(root, '.patchproof.yml')} --base git:HEAD --head . --git-repo <repo>`,
   );
   return 0;
 }
@@ -140,36 +168,51 @@ async function runCommand(args: ParsedArgs): Promise<number> {
   const base = option(args, 'base');
   const head = option(args, 'head');
   if (configPath === undefined || typeof base !== 'string' || typeof head !== 'string')
-    throw new Error('run requires config, --base <dir>, and --head <dir>');
+    throw new Error('run requires config, --base <dir|git:ref>, and --head <dir|git:ref>');
   const trustedBase = option(args, 'trusted-base');
   if (hasOption(args, 'fork') && typeof trustedBase !== 'string')
     throw new Error(
       'Fork runs require --trusted-base <dir>; head configuration is never trusted by default',
     );
-  const result =
-    typeof trustedBase === 'string'
-      ? await loadTrustedConfig(configPath, trustedBase)
-      : await loadConfig(configPath);
-  const backendValue = option(args, 'backend');
-  if (backendValue !== undefined && backendValue !== 'docker' && backendValue !== 'local')
-    throw new Error('--backend must be docker or local');
-  const backend =
-    backendValue === 'docker' || backendValue === 'local'
-      ? backendValue
-      : result.config.policy.backend;
-  const run = await runTwoRevisions({
-    config: result.config,
-    basePath: base,
-    headPath: head,
-    backendOverride: backend,
-    allowUnsafeLocal: hasOption(args, 'allow-unsafe-local'),
-    fork: hasOption(args, 'fork'),
-    trustedConfig: true,
-  });
-  const deniedSources = isPolicyDeniedRun(run)
-    ? await Promise.all([sourceIdentity(base, 'base'), sourceIdentity(head, 'head')])
+  // git: refs are materialized into scratch worktrees so checking a fix in a
+  // repository needs zero manual folder juggling: --base git:HEAD --head .
+  const gitRepoOption = option(args, 'git-repo');
+  const repoPath =
+    typeof gitRepoOption === 'string' && gitRepoOption !== ''
+      ? resolve(gitRepoOption)
+      : process.cwd();
+  const baseRevision = isGitRef(base)
+    ? await exportGitRevision(repoPath, gitRefOf(base))
     : undefined;
-  const output = option(args, 'output');
+  let headRevision: GitRevision | undefined;
+  try {
+    headRevision = isGitRef(head) ? await exportGitRevision(repoPath, gitRefOf(head)) : undefined;
+    const basePath = baseRevision?.path ?? base;
+    const headPath = headRevision?.path ?? head;
+    const result =
+      typeof trustedBase === 'string'
+        ? await loadTrustedConfig(configPath, trustedBase)
+        : await loadConfig(configPath);
+    const backendValue = option(args, 'backend');
+    if (backendValue !== undefined && backendValue !== 'docker' && backendValue !== 'local')
+      throw new Error('--backend must be docker or local');
+    const backend =
+      backendValue === 'docker' || backendValue === 'local'
+        ? backendValue
+        : result.config.policy.backend;
+    const run = await runTwoRevisions({
+      config: result.config,
+      basePath,
+      headPath,
+      backendOverride: backend,
+      allowUnsafeLocal: hasOption(args, 'allow-unsafe-local'),
+      fork: hasOption(args, 'fork'),
+      trustedConfig: true,
+    });
+    const deniedSources = isPolicyDeniedRun(run)
+      ? await Promise.all([sourceIdentity(basePath, 'base'), sourceIdentity(headPath, 'head')])
+      : undefined;
+    const output = option(args, 'output');
   const built = await writeEvidenceBundle({
     outputPath: typeof output === 'string' ? output : resolve('work', 'patchproof-run'),
     configResult: result,
@@ -180,20 +223,24 @@ async function runCommand(args: ParsedArgs): Promise<number> {
     ...(deniedSources === undefined
       ? {}
       : {
-          baseSource: { revision: 'base' as const, ...deniedSources[0], location: base },
-          headSource: { revision: 'head' as const, ...deniedSources[1], location: head },
+          baseSource: { revision: 'base' as const, ...deniedSources[0], location: basePath },
+          headSource: { revision: 'head' as const, ...deniedSources[1], location: headPath },
         }),
   });
-  if (hasOption(args, 'json'))
-    jsonOutput({
-      ok: true,
-      outcome: built.bundle.outcome,
-      bundlePath: built.bundlePath,
-      integrity: built.bundle.integrity.canonicalSha256,
-      report: renderMarkdownReport(built.bundle),
-    });
-  else console.log(`${renderTerminalReport(built.bundle)}\n\n${built.bundlePath}`);
-  return outcomeExitCode(built.bundle.outcome);
+    if (hasOption(args, 'json'))
+      jsonOutput({
+        ok: true,
+        outcome: built.bundle.outcome,
+        bundlePath: built.bundlePath,
+        integrity: built.bundle.integrity.canonicalSha256,
+        report: renderMarkdownReport(built.bundle),
+      });
+    else console.log(`${renderTerminalReport(built.bundle)}\n\n${built.bundlePath}`);
+    return outcomeExitCode(built.bundle.outcome);
+  } finally {
+    await headRevision?.cleanup();
+    await baseRevision?.cleanup();
+  }
 }
 
 async function verifyCommand(args: ParsedArgs): Promise<number> {
