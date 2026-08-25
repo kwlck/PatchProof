@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1 - 2026-08-25
+
+- patchproof init scaffolds the backend the machine can actually run: local with allowUnsafeLocal when Docker is absent, docker when it is present. An INFRA_ERROR on the docker backend now prints the exact local fallback flag.
+
 ## 0.9.0 - 2026-08-25
 
 - Added git backed sources: `--base git:HEAD --head .` materializes revisions through detached worktrees, so checking an uncommitted fix in any repository is one command with zero folder juggling. Any ref works (`git:main`, `git:<sha>`, `git:HEAD~1`), scratch worktrees are cleaned up on success and failure, and `--git-repo` selects the repository.

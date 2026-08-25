@@ -103,9 +103,27 @@ async function initCommand(args: ParsedArgs): Promise<number> {
   await mkdir(join(root, 'head'), { recursive: true });
   const target = join(root, '.patchproof.yml');
   if (existsSync(target)) throw new Error(`${target} already exists; refusing to overwrite`);
+  // Scaffold for the backend the machine can actually run: a fresh user
+  // without Docker must get a working local config, not an INFRA_ERROR.
+  let dockerReady = false;
+  try {
+    await execFileAsync('docker', ['version', '--format', '{{.Server.Version}}'], {
+      windowsHide: true,
+      timeout: 5_000,
+      shell: false,
+      maxBuffer: 64 * 1024,
+    });
+    dockerReady = true;
+  } catch {
+    dockerReady = false;
+  }
+  const policy =
+    dockerReady === true
+      ? `policy:\n  backend: docker\n  network: none\nredaction:\n  secrets: []\n`
+      : `# Docker was not detected, so this scaffold uses the development local\n# backend. Switch backend to docker for production isolation.\npolicy:\n  backend: local\n  allowUnsafeLocal: true\n  network: none\nredaction:\n  secrets: []\n`;
   await writeFile(
     target,
-    `version: 1\nname: Reproduction scenario\nscenario:\n  id: bug-reproduction\n  name: Reproduce the claimed bug\n  command: [node, scenario.mjs]\n  cwd: .\n  file: scenario.mjs\n  expectedFailure:\n    exitCode: 1\npolicy:\n  backend: docker\n  network: none\nredaction:\n  secrets: []\n`,
+    `version: 1\nname: Reproduction scenario\nscenario:\n  id: bug-reproduction\n  name: Reproduce the claimed bug\n  command: [node, scenario.mjs]\n  cwd: .\n  file: scenario.mjs\n  expectedFailure:\n    exitCode: 1\n${policy}`,
     'utf8',
   );
   const scenario = [
@@ -237,7 +255,14 @@ async function runCommand(args: ParsedArgs): Promise<number> {
         integrity: built.bundle.integrity.canonicalSha256,
         report: renderMarkdownReport(built.bundle),
       });
-    else console.log(`${renderTerminalReport(built.bundle)}\n\n${built.bundlePath}`);
+    else {
+      console.log(`${renderTerminalReport(built.bundle)}\n\n${built.bundlePath}`);
+      if (built.bundle.outcome === 'INFRA_ERROR' && backend === 'docker') {
+        console.log(
+          'Hint: Docker is unavailable or failed. For a quick local check add --backend local --allow-unsafe-local, or install Docker and retry.',
+        );
+      }
+    }
     return outcomeExitCode(built.bundle.outcome);
   } finally {
     await headRevision?.cleanup();
