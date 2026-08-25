@@ -1,14 +1,17 @@
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildDockerCommand,
   DockerBackend,
   applyOperatorPolicy,
+  exportGitRevision,
+  gitRefOf,
   hashKnownLockfile,
+  isGitRef,
   isPolicyDeniedRun,
   LocalProcessBackend,
   prepareDockerWorkspace,
@@ -533,4 +536,46 @@ test('local backend bounds only after streaming redaction', async () => {
   assert.equal(result.stdoutTruncated, true);
   assert.ok(Buffer.byteLength(result.stdout, 'utf8') <= 64);
   assert.ok(result.stdoutSizeBytes >= Buffer.byteLength(result.stdout, 'utf8'));
+});
+
+test('git revisions materialize as worktrees and clean up after themselves', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'patchproof-git-'));
+  const execGit = (args: string[], cwd = root) =>
+    new Promise<void>((resolveGit, rejectGit) => {
+      const { execFile } = require('node:child_process') as typeof import('node:child_process');
+      execFile('git', args, { cwd, windowsHide: true }, (error) =>
+        error ? rejectGit(error) : resolveGit(),
+      );
+    });
+  try {
+    await execGit(['init']);
+    await execGit(['config', 'user.email', 't@t']);
+    await execGit(['config', 'user.name', 't']);
+    await writeFile(join(root, 'lib.cjs'), 'module.exports = () => 1;', 'utf8');
+    await execGit(['add', '.']);
+    await execGit(['commit', '-m', 'base']);
+    await writeFile(join(root, 'lib.cjs'), 'module.exports = () => 42;', 'utf8');
+    await execGit(['add', '.']);
+    await execGit(['commit', '-m', 'fix']);
+
+    const baseRev = await exportGitRevision(root, 'HEAD~1');
+    const headRev = await exportGitRevision(root, 'HEAD');
+    const baseOut = await readFile(join(baseRev.path, 'lib.cjs'), 'utf8');
+    const headOut = await readFile(join(headRev.path, 'lib.cjs'), 'utf8');
+    assert.match(baseOut, /=> 1;/u);
+    assert.match(headOut, /=> 42;/u);
+    await baseRev.cleanup();
+    await headRev.cleanup();
+    await assert.rejects(readFile(join(baseRev.path, 'lib.cjs'), 'utf8'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('git ref parsing accepts only the git: prefix with a payload', () => {
+  assert.equal(isGitRef('git:HEAD~1'), true);
+  assert.equal(isGitRef('git:main'), true);
+  assert.equal(isGitRef('git:'), false);
+  assert.equal(isGitRef('base-dir'), false);
+  assert.equal(gitRefOf('git:HEAD~2'), 'HEAD~2');
 });

@@ -63,120 +63,86 @@ patchproof explain work/pass/patchproof.evidence.json # plain language outcome s
 
 ## How to use
 
-### The idea in plain words
+### The idea
 
-PatchProof answers one question: **does this fix actually fix the bug?** To answer it, it needs three things from you:
+PatchProof answers one question: **does this fix actually fix the bug?** It runs your reproduction script against the broken code (`base`) and the fixed code (`head`):
 
-| You provide    | What it is                                                                             | Example                             |
-| -------------- | -------------------------------------------------------------------------------------- | ----------------------------------- |
-| `base/`        | Your project **before** the fix. The bug is alive here.                                | Yesterday's checkout                |
-| `head/`        | Your project **after** the fix. The bug should be gone.                                | Today's checkout                    |
-| A **scenario** | A small script that reproduces the bug. It must **fail on base** and **pass on head**. | A test that crashes on the old code |
+- fails on base, passes on head → **PASS**, the fix works
+- fails on both, or passes on both → **FAIL**, the fix changes nothing
 
-PatchProof runs the same scenario in both folders and tells you the truth:
+### In a git repository: one command
 
-- Scenario fails on base and passes on head → **PASS** (the fix works, here is the evidence)
-- Scenario fails on both → **FAIL** (the fix does not fix anything)
-- Scenario passes on both → **FAIL** (there was no bug to begin with)
-
-### Step by step with a real example
-
-Say your bug is a `sum` function that assigns instead of adding. Create three files:
-
-`base/lib.cjs` (broken) and `head/lib.cjs` (fixed):
-
-```js
-function sum(numbers) {
-  let total = 0;
-  for (let i = 0; i < numbers.length; i++) {
-    total = numbers[i]; // base has the bug: "=" instead of "+="
-  }
-  return total;
-}
-module.exports = { sum };
-```
-
-`scenario.mjs` (put an identical copy in **both** `base/` and `head/`):
-
-```js
-import { createRequire } from 'node:module';
-const require = createRequire(import.meta.url);
-const { sum } = require('./lib.cjs');
-
-if (sum([1, 2, 3]) !== 6) {
-  console.error('EXPECTED_BUG: sum is wrong');
-  process.exit(1);
-}
-console.log('sum works');
-```
-
-`.patchproof.yml` next to the folders:
-
-```yaml
-version: 1
-name: Sum bug check
-scenario:
-  id: sum-bug
-  command: [node, scenario.mjs]
-  cwd: .
-  file: scenario.mjs
-  expectedFailure:
-    exitCode: 1
-    reasonPattern: EXPECTED_BUG
-policy:
-  backend: local
-  allowUnsafeLocal: true
-  network: none
-redaction:
-  secrets: []
-```
-
-Then run three commands:
+If your project is a git repo, there are no folders to create. PatchProof pulls both revisions from history itself:
 
 ```text
-patchproof validate .patchproof.yml
-patchproof run .patchproof.yml --base base --head head --allow-unsafe-local --output work/pass
-patchproof verify work/pass/patchproof.evidence.json
+patchproof init .
+# edit scenario.mjs so it reproduces your bug, then:
+patchproof run .patchproof.yml --base git:HEAD --head . --allow-unsafe-local
+```
+
+- `--base git:HEAD` - the last commit, where the bug is still alive
+- `--head .` - your working directory with the fix
+- `--allow-unsafe-local` - run without Docker on this machine (development only)
+
+Any ref works: `git:HEAD~1`, `git:main`, `git:<sha>`, `git:feature-branch`. To compare two commits:
+
+```text
+patchproof run .patchproof.yml --base git:main --head git:feature --allow-unsafe-local
 ```
 
 Expected result: `PatchProof PASS - The trusted scenario failed on base and passed on head.`
 
-### What every flag means
+### Without git: init scaffolds everything
 
-| Flag                          | Meaning                                                                                |
-| ----------------------------- | -------------------------------------------------------------------------------------- |
-| `--base base`                 | Folder with the **broken** code (before the fix)                                       |
-| `--head head`                 | Folder with the **fixed** code (after the fix)                                         |
-| `--allow-unsafe-local`        | Run without Docker on this machine. Development only; production always uses Docker    |
-| `--output work/pass`          | Folder for the evidence bundle                                                         |
-| `expectedFailure.exitCode: 1` | The scenario must exit 1 on base (that is the bug showing itself)                      |
-| `reasonPattern: EXPECTED_BUG` | The failure must print this marker, so PatchProof knows it failed for the right reason |
-| `backend: local`              | Run as a local process. Use `docker` for production isolation                          |
+```text
+patchproof init my-check
+```
 
-### Prove it is not canned
+creates the full skeleton - `base/`, `head/`, `scenario.mjs` in both, and `.patchproof.yml`:
 
-Change the code and watch the verdict follow:
+1. put the broken project into `base/`, the fixed one into `head/`
+2. edit `scenario.mjs` (same file in both folders) so it reproduces the bug
+3. `patchproof run my-check/.patchproof.yml --base my-check/base --head my-check/head --allow-unsafe-local`
 
-- Delete the fix (copy `base/lib.cjs` over `head/lib.cjs`) → rerun → **FAIL**
-- Swap the folders (`--base head --head base`) → rerun → **FAIL**, because the bug is now "after the fix"
-- Open `work/pass/patchproof.evidence.json` → your real stdout, stderr, timings, and hashes from both runs
+### Reading the result
+
+| Verdict                 | Meaning                                                      |
+| ----------------------- | ------------------------------------------------------------ |
+| `PASS`, exit 0          | scenario failed on base and passed on head; evidence written |
+| `FAIL`, exit 1          | the fix does not change the outcome                          |
+| `INCONCLUSIVE`, exit 2  | scenario could not produce a verdict                         |
+| `POLICY_DENIED`, exit 3 | run blocked by policy                                        |
+| `INFRA_ERROR`, exit 4   | infrastructure failed (docker missing, git error)            |
+
+The evidence bundle in `--output` contains your real stdout, stderr, timings, and hashes for both runs. `patchproof verify <bundle>` re-checks it without executing anything.
+
+### Flags that matter
+
+| Flag                    | Meaning                                                       |
+| ----------------------- | ------------------------------------------------------------- |
+| `--base <dir\|git:ref>` | Broken code: a folder or a git ref                            |
+| `--head <dir\|git:ref>` | Fixed code: a folder, `.`, or a git ref                       |
+| `--allow-unsafe-local`  | Run without Docker (development only)                         |
+| `--output <dir>`        | Where the evidence bundle lands                               |
+| `--git-repo <path>`     | Repository to read git refs from (default: current directory) |
+
+Config essentials: `scenario.command` runs your script; `expectedFailure.exitCode: 1` means base must fail; `reasonPattern: EXPECTED_BUG` proves it failed for the right reason. Full list in [docs/configuration-reference.md](docs/configuration-reference.md).
 
 ### Commands cheat sheet
 
-| Command                                          | Plain words                                     |
-| ------------------------------------------------ | ----------------------------------------------- |
-| `patchproof setup --check`                       | Is my machine ready?                            |
-| `patchproof setup --demo`                        | Prove the whole pipeline in 30 seconds          |
-| `patchproof setup --app`                         | Two click GitHub App setup wizard               |
-| `patchproof init <dir>`                          | Create a config template                        |
-| `patchproof validate <config>`                   | Is my config correct?                           |
-| `patchproof run <config> --base --head`          | Run the check                                   |
-| `patchproof verify <bundle>`                     | Is this evidence genuine?                       |
-| `patchproof replay <bundle> --yes --base --head` | Re-run the recorded scenario now                |
-| `patchproof draft --diff --issue`                | AI drafts a scenario (needs `OPENAI_API_KEY`)   |
-| `patchproof explain <bundle>`                    | AI explains an outcome (needs `OPENAI_API_KEY`) |
-
-Exit codes: `0` PASS, `1` FAIL, `2` inconclusive, `3` policy denied, `4` infrastructure error.
+| Command                                          | Plain words                                                |
+| ------------------------------------------------ | ---------------------------------------------------------- |
+| `patchproof setup --check`                       | Is my machine ready?                                       |
+| `patchproof setup --demo`                        | Prove the whole pipeline in 30 seconds                     |
+| `patchproof setup --app`                         | Two click GitHub App setup wizard                          |
+| `patchproof init <dir>`                          | Scaffold config, scenario, and base/head folders           |
+| `patchproof validate <config>`                   | Is my config correct?                                      |
+| `patchproof run <config> --base --head`          | Run the check                                              |
+| `patchproof verify <bundle>`                     | Is this evidence genuine? (`--signature --key` for signed) |
+| `patchproof replay <bundle> --yes --base --head` | Re-run the recorded scenario now                           |
+| `patchproof sign <bundle> --key <pem>`           | Sign the evidence with your key                            |
+| `patchproof draft --diff --issue`                | AI drafts a scenario (needs `OPENAI_API_KEY`)              |
+| `patchproof explain <bundle>`                    | AI explains an outcome (needs `OPENAI_API_KEY`)            |
 
 ## Run from source
 
