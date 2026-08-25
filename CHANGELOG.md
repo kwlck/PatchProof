@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1 - 2026-08-25
+
+- Both installers now offer a confirmed Docker install when the daemon is missing: winget on Windows, apt, dnf, pacman, or Homebrew elsewhere. The prompt is skipped in non-interactive shells, which only get the manual guide link.
+
 ## 0.8.0 - 2026-08-25
 
 - Added signed evidence envelopes: `patchproof sign` signs the exact bundle bytes with an RSA key and writes a bounded envelope carrying the canonical key fingerprint, and `patchproof verify --signature --key` checks both the envelope and the fingerprint. This closes the first roadmap item with explicit semantics: a signature identifies the publisher of these bytes, nothing more.
