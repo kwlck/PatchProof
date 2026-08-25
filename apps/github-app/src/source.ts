@@ -57,6 +57,9 @@ export class GitHubSourceAdapter implements SourceAdapter {
       }
     }
     if (!token || token.length > 16_384) throw new Error('GitHub source credential is invalid');
+    const authorization = `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString(
+      'base64',
+    )}`;
     await mkdir(root, { recursive: true, mode: 0o700 });
     const environment: NodeJS.ProcessEnv = {
       ...(process.env.PATH === undefined ? {} : { PATH: process.env.PATH }),
@@ -78,14 +81,7 @@ export class GitHubSourceAdapter implements SourceAdapter {
         // GitHub's Git transport authenticates installation tokens through the
         // basic scheme with the x-access-token user name, matching what the
         // official checkout action sends.
-        env: authenticated
-          ? {
-              ...environment,
-              GIT_AUTH_HEADER: `Authorization: Basic ${Buffer.from(
-                `x-access-token:${token}`,
-              ).toString('base64')}`,
-            }
-          : environment,
+        env: authenticated ? { ...environment, GIT_AUTH_HEADER: authorization } : environment,
         timeout: this.gitTimeoutMs,
         maxBuffer: 1_048_576,
         shell: false,
@@ -105,7 +101,13 @@ export class GitHubSourceAdapter implements SourceAdapter {
     } catch (error) {
       await rm(root, { recursive: true, force: true });
       const message = error instanceof Error ? error.message : 'GitHub source fetch failed';
-      throw new Error(message.replaceAll(token, '[credential omitted]'));
+      // Scrub both wire forms of the credential: the raw token and the basic
+      // header value a proxy or git error handler could echo.
+      throw new Error(
+        message
+          .replaceAll(authorization, '[credential omitted]')
+          .replaceAll(token, '[credential omitted]'),
+      );
     }
   }
 }

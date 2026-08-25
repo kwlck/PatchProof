@@ -73,6 +73,7 @@ export interface RunQueue {
     after: QueueCleanupCursor | undefined,
     limit: number,
   ): Promise<QueueCleanupCursor[]>;
+  pruneTerminalJobs?(retentionMs: number): Promise<number>;
   list(): Promise<QueueJob[]>;
   close(): void;
 }
@@ -190,6 +191,7 @@ export class SqliteQueue implements RunQueue {
   private readonly database: DatabaseSync;
   private readonly clock: () => Date;
   private readonly requireInstallationId: boolean;
+  private terminalPollCounter = 0;
 
   private withImmediateTransaction<T>(operation: (now: Date) => T): T {
     this.database.exec('BEGIN IMMEDIATE');
@@ -400,8 +402,12 @@ export class SqliteQueue implements RunQueue {
             `SELECT * FROM patchproof_jobs WHERE status = 'queued' ORDER BY created_at ASC, id ASC LIMIT 1`,
           )
           .get();
+        // Terminal failure notifications must not starve behind a busy queue:
+        // interleave them deterministically instead of only draining them when
+        // the queue happens to be empty.
+        this.terminalPollCounter = (this.terminalPollCounter + 1) % 4;
         const terminal =
-          row === undefined
+          row === undefined || this.terminalPollCounter === 0
             ? this.database
                 .prepare(
                   `SELECT * FROM patchproof_jobs
@@ -677,6 +683,21 @@ export class SqliteQueue implements RunQueue {
         return { createdAt: row.created_at, id: row.id };
       }),
     );
+  }
+
+  public pruneTerminalJobs(retentionMs: number): Promise<number> {
+    if (!Number.isSafeInteger(retentionMs) || retentionMs < 3_600_000)
+      return Promise.reject(new Error('Queue retention window is invalid'));
+    const cutoff = new Date(this.clock().getTime() - retentionMs).toISOString();
+    const result = this.database
+      .prepare(
+        `DELETE FROM patchproof_jobs
+         WHERE status IN ('succeeded', 'cancelled')
+           AND lease_owner IS NULL AND lease_expires_at IS NULL
+           AND updated_at < ?`,
+      )
+      .run(cutoff);
+    return Promise.resolve(result.changes);
   }
 
   public list(): Promise<QueueJob[]> {

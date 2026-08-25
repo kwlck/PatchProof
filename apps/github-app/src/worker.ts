@@ -74,6 +74,7 @@ const MAX_QUEUE_OWNER_LENGTH = 128;
 let warnedWindowsPermissions = false;
 
 const LEASE_LOST_ERROR = 'Queue job was cancelled or superseded before publication';
+const PRUNE_INTERVAL_MS = 3_600_000;
 
 interface OutputRootPaths {
   configuredRoot: string;
@@ -327,6 +328,7 @@ export class PatchProofWorker {
   private stopping = false;
   private activeFence: WorkerLeaseFence | undefined;
   private reaperCursor: QueueCleanupCursor | undefined;
+  private lastPruneAt = 0;
   private runOnceTail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly dependencies: PatchProofWorkerDependencies) {
@@ -865,7 +867,28 @@ export class PatchProofWorker {
     };
   }
 
+  private async pruneAtIdle(): Promise<void> {
+    // Retention runs at most once per hour and only while the worker is idle.
+    // Terminal rows and delivery history otherwise grow without bound on busy
+    // installations and slow every boot-time scan down linearly.
+    const now = Date.now();
+    if (now - this.lastPruneAt < PRUNE_INTERVAL_MS) return;
+    this.lastPruneAt = now;
+    const retention = 30 * 24 * 3_600_000;
+    try {
+      await this.dependencies.queue.pruneTerminalJobs?.(retention);
+    } catch {
+      return;
+    }
+    try {
+      await this.dependencies.store.prune?.(retention);
+    } catch {
+      // Retention is best effort; the next idle cycle retries.
+    }
+  }
+
   private async reaperAtIdle(): Promise<void> {
+    await this.pruneAtIdle();
     let candidates: QueueCleanupCursor[];
     try {
       candidates = await this.dependencies.queue.listTerminalCleanupCandidates(
@@ -1104,8 +1127,17 @@ export class PatchProofWorker {
         };
       const executionError = error instanceof WorkerExecutionError ? error : undefined;
       if (executionError?.evidencePath !== undefined) evidencePath = executionError.evidencePath;
-      const pathTokens = executionError?.pathTokens ??
-        attemptPaths?.pathTokens ?? [resolve(this.dependencies.outputRoot)];
+      // Prefer the attempt's own token set. When even that is unavailable,
+      // include both the configured and the realpath forms of the output root
+      // so a symlinked or relocated root cannot leak into public text.
+      let pathTokens = executionError?.pathTokens ?? attemptPaths?.pathTokens;
+      if (pathTokens === undefined) {
+        const fallbackRoot = await this.resolveOutputRoot(false).catch(() => undefined);
+        pathTokens = [
+          resolve(this.dependencies.outputRoot),
+          ...(fallbackRoot === undefined ? [] : [fallbackRoot.realRoot]),
+        ];
+      }
       const message =
         executionError?.message ?? sanitizeWorkerText(errorMessage(error), pathTokens);
       const retryable = retryableWorkerError(error);
@@ -1219,7 +1251,23 @@ export class PatchProofWorker {
 
   public async runForever(pollMs = 1_000): Promise<void> {
     while (!this.stopping) {
-      const result = await this.runOnce();
+      let result: WorkerRunResult;
+      try {
+        result = await this.runOnce();
+      } catch (error) {
+        // A queue or store fault must never kill the daemon. A transient
+        // SQLITE_BUSY or one corrupt row would otherwise become a permanent
+        // crash loop; log a bounded operator line and keep polling instead.
+        console.error(
+          `PatchProof worker iteration failed: ${
+            error instanceof Error
+              ? error.message.replaceAll(/[\r\n]+/gu, ' ').slice(0, 300)
+              : 'unknown error'
+          }`,
+        );
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, pollMs));
+        continue;
+      }
       if (result.status === 'idle')
         await new Promise((resolvePromise) => setTimeout(resolvePromise, pollMs));
     }

@@ -17,12 +17,24 @@ function clean(value: string): string {
     .join('');
 }
 
+const MANAGED_MARKERS = [
+  '<!-- patchproof:summary:start -->',
+  '<!-- patchproof:summary:end -->',
+] as const;
+
+function stripManagedMarkers(value: string): string {
+  return MANAGED_MARKERS.reduce(
+    (text, marker) => text.replaceAll(marker, '[managed marker omitted]'),
+    value,
+  );
+}
+
 function singleLine(value: string): string {
-  return clean(value).replaceAll(/\r?\n/gu, ' ');
+  return stripManagedMarkers(clean(value).replaceAll(/\r?\n/gu, ' '));
 }
 
 function code(value: string): string {
-  return clean(value).replaceAll('`', '\\x60');
+  return stripManagedMarkers(clean(value).replaceAll('`', '\\x60'));
 }
 
 function color(text: string, ansi: string, enabled: boolean): string {

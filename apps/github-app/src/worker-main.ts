@@ -54,9 +54,17 @@ if (credentials === undefined) {
     operatorPolicy,
     requireFreshSnapshot: true,
   });
-  const shutdown = (): void => worker.stop();
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  let shutdownRequested = false;
+  const shutdown = (): void => {
+    worker.stop();
+    if (shutdownRequested) process.exit(1);
+    shutdownRequested = true;
+    // Bounded grace: the lease fence covers a killed attempt, so exiting on
+    // our own beats letting an orchestrator SIGKILL us mid-close.
+    setTimeout(() => process.exit(1), 30_000).unref();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
   try {
     await worker.runForever();
   } finally {

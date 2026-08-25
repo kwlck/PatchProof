@@ -62,8 +62,14 @@ export function createWebhookServer(dependencies: WebhookDependencies) {
           ? error.message.replaceAll(/[\r\n]+/gu, ' ').slice(0, 512)
           : 'unknown error',
       );
-      response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-      response.end(JSON.stringify({ message: 'webhook handling failed' }));
+      // The request may already be destroyed (oversize body, client abort);
+      // writing to that socket throws asynchronously, so absorb response
+      // errors instead of letting them escape as unhandled events.
+      response.on('error', () => undefined);
+      if (!response.destroyed) {
+        response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ message: 'webhook handling failed' }));
+      }
     }
   };
   return createServer((request: IncomingMessage, response: ServerResponse) => {

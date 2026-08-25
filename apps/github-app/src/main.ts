@@ -10,7 +10,13 @@ import {
   type GitHubAppCredentials,
 } from './github-auth.js';
 
-const port = Number(process.env.PORT ?? 3000);
+const portRaw = process.env.PORT ?? '3000';
+const port = Number(portRaw);
+const portValid = /^[1-9][0-9]*$/u.test(portRaw) && Number.isSafeInteger(port) && port <= 65535;
+if (!portValid) {
+  console.error('PORT must be an integer between 1 and 65535');
+  process.exitCode = 1;
+}
 const secret = process.env.PATCHPROOF_WEBHOOK_SECRET;
 let credentials: GitHubAppCredentials | undefined;
 try {
@@ -28,6 +34,8 @@ if (secret === undefined || secret.length < 16 || credentials === undefined) {
     'PATCHPROOF_WEBHOOK_SECRET, PATCHPROOF_GITHUB_APP_ID, and PATCHPROOF_GITHUB_APP_PRIVATE_KEY must be set before starting the app',
   );
   process.exitCode = 1;
+} else if (!portValid) {
+  // The PORT diagnostic above already reported the failure.
 } else {
   const sqlitePath = resolve(process.env.PATCHPROOF_SQLITE_PATH ?? 'work/github-app.sqlite');
   await mkdir(dirname(sqlitePath), { recursive: true, mode: 0o700 });
@@ -46,12 +54,16 @@ if (secret === undefined || secret.length < 16 || credentials === undefined) {
     requireInstallationId: true,
   });
   server.listen(port, () => console.log(`PatchProof GitHub App listening on ${port}`));
+  let shutdownRequested = false;
   const shutdown = (): void => {
+    if (shutdownRequested) process.exit(1);
+    shutdownRequested = true;
     server.close(() => {
       queue.close();
       store.close();
     });
+    setTimeout(() => process.exit(1), 10_000).unref();
   };
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }

@@ -147,6 +147,8 @@ export interface ManagedStateStore {
   claimDelivery?(deliveryId: string, staleAfterMs?: number): Promise<DeliveryClaim>;
   completeDelivery?(deliveryId: string): Promise<void>;
   releaseDelivery?(deliveryId: string, error?: string): Promise<void>;
+  /** Optional retention pruning of completed deliveries and expired claims. */
+  prune?(retentionMs: number): Promise<number>;
   /** Optional durable per-surface lock for concurrent delivery/publisher reconciliation. */
   claimSurface?(repository: string, pullRequest: number, headSha: string): Promise<boolean>;
   releaseSurface?(repository: string, pullRequest: number, headSha: string): Promise<void>;

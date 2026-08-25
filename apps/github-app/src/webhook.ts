@@ -384,8 +384,51 @@ export async function handleWebhook(
   if (request.event === 'pull_request') {
     const action = stringValue(object.action);
     const pr = extractPullRequest(object);
-    if (pr === undefined)
-      return markIgnored(dependencies.store, request.deliveryId, 'event ignored');
+    if (pr === undefined) {
+      if (action !== 'closed')
+        return markIgnored(dependencies.store, request.deliveryId, 'event ignored');
+      // A fork deleted before closure arrives without head metadata. The
+      // queue fence and the stored surfaces are still keyed by repository
+      // and pull request number, so close them out instead of ignoring the
+      // event and leaving a queued Check behind forever.
+      const repository = extractRepository(object);
+      const pullRequest = numberValue(object.number);
+      const installationId = extractInstallationId(object);
+      if (repository === undefined || pullRequest === undefined)
+        return markIgnored(dependencies.store, request.deliveryId, 'event ignored');
+      if (installationRequired && installationId === undefined)
+        return markIgnored(
+          dependencies.store,
+          request.deliveryId,
+          'installation identity unavailable',
+        );
+      try {
+        if (dependencies.cancelPullRequest !== undefined)
+          await dependencies.cancelPullRequest(
+            repository,
+            pullRequest,
+            'Pull request closed before PatchProof execution',
+          );
+        const state = await dependencies.store.getRun(
+          repository,
+          pullRequest,
+          undefined,
+          dependencies.github.appId,
+        );
+        if (state?.checkId !== undefined)
+          await dependencies.github.updateCheck(
+            repository,
+            state.checkId,
+            buildCancelledCheckPayload(),
+            installationId === undefined ? undefined : { installationId },
+          );
+      } catch (error) {
+        await failDelivery(error instanceof Error ? error.message : undefined);
+        throw error;
+      }
+      await completeDelivery(dependencies.store, request.deliveryId);
+      return { status: 200, body: 'run cancelled', enqueued: false };
+    }
     if (installationRequired && pr.installationId === undefined)
       return markIgnored(
         dependencies.store,

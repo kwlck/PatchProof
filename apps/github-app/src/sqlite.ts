@@ -391,8 +391,13 @@ export class SqliteStateStore implements ManagedStateStore {
           .prepare('SELECT status, claimed_at FROM deliveries WHERE delivery_id = ?')
           .get(deliveryId);
         if (row !== undefined && row.status === 'completed') return 'completed';
-        const claimedAt = typeof row?.claimed_at === 'string' ? Date.parse(row.claimed_at) : NaN;
-        const active = Number.isFinite(claimedAt) && Date.parse(now) - claimedAt < staleAfterMs;
+        // Parse through the same canonical UTC path as publication claims: a
+        // legacy local-time or malformed stamp must not silently extend or
+        // collapse the processing lock.
+        const claimedAt =
+          typeof row?.claimed_at === 'string' ? canonicalUtcIso(row.claimed_at) : undefined;
+        const claimedAtMs = claimedAt === undefined ? Number.NaN : Date.parse(claimedAt);
+        const active = Number.isFinite(claimedAtMs) && Date.parse(now) - claimedAtMs < staleAfterMs;
         if (active) return 'processing';
         if (row === undefined) {
           this.database
@@ -423,6 +428,31 @@ export class SqliteStateStore implements ManagedStateStore {
       return undefined;
     });
     return Promise.resolve();
+  }
+
+  /**
+   * Delete completed deliveries and expired publication claim tombstones that
+   * aged past the retention window. Busy installations otherwise accumulate
+   * one row per webhook delivery forever, and the boot-time claim scan grows
+   * linearly with them.
+   */
+  public prune(retentionMs: number): Promise<number> {
+    if (!Number.isSafeInteger(retentionMs) || retentionMs < 3_600_000)
+      return Promise.reject(new Error('Retention window is invalid'));
+    return Promise.resolve(
+      this.withImmediateTransaction((now) => {
+        const cutoff = new Date(Date.parse(now) - retentionMs).toISOString();
+        const deliveries = this.database
+          .prepare(
+            "DELETE FROM deliveries WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at < ?",
+          )
+          .run(cutoff);
+        const claims = this.database
+          .prepare('DELETE FROM publication_claims WHERE expires_at < ?')
+          .run(cutoff);
+        return deliveries.changes + claims.changes;
+      }),
+    );
   }
 
   public releaseDelivery(deliveryId: string, error = 'delivery processing failed'): Promise<void> {

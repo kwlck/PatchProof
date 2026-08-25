@@ -566,6 +566,41 @@ async function doctorCommand(args: ParsedArgs): Promise<number> {
   return requiredOk ? 0 : 2;
 }
 
+/** Every option each command accepts; anything else is a typo and must fail loudly. */
+const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
+  init: [],
+  validate: ['json', 'help'],
+  run: [
+    'output',
+    'backend',
+    'base',
+    'head',
+    'allow-unsafe-local',
+    'fork',
+    'trusted-base',
+    'json',
+    'help',
+  ],
+  verify: ['json', 'help'],
+  replay: ['yes', 'backend', 'base', 'head', 'allow-unsafe-local', 'json', 'help'],
+  doctor: ['json', 'help'],
+  setup: ['check', 'demo', 'demo-dir', 'json', 'help'],
+});
+
+function assertKnownOptions(args: ParsedArgs): void {
+  const known = KNOWN_OPTIONS[args.command];
+  if (known === undefined) return;
+  for (const name of args.options.keys()) {
+    if (!known.includes(name)) {
+      throw new Error(
+        `Unknown option --${name} for ${args.command}. Available options: ${known
+          .map((item) => `--${item}`)
+          .join(', ')}`,
+      );
+    }
+  }
+}
+
 export async function runCli(argv: readonly string[]): Promise<number> {
   const args = parseArgs(argv);
   try {
@@ -573,6 +608,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       console.log(HELP);
       return 0;
     }
+    assertKnownOptions(args);
     if (args.command === 'init') return await initCommand(args);
     if (args.command === 'validate') return await validateCommand(args);
     if (args.command === 'run') return await runCommand(args);

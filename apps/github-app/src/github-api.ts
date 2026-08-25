@@ -98,9 +98,14 @@ function rawHeaderValue(headers: IncomingHttpHeaders, name: string): string | un
   return text === '' ? undefined : text;
 }
 
-function boundedSecondaryRetryMs(headers: IncomingHttpHeaders): number | undefined {
+function boundedSecondaryRetryMs(status: number, headers: IncomingHttpHeaders): number | undefined {
   const text = rawHeaderValue(headers, 'retry-after');
-  if (text === undefined) return SECONDARY_RETRY_DEFAULT_MS;
+  if (text === undefined) {
+    // A bare 403 is a deterministic authorization failure: replaying it only
+    // doubles latency and mislabels the diagnostic. 429 without a header is
+    // the one case the default delay covers.
+    return status === 429 ? SECONDARY_RETRY_DEFAULT_MS : undefined;
+  }
   if (!/^[1-9][0-9]*$/u.test(text)) return undefined;
   const waitMs = Number(text) * 1000;
   return waitMs > SECONDARY_RETRY_MAX_MS ? undefined : waitMs;
@@ -124,9 +129,10 @@ function statusFailure(
   if (remainingText !== undefined) notes.push(`ratelimit-remaining=${remainingText}`);
   let retryAfterMs: number | undefined;
   if ((status === 403 || status === 429) && endpoint.method === 'POST' && remainingText !== '0') {
-    retryAfterMs = boundedSecondaryRetryMs(headers);
+    retryAfterMs = boundedSecondaryRetryMs(status, headers);
     if (retryAfterMs !== undefined) notes.push('replaying once after the advised delay');
-    else notes.push('advised wait exceeds the replay bound');
+    else if (retryAfterText !== undefined) notes.push('advised wait exceeds the replay bound');
+    else notes.push('not replayed');
   }
   const suffix = notes.length === 0 ? '' : ` [${notes.join(', ')}]`;
   return new GitHubApiStatusError(

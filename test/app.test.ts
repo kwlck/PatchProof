@@ -2332,3 +2332,22 @@ test('publication fence blocks and fences completed publication mutations', asyn
   assert.deepEqual(failureCalls, []);
   assert.equal(await failureStore.getRun('o/r', 13), undefined);
 });
+
+test('GitHub transport treats a bare 403 as terminal without replay', async () => {
+  const mock = installMockHttpsRequest(() => ({
+    status: 403,
+    headers: { 'x-ratelimit-remaining': '4990' },
+    body: '{"message":"Forbidden"}',
+  }));
+  const transport = new GitHubApiTransport('test-token');
+  try {
+    const pending = transport.createComment('owner/repo', 22, { body: 'managed' });
+    await assert.rejects(
+      () => pending,
+      /GitHub API request failed \(403\) for POST .*issues\/22\/comments \[ratelimit-remaining=4990, not replayed\]/u,
+    );
+    assert.equal(mock.requests.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
