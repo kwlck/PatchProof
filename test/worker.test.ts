@@ -21,6 +21,7 @@ import { computeWebhookSignature, MemoryStateStore } from '@patchproof/github';
 import { runTwoRevisions } from '@patchproof/runner';
 import { handleWebhook } from '../apps/github-app/dist/webhook.js';
 import { SqliteQueue } from '../apps/github-app/dist/queue.js';
+import { SqliteStateStore } from '../apps/github-app/dist/sqlite.js';
 import { PatchProofWorker, type WorkerRunInput } from '../apps/github-app/dist/worker.js';
 import {
   parseWorkerOperatorPolicy,
@@ -1731,4 +1732,112 @@ test('worker metrics count every outcome exactly once', async () => {
     await rm(outputRoot, { recursive: true, force: true });
     queue.close();
   }
+});
+
+test('handleWebhook marks undecodable and primitive bodies ignored', async () => {
+  const store = new MemoryStateStore();
+  const dependencies = {
+    webhookSecret: 'worker-test-secret',
+    store,
+    github: {},
+    enqueue: async () => undefined,
+  };
+  const bad = await handleWebhook(
+    {
+      rawBody: 'not-json-at-all',
+      signature: computeWebhookSignature('not-json-at-all', 'worker-test-secret'),
+      deliveryId: 'd-bad-json',
+      event: 'pull_request',
+    },
+    dependencies,
+  );
+  assert.equal(bad.status, 200);
+  assert.equal(bad.enqueued, false);
+  assert.match(bad.body, /invalid JSON/u);
+  const primitive = await handleWebhook(
+    {
+      rawBody: '"just a string"',
+      signature: computeWebhookSignature('"just a string"', 'worker-test-secret'),
+      deliveryId: 'd-primitive',
+      event: 'pull_request',
+    },
+    dependencies,
+  );
+  assert.equal(primitive.status, 200);
+  assert.match(primitive.body, /invalid payload/u);
+});
+
+test('handleWebhook fails closed when the installation identity is missing', async () => {
+  const store = new MemoryStateStore();
+  const payload = JSON.stringify({
+    action: 'opened',
+    number: 7,
+    repository: { full_name: 'octo/example' },
+    pull_request: {
+      base: { ref: 'main', sha: 'a'.repeat(40), repo: { full_name: 'octo/example' } },
+      head: { ref: 'fix', sha: 'b'.repeat(40), repo: { full_name: 'octo/example' } },
+    },
+  });
+  const response = await handleWebhook(
+    {
+      rawBody: payload,
+      signature: computeWebhookSignature(payload, 'worker-test-secret'),
+      deliveryId: 'd-no-install',
+      event: 'pull_request',
+    },
+    {
+      webhookSecret: 'worker-test-secret',
+      store,
+      github: {},
+      enqueue: async () => undefined,
+      requireInstallationId: true,
+    },
+  );
+  assert.equal(response.status, 200);
+  assert.equal(response.enqueued, false);
+  assert.match(response.body, /installation identity unavailable/u);
+});
+
+test('queue enqueue bounds maxAttempts and cancelTerminal rejects stale leases', async () => {
+  const queue = new SqliteQueue(':memory:');
+  const request = {
+    repository: 'octo/example',
+    pullRequest: 7,
+    baseSha,
+    headSha,
+    reason: 'pull_request' as const,
+  };
+  for (const bad of [0, 21, 1.5]) {
+    assert.throws(() => queue.enqueue(request, bad as number));
+  }
+  const job = await queue.enqueue(request);
+  const claimed = await queue.claim('worker-a', 1_000);
+  assert.ok(claimed);
+  const lease = { owner: claimed.leaseOwner as string, generation: claimed.leaseGeneration };
+  await queue.fail(job.id, lease, 'terminal problem', false);
+  assert.equal(
+    await queue.cancelTerminal(
+      job.id,
+      { owner: lease.owner, generation: lease.generation + 1 },
+      'stale',
+    ),
+    false,
+  );
+  assert.equal(await queue.cancelTerminal(job.id, lease, 'fenced'), true);
+  queue.close();
+});
+
+test('delivery claims keep active locks and take over stale ones', async () => {
+  let now = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const store = new SqliteStateStore(':memory:', () => new Date(now));
+  const first = await store.claimDelivery('delivery-clock', 60_000);
+  assert.equal(first, 'claimed');
+  const active = await store.claimDelivery('delivery-clock', 60_000);
+  assert.equal(active, 'processing');
+  now += 120_000;
+  const takenOver = await store.claimDelivery('delivery-clock', 60_000);
+  assert.equal(takenOver, 'claimed');
+  await store.completeDelivery('delivery-clock');
+  const completed = await store.claimDelivery('delivery-clock', 60_000);
+  assert.equal(completed, 'completed');
 });
