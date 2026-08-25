@@ -112,8 +112,12 @@ export async function runTwoRevisions(
     // Unsafe local execution requires both independent authorities. A
     // repository cannot opt itself into host execution, and a CLI flag cannot
     // override a trusted base policy that disallows it.
-    allowUnsafeLocal:
-      options.allowUnsafeLocal === true && options.config.policy.allowUnsafeLocal === true,
+  allowUnsafeLocal:
+    // The trusted base config is the single source of truth: its explicit
+    // opt-in permits local execution, and its absence forbids it even with a
+    // caller flag, so an author can declare "docker only" and be heard. The
+    // CLI flag remains accepted for compatibility and backend overrides.
+    options.config.policy.allowUnsafeLocal === true,
     fork: options.fork === true,
     allowFork: options.config.policy.allowFork,
     trustedConfig: options.trustedConfig === true,
