@@ -26,6 +26,7 @@ import { writeEvidenceBundle } from './bundle.js';
 import { runSetup } from './setup.js';
 import { runSetupApp } from './setup-app.js';
 import { runDraft } from './draft.js';
+import { runExplain } from './explain.js';
 
 const execFileAsync = promisify(execFile);
 const DOCTOR_TIMEOUT_MS = 5_000;
@@ -50,6 +51,7 @@ Usage:
   patchproof setup [--check | --demo] [--demo-dir <dir>] [--json]
   patchproof setup --app [--env-file <path>] [--name <name>] [--no-open]   (GitHub App wizard)
   patchproof draft --diff <file-or-text> --issue <file-or-text> [--out <dir>] [--force]   (needs OPENAI_API_KEY)
+  patchproof explain <patchproof.evidence.json> [--json]   (needs OPENAI_API_KEY)
 
 Setup options:
   --check                   Report the environment without running the demo
@@ -590,6 +592,7 @@ const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
   doctor: ['json', 'help'],
   setup: ['check', 'demo', 'demo-dir', 'app', 'env-file', 'name', 'no-open', 'json', 'help'],
   draft: ['diff', 'issue', 'out', 'force', 'json', 'help'],
+  explain: ['json', 'help'],
 });
 
 function assertKnownOptions(args: ParsedArgs): void {
@@ -625,6 +628,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       return await runSetup(args);
     }
     if (args.command === 'draft') return await runDraft(args);
+    if (args.command === 'explain') return await runExplain(args);
     throw new Error(`Unknown command: ${args.command}`);
   } catch (error) {
     return printError(error, hasOption(args, 'json'));
