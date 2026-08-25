@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0 - 2026-08-25
+
+- Closed the largest test coverage gaps from the code review: webhook handling of undecodable and primitive bodies, fail-closed installation identity, queue maxAttempts bounds, fenced cancelTerminal semantics, and delivery claim takeover timing through an injectable clock.
+
 ## 0.4.0 - 2026-08-25
 
 - Added a `/healthz` liveness endpoint to the webhook process and periodic worker metric snapshots (`PATCHPROOF_METRICS_INTERVAL_MS`) counting every run outcome, giving operators a window into claims, retries, and failures without touching the store.
