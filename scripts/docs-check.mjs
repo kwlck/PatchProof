@@ -61,6 +61,25 @@ else {
   });
   for (const command of ['init', 'validate', 'run', 'verify', 'replay', 'doctor'])
     if (!help.includes(`patchproof ${command}`)) failures.push(`CLI help is missing ${command}`);
+  const publishedExample = resolve(root, 'docs/examples/fixture-proof/patchproof.evidence.json');
+  try {
+    const result = JSON.parse(
+      execFileSync(process.execPath, [cli, 'verify', publishedExample, '--json'], {
+        cwd: root,
+        encoding: 'utf8',
+        shell: false,
+        windowsHide: true,
+      }),
+    );
+    if (!result.valid || !result.digestValid || !result.artifactsValid)
+      failures.push('offline fixture evidence is invalid');
+    const bundle = JSON.parse(readFileSync(publishedExample, 'utf8'));
+    const version = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')).version;
+    if (bundle.outcome !== 'PASS' || bundle.product.version !== version)
+      failures.push('offline fixture evidence has the wrong outcome or product version');
+  } catch (error) {
+    failures.push(`offline fixture evidence could not be verified: ${commandDiagnostics(error)}`);
+  }
   const workspace = mkdtempSync(join(root, 'work', 'docs-check-'));
   try {
     const config = materializeLocalFixture(workspace);

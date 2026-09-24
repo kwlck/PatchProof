@@ -1,0 +1,176 @@
+{
+  "artifacts": [
+    {
+      "id": "artifacts_base.stdout.log",
+      "mediaType": "text/plain",
+      "relativePath": "artifacts/base.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sizeBytes": 0
+    },
+    {
+      "id": "artifacts_base.stderr.log",
+      "mediaType": "text/plain",
+      "relativePath": "artifacts/base.stderr.log",
+      "sha256": "5dc548a936abd9baefd947c4fb5bb16d508be04315c294e59a7eaddf35486a0b",
+      "sizeBytes": 48
+    },
+    {
+      "id": "artifacts_head.stdout.log",
+      "mediaType": "text/plain",
+      "relativePath": "artifacts/head.stdout.log",
+      "sha256": "81dd6aeed321f5a893c6a421cec6c87537e9374abac610d88d4dc347bc70b29c",
+      "sizeBytes": 46
+    },
+    {
+      "id": "artifacts_head.stderr.log",
+      "mediaType": "text/plain",
+      "relativePath": "artifacts/head.stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sizeBytes": 0
+    }
+  ],
+  "bundleId": "d99d2e6d-389e-446c-9ad2-a42488845911",
+  "completeness": {
+    "checks": {
+      "artifactHashes": true,
+      "baseExecution": true,
+      "baseSource": true,
+      "cleanup": true,
+      "headExecution": true,
+      "headSource": true,
+      "logsPersisted": true,
+      "schema": true,
+      "trustedScenario": true
+    },
+    "complete": true,
+    "missing": []
+  },
+  "createdAt": "2026-09-24T10:35:52.860Z",
+  "executions": {
+    "base": {
+      "command": ["node", "scenario.mjs"],
+      "cwd": ".",
+      "durationMs": 29,
+      "environment": { "CI": "1", "PATCHPROOF_REVISION": "base" },
+      "exitCode": 1,
+      "launcherEnvironment": {
+        "keys": ["PATH"],
+        "omitted": true,
+        "sha256": "dcc8e4bde9d4a2f65d32d75559370645f2e6525e9795ab34d6817c8f5c3fface"
+      },
+      "revision": "base",
+      "startedAt": "2026-09-24T10:35:52.741Z",
+      "stderr": {
+        "artifactId": "artifacts_base.stderr.log",
+        "preview": "EXPECTED_BUG: parser accepted a malformed token\n",
+        "sizeBytes": 48,
+        "truncated": false
+      },
+      "stdout": {
+        "artifactId": "artifacts_base.stdout.log",
+        "preview": "",
+        "sizeBytes": 0,
+        "truncated": false
+      },
+      "timedOut": false,
+      "toolchain": {
+        "arch": "x64",
+        "dependencyLock": { "status": "not-detected" },
+        "node": "v24.19.0",
+        "platform": "linux",
+        "runner": "@patchproof/runner/0.1.0"
+      }
+    },
+    "head": {
+      "command": ["node", "scenario.mjs"],
+      "cwd": ".",
+      "durationMs": 29,
+      "environment": { "CI": "1", "PATCHPROOF_REVISION": "head" },
+      "exitCode": 0,
+      "launcherEnvironment": {
+        "keys": ["PATH"],
+        "omitted": true,
+        "sha256": "dcc8e4bde9d4a2f65d32d75559370645f2e6525e9795ab34d6817c8f5c3fface"
+      },
+      "revision": "head",
+      "startedAt": "2026-09-24T10:35:52.770Z",
+      "stderr": {
+        "artifactId": "artifacts_head.stderr.log",
+        "preview": "",
+        "sizeBytes": 0,
+        "truncated": false
+      },
+      "stdout": {
+        "artifactId": "artifacts_head.stdout.log",
+        "preview": "assertion passed: malformed token is rejected\n",
+        "sizeBytes": 46,
+        "truncated": false
+      },
+      "timedOut": false,
+      "toolchain": {
+        "arch": "x64",
+        "dependencyLock": { "status": "not-detected" },
+        "node": "v24.19.0",
+        "platform": "linux",
+        "runner": "@patchproof/runner/0.1.0"
+      }
+    }
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "canonicalSha256": "99599a650e2620c4f8a8c81c5eef2957f6c85b50702b9f16532cadde40588f4e",
+    "signer": null
+  },
+  "outcome": "PASS",
+  "policy": {
+    "allowedHosts": [],
+    "backend": "local",
+    "fork": false,
+    "limits": {
+      "cpuCount": 1,
+      "memoryMb": 512,
+      "outputBytes": 8192,
+      "pids": 128,
+      "timeoutMs": 30000
+    },
+    "network": "none",
+    "trustedConfigRevision": "base",
+    "unsafeLocalProcess": true
+  },
+  "product": { "name": "PatchProof", "version": "0.9.3" },
+  "replay": {
+    "baseLocation": "base",
+    "headLocation": "head",
+    "recordedEnvironment": { "arch": "x64", "node": "v24.19.0", "platform": "linux" },
+    "requiresExplicitConfirmation": true,
+    "supported": true
+  },
+  "scenario": {
+    "command": ["node", "scenario.mjs"],
+    "cwd": ".",
+    "expectedFailure": { "exitCode": 1, "reasonPattern": "EXPECTED_BUG" },
+    "file": "scenario.mjs",
+    "id": "parser-regression",
+    "name": "Parser rejects the old malformed token and accepts the fixed token",
+    "sha256": "97309ab76aac08409cd4bee7a304301590cb8dce0cd6b2e6da2f29b79e4b9484",
+    "trustedSource": "base"
+  },
+  "schemaVersion": 1,
+  "sources": {
+    "base": {
+      "kind": "directory-tree",
+      "location": "base",
+      "ref": "base",
+      "revision": "base",
+      "sha256": "8ecbeb13cc46383a8942fb73e6ccdd1360a0c3d39209865c085332b03c70b6b5"
+    },
+    "head": {
+      "kind": "directory-tree",
+      "location": "head",
+      "ref": "head",
+      "revision": "head",
+      "sha256": "47a5575fa9164b3ef59ce79c1811468999e0611979856b3f0a3f98f6d45cd1c0"
+    }
+  },
+  "verdict": "The trusted scenario failed on base and passed on head."
+}
