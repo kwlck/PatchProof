@@ -2,6 +2,8 @@
 
 Run the webhook app and worker as separate processes with the same durable SQLite path. Put the HTTP process behind TLS termination with a private webhook secret.
 
+`GET /healthz` reports HTTP liveness. `GET /readyz` returns 200 only while a worker has recently reached its Docker daemon and written a heartbeat to the shared SQLite database; otherwise it returns 503. Use readiness for traffic routing and keep both processes on the same SQLite file.
+
 ```text
 PATCHPROOF_WEBHOOK_SECRET=<random value at least 16 characters>
 PATCHPROOF_GITHUB_APP_ID=<numeric GitHub App ID>

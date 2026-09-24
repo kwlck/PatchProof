@@ -1,7 +1,8 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import assert from 'node:assert/strict';
 import { verifyEvidenceBundle } from '@patchproof/core';
 import { handleWebhook } from '../apps/github-app/dist/webhook.js';
@@ -30,8 +31,7 @@ async function cliRun(args: string[]): Promise<{ code: number; stdout: string; s
 }
 
 async function run(): Promise<void> {
-  const outputRoot = join(root, 'work', 'e2e');
-  await mkdir(outputRoot, { recursive: true });
+  const outputRoot = await mkdtemp(join(tmpdir(), 'patchproof-e2e-'));
   // The maintained Docker fixture intentionally leaves unsafe local execution
   // disabled. This test opts into local development explicitly in a temporary
   // trusted config so it exercises the CLI without weakening the fixture.

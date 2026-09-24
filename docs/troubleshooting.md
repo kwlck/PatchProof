@@ -6,7 +6,7 @@ Run `patchproof doctor --json`. Docker must be installed, the daemon must be rea
 
 ## `POLICY_DENIED`
 
-Check `policy.allowUnsafeLocal`, `--allow-unsafe-local`, `policy.allowFork`, and `--trusted-base`. A denied run is a reportable result, not a failed assertion.
+Check `policy.allowUnsafeLocal`, `policy.allowFork`, and `--trusted-base`. The local backend needs the trusted config to permit it; `--allow-unsafe-local` is used with `--backend local` when overriding a Docker config. A denied run is a reportable result, not a failed assertion.
 
 ## `INCONCLUSIVE`
 

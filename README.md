@@ -50,9 +50,9 @@ The installer verifies every download against published SHA-256 checksums, insta
 patchproof setup --demo
 ```
 
-That single command runs a self-contained bug scenario against two revisions, writes the evidence bundle, verifies it, and prints next steps in about 30 seconds. Production runs use Docker; install it from [Docker Desktop](https://www.docker.com/products/docker-desktop/) whenever you are ready - the setup wizard offers to do it for you. Installers resolve the latest GitHub Release, so create a release first or pin `PATCHPROOF_VERSION=<tag>`.
+That single command runs a self-contained bug scenario against two revisions, writes the evidence bundle, verifies it, and prints next steps in about 30 seconds. Use a new directory for each demo: an existing nonempty `patchproof-demo` or `--demo-dir` is never deleted. Production runs use Docker; install it from [Docker Desktop](https://www.docker.com/products/docker-desktop/) whenever you are ready - the setup wizard offers to do it for you. Installers resolve the latest GitHub Release, so create a release first or pin `PATCHPROOF_VERSION=<tag>`.
 
-Setting up the GitHub App deployment is a two click wizard too: `patchproof setup --app` drives the official App Manifest flow and writes a private env file for you.
+`patchproof setup --app` registers a GitHub App and writes its credentials to a private env file. Deploy the webhook and worker separately, configure a public HTTPS webhook URL, and approve a digest-pinned Docker image as described in [Deployment](docs/deployment.md).
 
 Two optional AI commands help you write and read scenarios. Both are strictly bring your own key through `OPENAI_API_KEY`; without a key they only point at the manual path and send nothing anywhere:
 
@@ -68,26 +68,26 @@ patchproof explain work/pass/patchproof.evidence.json # plain language outcome s
 PatchProof answers one question: **does this fix actually fix the bug?** It runs your reproduction script against the broken code (`base`) and the fixed code (`head`):
 
 - fails on base, passes on head → **PASS**, the fix works
-- fails on both, or passes on both → **FAIL**, the fix changes nothing
+- fails on both with the expected failure on base → **FAIL**, the head still fails
+- passes on base → **INCONCLUSIVE**, the expected bug was not reproduced
 
-### In a git repository: one command
+### In a git repository
 
-If your project is a git repo, there are no folders to create. PatchProof pulls both revisions from history itself:
+PatchProof can compare a committed broken revision with an uncommitted fix. The reproduction scenario and `.patchproof.yml` must already exist in the broken base commit. The CLI loads the configuration and scenario from that base revision:
 
 ```text
-patchproof init .
-# edit scenario.mjs so it reproduces your bug, then:
-patchproof run .patchproof.yml --base git:HEAD --head . --allow-unsafe-local
+patchproof preflight .patchproof.yml --base git:HEAD --head .
+patchproof run .patchproof.yml --base git:HEAD --head .
 ```
 
 - `--base git:HEAD` - the last commit, where the bug is still alive
 - `--head .` - your working directory with the fix
-- `--allow-unsafe-local` - run without Docker on this machine (development only)
+- A local run needs `policy.allowUnsafeLocal: true` in the trusted base config. To override a Docker config, use `--backend local --allow-unsafe-local` only if that base policy allows local execution.
 
 Any ref works: `git:HEAD~1`, `git:main`, `git:<sha>`, `git:feature-branch`. To compare two commits:
 
 ```text
-patchproof run .patchproof.yml --base git:main --head git:feature --allow-unsafe-local
+patchproof run .patchproof.yml --base git:main --head git:feature
 ```
 
 Expected result: `PatchProof PASS - The trusted scenario failed on base and passed on head.`
@@ -95,14 +95,17 @@ Expected result: `PatchProof PASS - The trusted scenario failed on base and pass
 ### Without git: init scaffolds everything
 
 ```text
-patchproof init my-check
+patchproof init my-check                    # Node example
+patchproof init my-python-check --template python
 ```
 
-creates the full skeleton - `base/`, `head/`, `scenario.mjs` in both, and `.patchproof.yml`:
+Each command creates `base/`, `head/`, `.patchproof.yml`, and a matching scenario file in both source directories (`scenario.mjs` for Node or `scenario.py` for Python):
 
-1. put the broken project into `base/`, the fixed one into `head/`
-2. edit `scenario.mjs` (same file in both folders) so it reproduces the bug
-3. `patchproof run my-check/.patchproof.yml --base my-check/base --head my-check/head --allow-unsafe-local`
+1. Run the generated example as-is to see a `PASS`: `patchproof run my-check/.patchproof.yml --base my-check/base --head my-check/head`.
+2. Replace the broken copy in `base/` and the fixed copy in `head/` with your project.
+3. Edit the same scenario in both folders to reproduce the bug. Keep a specific `reasonPattern` so an unrelated base error cannot pass.
+
+If Docker was available when you ran `init`, the config selects Docker. The presence of `--allow-unsafe-local` alone never changes that backend. To use Git later, copy the scenario into your repository root and commit it with `.patchproof.yml` before testing `git:HEAD`.
 
 ### Reading the result
 
@@ -122,8 +125,8 @@ The evidence bundle in `--output` contains your real stdout, stderr, timings, an
 | ----------------------- | ------------------------------------------------------------- |
 | `--base <dir\|git:ref>` | Broken code: a folder or a git ref                            |
 | `--head <dir\|git:ref>` | Fixed code: a folder, `.`, or a git ref                       |
-| `--allow-unsafe-local`  | Run without Docker (development only)                         |
-| `--output <dir>`        | Where the evidence bundle lands                               |
+| `--allow-unsafe-local`  | Explicit local override for a Docker config that permits it   |
+| `--output <dir>`        | Choose a fresh evidence directory; existing evidence is kept  |
 | `--git-repo <path>`     | Repository to read git refs from (default: current directory) |
 
 Config essentials: `scenario.command` runs your script; `expectedFailure.exitCode: 1` means base must fail; `reasonPattern: EXPECTED_BUG` proves it failed for the right reason. Full list in [docs/configuration-reference.md](docs/configuration-reference.md).
@@ -134,10 +137,12 @@ Config essentials: `scenario.command` runs your script; `expectedFailure.exitCod
 | ------------------------------------------------ | ---------------------------------------------------------- |
 | `patchproof setup --check`                       | Is my machine ready?                                       |
 | `patchproof setup --demo`                        | Prove the whole pipeline in 30 seconds                     |
-| `patchproof setup --app`                         | Two click GitHub App setup wizard                          |
-| `patchproof init <dir>`                          | Scaffold config, scenario, and base/head folders           |
+| `patchproof setup --app`                         | Register App credentials; then configure its deployment    |
+| `patchproof init <dir> [--template python]`      | Scaffold a Node or Python example                          |
 | `patchproof validate <config>`                   | Is my config correct?                                      |
+| `patchproof preflight <config> --base --head`    | Check readiness without executing the scenario             |
 | `patchproof run <config> --base --head`          | Run the check                                              |
+| `patchproof runs list/show/compare`              | Find and compare verified local evidence                   |
 | `patchproof verify <bundle>`                     | Is this evidence genuine? (`--signature --key` for signed) |
 | `patchproof replay <bundle> --yes --base --head` | Re-run the recorded scenario now                           |
 | `patchproof sign <bundle> --key <pem>`           | Sign the evidence with your key                            |

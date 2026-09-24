@@ -32,6 +32,8 @@ export interface WebhookDependencies {
   github: GitHubTransport;
   enqueue: (request: RunEnqueueRequest) => Promise<void>;
   cancelPullRequest?: (repository: string, pullRequest: number, reason: string) => Promise<number>;
+  /** Production readiness checks that a worker recently reached its Docker daemon. */
+  ready?: () => Promise<boolean> | boolean;
   /** Production wiring sets this true; omitted installation IDs then fail closed. */
   requireInstallationId?: boolean;
 }

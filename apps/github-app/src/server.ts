@@ -44,6 +44,17 @@ export function createWebhookServer(dependencies: WebhookDependencies) {
       );
       return;
     }
+    if (request.method === 'GET' && request.url === '/readyz') {
+      let ready = false;
+      try {
+        ready = (await dependencies.ready?.()) === true;
+      } catch {
+        // Treat store failures as unavailable without disclosing internals.
+      }
+      response.writeHead(ready ? 200 : 503, { 'content-type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ ready }));
+      return;
+    }
     if (request.method !== 'POST' || request.url !== '/webhooks/github') {
       response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       response.end('not found');

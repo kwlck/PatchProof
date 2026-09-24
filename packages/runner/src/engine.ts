@@ -109,15 +109,11 @@ export async function runTwoRevisions(
   }
   const decision = decidePolicy({
     backend,
-    // Unsafe local execution requires both independent authorities. A
-    // repository cannot opt itself into host execution, and a CLI flag cannot
-    // override a trusted base policy that disallows it.
+    // The trusted base policy must allow host execution. Switching a trusted
+    // Docker policy to local also requires an explicit CLI opt-in.
     allowUnsafeLocal:
-      // The trusted base config is the single source of truth: its explicit
-      // opt-in permits local execution, and its absence forbids it even with a
-      // caller flag, so an author can declare "docker only" and be heard. The
-      // CLI flag remains accepted for compatibility and backend overrides.
-      options.config.policy.allowUnsafeLocal === true,
+      options.config.policy.allowUnsafeLocal === true &&
+      (options.config.policy.backend === 'local' || options.allowUnsafeLocal === true),
     fork: options.fork === true,
     allowFork: options.config.policy.allowFork,
     trustedConfig: options.trustedConfig === true,
@@ -154,6 +150,16 @@ export async function runTwoRevisions(
         `INFRA_ERROR: workspace preparation failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    // Identify the bytes that were copied, before the trusted scenario is
+    // overlaid on head. A dirty working tree must never claim its HEAD SHA.
+    const baseSource =
+      options.baseRef !== undefined
+        ? { sha256: options.baseRef, kind: 'git-commit' as const, ref: options.baseRef }
+        : await sourceIdentity(baseWork, 'base');
+    const headSource =
+      options.headRef !== undefined
+        ? { sha256: options.headRef, kind: 'git-commit' as const, ref: options.headRef }
+        : await sourceIdentity(headWork, 'head');
     let scenarioFileSha256: string | undefined;
     if (options.config.scenario.file !== undefined) {
       const safeFile = assertSafeRelativePath(options.config.scenario.file, 'scenario.file');
@@ -163,8 +169,6 @@ export async function runTwoRevisions(
       await prepareDockerWorkspace(baseWork);
       await prepareDockerWorkspace(headWork);
     }
-    const baseSource = await sourceIdentity(basePath, options.baseRef ?? 'base');
-    const headSource = await sourceIdentity(headPath, options.headRef ?? 'head');
     const safeCwd =
       options.config.scenario.cwd === '.'
         ? '.'

@@ -1,4 +1,4 @@
-import { mkdir, writeFile, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, link, rm, lstat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -27,6 +27,7 @@ import {
 
 export interface BundleBuildOptions {
   outputPath: string;
+  bundleId?: string;
   configResult: ConfigParseResult;
   config: PatchProofConfig;
   run: TwoRevisionRun | PolicyDeniedRun;
@@ -49,7 +50,7 @@ async function artifactFromText(
 }> {
   const file = join(outputRoot, relativePath);
   await mkdir(dirname(file), { recursive: true });
-  await writeFile(file, value, 'utf8');
+  await writeFile(file, value, { encoding: 'utf8', flag: 'wx' });
   const bytes = await readFile(file);
   return {
     id: relativePath.replaceAll(/[\\/]/g, '_'),
@@ -177,6 +178,19 @@ export async function writeEvidenceBundle(
   const bundlePath = outputPath.toLowerCase().endsWith('.json')
     ? outputPath
     : join(outputPath, 'patchproof.evidence.json');
+  for (const file of [
+    bundlePath,
+    ...['base.stdout.log', 'base.stderr.log', 'head.stdout.log', 'head.stderr.log'].map((name) =>
+      join(outputRoot, 'artifacts', name),
+    ),
+  ]) {
+    try {
+      await lstat(file);
+      throw new Error(`Evidence output already exists: ${file}; choose a new --output`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
   await mkdir(outputRoot, { recursive: true });
   let run: TwoRevisionRun | undefined;
   let denialReason: string | undefined;
@@ -323,7 +337,7 @@ export async function writeEvidenceBundle(
   const withoutIntegrity: Omit<EvidenceBundle, 'integrity'> = {
     schemaVersion: 1,
     product: { name: 'PatchProof', version: '0.9.2' },
-    bundleId: randomUUID(),
+    bundleId: options.bundleId ?? randomUUID(),
     createdAt: new Date().toISOString(),
     outcome: classification.outcome,
     verdict: classification.verdict,
@@ -373,8 +387,8 @@ export async function writeEvidenceBundle(
     ...withoutIntegrity,
     integrity: createIntegrity(withoutIntegrity),
   };
-  // Atomic replace: a crash mid-write must never leave a truncated evidence
-  // file that later verifies as INVALID through no fault of the run.
+  // A complete temporary file is published atomically; a concurrent run
+  // cannot replace evidence that appeared after the preflight check.
   const temporaryPath = `${bundlePath}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, `${canonicalize(bundle)}\n`, {
@@ -382,7 +396,8 @@ export async function writeEvidenceBundle(
       mode: 0o600,
       flag: 'wx',
     });
-    await rename(temporaryPath, bundlePath);
+    await link(temporaryPath, bundlePath);
+    await rm(temporaryPath, { force: true });
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;

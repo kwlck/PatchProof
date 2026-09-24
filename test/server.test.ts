@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { createWebhookServer } from '../apps/github-app/dist/server.js';
 import { MemoryStateStore } from '@patchproof/github';
 import { GitHubApiTransport } from '../apps/github-app/dist/github-api.js';
+import { SqliteQueue } from '../apps/github-app/dist/queue.js';
 
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
@@ -50,6 +51,30 @@ test('healthz reports liveness without internals', async () => {
     assert.equal(typeof payload.uptimeSeconds, 'number');
   } finally {
     server.close();
+  }
+});
+
+test('readyz requires a fresh worker heartbeat while healthz stays live', async () => {
+  let now = Date.UTC(2026, 8, 24);
+  const queue = new SqliteQueue(':memory:', () => new Date(now));
+  const server = createWebhookServer({
+    webhookSecret: 'x'.repeat(32),
+    store: new MemoryStateStore(),
+    github: new GitHubApiTransport('test-token'),
+    enqueue: async () => undefined,
+    ready: () => queue.hasReadyWorker(),
+  });
+  const port = await listen(server);
+  try {
+    assert.equal((await get(port, '/readyz')).status, 503);
+    queue.reportHeartbeat('worker-test');
+    assert.equal((await get(port, '/readyz')).status, 200);
+    now += 31_000;
+    assert.equal((await get(port, '/readyz')).status, 503);
+    assert.equal((await get(port, '/healthz')).status, 200);
+  } finally {
+    server.close();
+    queue.close();
   }
 });
 

@@ -1,9 +1,9 @@
-import { existsSync } from 'node:fs';
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
-import { dirname, extname, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   classifyOutcomeGuarded,
@@ -37,6 +37,8 @@ import { runSetup } from './setup.js';
 import { runSetupApp } from './setup-app.js';
 import { runDraft } from './draft.js';
 import { runExplain } from './explain.js';
+import { runPreflight } from './preflight.js';
+import { runHistory } from './runs.js';
 
 const execFileAsync = promisify(execFile);
 const DOCTOR_TIMEOUT_MS = 5_000;
@@ -52,8 +54,10 @@ const HELP = `PatchProof - replayable evidence for pull-request bug fixes
 Quick start: patchproof setup --demo proves the full pipeline in about 30 seconds.
 
 Usage:
-  patchproof init [directory]
+  patchproof init [directory] [--template node|python]
   patchproof validate <.patchproof.yml> [--json]
+  patchproof preflight <.patchproof.yml> --base <dir|git:ref> --head <dir|git:ref> [--json]
+  patchproof runs [list | show <bundle|dir> | compare <before> <after>] [--root <dir>] [--json]
   patchproof run <.patchproof.yml> --base <dir|git:ref> --head <dir|git:ref> [options]
     git refs: --base git:HEAD~1 --head .   (check uncommitted work against last commit)
   patchproof verify <patchproof.evidence.json> [--json]
@@ -72,15 +76,16 @@ Setup options:
   --demo-dir <dir>          Demo workspace location (default: ./patchproof-demo)
 
 Run options:
-  --output <dir|file>       Evidence output location (default: ./work/patchproof-run)
-  --backend <docker|local>  Override backend; local requires --allow-unsafe-local
+  --output <dir|file>       Evidence output location (default: a unique ./work/patchproof-run/<id>)
+  --backend <docker|local>  Override backend; Docker-to-local needs --allow-unsafe-local
+  --git-repo <dir>          Repository containing git refs (default: current directory)
   --allow-unsafe-local      Explicitly allow the development local-process backend
   --fork                    Apply fork policy and report POLICY_DENIED when disallowed
   --trusted-base <dir>      Trusted base checkout containing the executable config/scenario
   --json                    Emit machine-readable result
 
 Exit codes: 0 PASS/valid, 1 FAIL, 2 inconclusive/invalid, 3 policy denied, 4 infrastructure error.
-Docker is the production default. The local backend is unsafe and never implied by configuration.
+Docker is the production default. The local backend is unsafe and requires trusted base policy.
 `;
 
 function jsonOutput(value: unknown): void {
@@ -98,11 +103,32 @@ function printError(error: unknown, json: boolean): number {
 
 async function initCommand(args: ParsedArgs): Promise<number> {
   const root = resolve(args.positional[0] ?? process.cwd());
+  const templateOption = option(args, 'template');
+  if (templateOption !== undefined && templateOption !== 'node' && templateOption !== 'python')
+    throw new Error('init --template must be node or python');
+  const python = templateOption === 'python';
+  const libraryFile = python ? 'lib.py' : 'lib.cjs';
+  const scenarioFile = python ? 'scenario.py' : 'scenario.mjs';
+  const targets = [
+    '.patchproof.yml',
+    `base/${libraryFile}`,
+    `head/${libraryFile}`,
+    `base/${scenarioFile}`,
+    `head/${scenarioFile}`,
+  ];
+  for (const file of targets) {
+    const target = join(root, file);
+    try {
+      await lstat(target);
+      throw new Error(`${target} already exists; refusing to overwrite`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
   await mkdir(root, { recursive: true });
   await mkdir(join(root, 'base'), { recursive: true });
   await mkdir(join(root, 'head'), { recursive: true });
   const target = join(root, '.patchproof.yml');
-  if (existsSync(target)) throw new Error(`${target} already exists; refusing to overwrite`);
   // Scaffold for the backend the machine can actually run: a fresh user
   // without Docker must get a working local config, not an INFRA_ERROR.
   let dockerReady = false;
@@ -119,12 +145,12 @@ async function initCommand(args: ParsedArgs): Promise<number> {
   }
   const policy =
     dockerReady === true
-      ? `policy:\n  backend: docker\n  network: none\nredaction:\n  secrets: []\n`
+      ? `policy:\n  backend: docker\n  network: none\n${python ? '  dockerImage: python:3.12-slim\n' : ''}redaction:\n  secrets: []\n`
       : `# Docker was not detected, so this scaffold uses the development local\n# backend. Switch backend to docker for production isolation.\npolicy:\n  backend: local\n  allowUnsafeLocal: true\n  network: none\nredaction:\n  secrets: []\n`;
   await writeFile(
     target,
-    `version: 1\nname: Reproduction scenario\nscenario:\n  id: bug-reproduction\n  name: Reproduce the claimed bug\n  command: [node, scenario.mjs]\n  cwd: .\n  file: scenario.mjs\n  expectedFailure:\n    exitCode: 1\n${policy}`,
-    'utf8',
+    `version: 1\nname: Reproduction scenario\nscenario:\n  id: bug-reproduction\n  name: Reproduce the claimed bug\n  command: [${python ? 'python3' : 'node'}, ${scenarioFile}]\n  cwd: .\n  file: ${scenarioFile}\n  expectedFailure:\n    exitCode: 1\n    reasonPattern: EXPECTED_BUG\n${policy}`,
+    { encoding: 'utf8', flag: 'wx' },
   );
   const scenario = [
     '// This scenario must:',
@@ -167,22 +193,59 @@ async function initCommand(args: ParsedArgs): Promise<number> {
     'total = numbers[i]; // BUG: "=" instead of "+="',
     'total += numbers[i]; // FIXED',
   );
-  await writeFile(join(root, 'base', 'lib.cjs'), brokenLib, 'utf8');
-  await writeFile(join(root, 'head', 'lib.cjs'), fixedLib, 'utf8');
-  await writeFile(join(root, 'base', 'scenario.mjs'), scenario, 'utf8');
-  await writeFile(join(root, 'head', 'scenario.mjs'), scenario, 'utf8');
+  const pythonScenario = [
+    'from lib import sum_numbers',
+    '',
+    'for numbers, expected in [([1, 2, 3], 6), ([10, 20, 30], 60)]:',
+    '    actual = sum_numbers(numbers)',
+    '    if actual != expected:',
+    '        raise SystemExit(f"EXPECTED_BUG: sum({numbers}) = {actual}, expected {expected}")',
+    '',
+    'print("sum works correctly")',
+    '',
+  ].join('\n');
+  const pythonBroken = [
+    'def sum_numbers(numbers):',
+    '    total = 0',
+    '    for value in numbers:',
+    '        total = value  # BUG: assignment instead of addition',
+    '    return total',
+    '',
+  ].join('\n');
+  const pythonFixed = pythonBroken.replace(
+    'total = value  # BUG: assignment instead of addition',
+    'total += value  # FIXED',
+  );
+  await writeFile(join(root, 'base', libraryFile), python ? pythonBroken : brokenLib, {
+    encoding: 'utf8',
+    flag: 'wx',
+  });
+  await writeFile(join(root, 'head', libraryFile), python ? pythonFixed : fixedLib, {
+    encoding: 'utf8',
+    flag: 'wx',
+  });
+  await writeFile(join(root, 'base', scenarioFile), python ? pythonScenario : scenario, {
+    encoding: 'utf8',
+    flag: 'wx',
+  });
+  await writeFile(join(root, 'head', scenarioFile), python ? pythonScenario : scenario, {
+    encoding: 'utf8',
+    flag: 'wx',
+  });
   console.log(`Scaffolded ${root} with a working example (the first run should be PASS).`);
   console.log('Next steps:');
-  console.log('  1. Run the check as-is to see PASS, then replace lib.cjs with your project');
-  console.log('     (buggy copy in base/, fixed copy in head/) and edit scenario.mjs.');
+  console.log(
+    `  1. Run the check as-is to see PASS, then replace ${libraryFile} with your project`,
+  );
+  console.log(`     (buggy copy in base/, fixed copy in head/) and edit ${scenarioFile}.`);
   console.log(`  2. patchproof validate ${join(root, '.patchproof.yml')}`);
   console.log(
     `  3. patchproof run ${join(root, '.patchproof.yml')} --base ${join(root, 'base')} --head ${join(root, 'head')}`,
   );
-  console.log('  In a git repository you can skip the folders entirely:');
   console.log(
-    `     patchproof run ${join(root, '.patchproof.yml')} --base git:HEAD --head . --git-repo <repo>`,
+    `  To compare git revisions, copy ${scenarioFile} to the repository root and commit it with the config.`,
   );
+  console.log('     patchproof run .patchproof.yml --base git:HEAD --head . --git-repo <repo>');
   return 0;
 }
 
@@ -239,10 +302,22 @@ async function runCommand(args: ParsedArgs): Promise<number> {
     headRevision = isGitRef(head) ? await exportGitRevision(repoPath, gitRefOf(head)) : undefined;
     const basePath = baseRevision?.path ?? base;
     const headPath = headRevision?.path ?? head;
+    const configAbsolute = isAbsolute(configPath) ? configPath : resolve(repoPath, configPath);
+    const configRelative = relative(repoPath, configAbsolute);
+    if (
+      baseRevision !== undefined &&
+      (configRelative === '' ||
+        configRelative === '..' ||
+        configRelative.startsWith(`..${sep}`) ||
+        isAbsolute(configRelative))
+    )
+      throw new Error('Git base configuration must be inside --git-repo');
     const result =
       typeof trustedBase === 'string'
         ? await loadTrustedConfig(configPath, trustedBase)
-        : await loadConfig(configPath);
+        : baseRevision === undefined
+          ? await loadConfig(configPath)
+          : await loadTrustedConfig(join(baseRevision.path, configRelative), baseRevision.path);
     const backendValue = option(args, 'backend');
     if (backendValue !== undefined && backendValue !== 'docker' && backendValue !== 'local')
       throw new Error('--backend must be docker or local');
@@ -254,7 +329,11 @@ async function runCommand(args: ParsedArgs): Promise<number> {
       config: result.config,
       basePath,
       headPath,
-      backendOverride: backend,
+      ...(baseRevision === undefined ? {} : { baseRef: baseRevision.sha }),
+      ...(headRevision === undefined ? {} : { headRef: headRevision.sha }),
+      ...(backendValue === 'docker' || backendValue === 'local'
+        ? { backendOverride: backendValue }
+        : {}),
       allowUnsafeLocal: hasOption(args, 'allow-unsafe-local'),
       fork: hasOption(args, 'fork'),
       trustedConfig: true,
@@ -263,8 +342,10 @@ async function runCommand(args: ParsedArgs): Promise<number> {
       ? await Promise.all([sourceIdentity(basePath, 'base'), sourceIdentity(headPath, 'head')])
       : undefined;
     const output = option(args, 'output');
+    const runId = randomUUID();
     const built = await writeEvidenceBundle({
-      outputPath: typeof output === 'string' ? output : resolve('work', 'patchproof-run'),
+      outputPath: typeof output === 'string' ? output : resolve('work', 'patchproof-run', runId),
+      bundleId: runId,
       configResult: result,
       config: result.config,
       run,
@@ -721,8 +802,10 @@ async function doctorCommand(args: ParsedArgs): Promise<number> {
 
 /** Every option each command accepts; anything else is a typo and must fail loudly. */
 const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
-  init: [],
+  init: ['template'],
   validate: ['json', 'help'],
+  preflight: ['base', 'head', 'git-repo', 'backend', 'allow-unsafe-local', 'fork', 'json', 'help'],
+  runs: ['root', 'json', 'help'],
   run: [
     'output',
     'backend',
@@ -731,10 +814,12 @@ const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
     'allow-unsafe-local',
     'fork',
     'trusted-base',
+    'git-repo',
     'json',
     'help',
   ],
-  verify: ['json', 'help'],
+  verify: ['json', 'help', 'signature', 'key'],
+  sign: ['key', 'out', 'json', 'help'],
   replay: ['yes', 'backend', 'base', 'head', 'allow-unsafe-local', 'json', 'help'],
   doctor: ['json', 'help'],
   setup: ['check', 'demo', 'demo-dir', 'app', 'env-file', 'name', 'no-open', 'json', 'help'],
@@ -766,6 +851,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     assertKnownOptions(args);
     if (args.command === 'init') return await initCommand(args);
     if (args.command === 'validate') return await validateCommand(args);
+    if (args.command === 'preflight') return await runPreflight(args);
+    if (args.command === 'runs') return await runHistory(args);
     if (args.command === 'run') return await runCommand(args);
     if (args.command === 'verify') return await verifyCommand(args);
     if (args.command === 'replay') return await replayCommand(args);
