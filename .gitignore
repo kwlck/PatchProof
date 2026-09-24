@@ -9,6 +9,7 @@ outputs/*
 .env.*
 !.env.example
 *.log
+!docs/examples/fixture-proof/artifacts/*.log
 *.tsbuildinfo
 .DS_Store
 

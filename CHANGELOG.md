@@ -2,11 +2,14 @@
 
 ## Unreleased
 
+## 0.9.3 - 2026-09-24
+
 - Protect existing files in `init`, `setup --demo`, and evidence output paths; each default run now writes a separate bundle.
 - Identify uncommitted working-tree content by its copied directory hash, load Git run configuration from the base commit, and require the scaffold's expected failure marker.
 - Repair `--git-repo` and the signed `verify --signature --key` CLI path.
 - Add read-only `preflight`, local `runs list/show/compare`, and a Python starter template.
 - Explain GitHub App webhook and worker deployment accurately; add a Docker-aware worker readiness endpoint.
+- Correct the bundled package README and include a verifiable offline fixture bundle for the first read-only demonstration.
 
 ## 0.9.2 - 2026-08-25
 

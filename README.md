@@ -18,7 +18,7 @@ One trusted reproduction. Two exact revisions. One evidence bundle.
 | :--------------: | :-----------: | :---------------: |
 | Expected failure |     Pass      | Verified evidence |
 
-[Install](#one-command-install) В· [Evidence](#evidence-at-a-glance) В· [Architecture](#how-the-product-is-split) В· [Security](#security-model) В· [Docs](#documentation) В· [Roadmap](#roadmap)
+[Install](#one-command-install) · [Evidence](#evidence-at-a-glance) · [Architecture](#how-the-product-is-split) · [Security](#security-model) · [Docs](#documentation) · [Roadmap](#roadmap)
 
 </div>
 
@@ -196,6 +196,8 @@ Every run writes a versioned bundle with canonical JSON, SHA-256 integrity over 
 
 `patchproof verify` recomputes all of it without executing repository code, and `patchproof replay` re-runs the recorded scenario against operator-supplied source directories.
 
+To inspect a complete, committed **synthetic fixture** first, run `patchproof verify docs/examples/fixture-proof/patchproof.evidence.json --json` from the repository root. The [offline evidence example](docs/examples/README.md) explains how to reproduce it and what its hash can establish.
+
 ## How the product is split
 
 ```mermaid
@@ -213,16 +215,16 @@ flowchart LR
   E --> C[Check and managed comment]
 ```
 
-| Package            | Role                                                                                                |
-| ------------------ | --------------------------------------------------------------------------------------------------- |
-| `packages/core`    | Versioned evidence model, canonical JSON, SHA-256 integrity, redaction, classification              |
-| `packages/config`  | `.patchproof.yml` parsing, semantic validation, trusted-base executable configuration               |
-| `packages/runner`  | Clean revision copies, identical argv through Docker, explicit local development backend            |
-| `packages/cli`     | `init`, `validate`, `run`, `verify`, `replay`, `doctor`, and `setup` behind the `patchproof` binary |
-| `packages/report`  | Terminal and Markdown rendering                                                                     |
-| `packages/github`  | Checks, managed comments, slash commands, webhook signatures without credentials                    |
-| `apps/github-app`  | Webhook process, SQLite run state, durable queue, exact-ref adapter, separate worker                |
-| `packages/testkit` | Deterministic fail-to-pass, failure, timeout, policy, tamper, and redaction cases                   |
+| Package            | Role                                                                                                                             |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/core`    | Versioned evidence model, canonical JSON, SHA-256 integrity, redaction, classification                                           |
+| `packages/config`  | `.patchproof.yml` parsing, semantic validation, trusted-base executable configuration                                            |
+| `packages/runner`  | Clean revision copies, identical argv through Docker, explicit local development backend                                         |
+| `packages/cli`     | `init`, `validate`, `preflight`, `run`, `runs`, `verify`, `sign`, `replay`, `doctor`, and `setup` behind the `patchproof` binary |
+| `packages/report`  | Terminal and Markdown rendering                                                                                                  |
+| `packages/github`  | Checks, managed comments, slash commands, webhook signatures without credentials                                                 |
+| `apps/github-app`  | Webhook process, SQLite run state, durable queue, exact-ref adapter, separate worker                                             |
+| `packages/testkit` | Deterministic fail-to-pass, failure, timeout, policy, tamper, and redaction cases                                                |
 
 The HTTP process never executes repository code. For a local GitHub App deployment, start the two processes with the same `PATCHPROOF_SQLITE_PATH`:
 
@@ -253,20 +255,21 @@ See [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) 
 
 ## Documentation
 
-| Guide                                                      | Covers                                        |
-| ---------------------------------------------------------- | --------------------------------------------- |
-| [Quickstart](docs/quickstart.md)                           | First local run, step by step                 |
-| [CLI reference](docs/cli-reference.md)                     | Every command, flag, and exit code            |
-| [Configuration reference](docs/configuration-reference.md) | `.patchproof.yml` fields and limits           |
-| [Evidence format](docs/evidence-format.md)                 | Bundle schema, integrity, and artifacts       |
-| [Replay model](docs/replay-model.md)                       | What replay proves and what it asks of you    |
-| [Architecture](docs/architecture.md)                       | Process boundaries and design decisions       |
-| [Deployment](docs/deployment.md)                           | Production processes, variables, and ceilings |
-| [GitHub App setup](docs/github-app-setup.md)               | App registration, permissions, events         |
-| [Manual validation](docs/github-app-validation.md)         | Protected credential validation procedure     |
-| [Threat model](docs/threat-model.md)                       | Adversaries, controls, residual risks         |
-| [Troubleshooting](docs/troubleshooting.md)                 | Outcomes, errors, and recovery                |
-| [Contributor guide](docs/contributor-guide.md)             | Day-to-day development workflow               |
+| Guide                                                      | Covers                                                |
+| ---------------------------------------------------------- | ----------------------------------------------------- |
+| [Quickstart](docs/quickstart.md)                           | First local run, step by step                         |
+| [CLI reference](docs/cli-reference.md)                     | Every command, flag, and exit code                    |
+| [Configuration reference](docs/configuration-reference.md) | `.patchproof.yml` fields and limits                   |
+| [Evidence format](docs/evidence-format.md)                 | Bundle schema, integrity, and artifacts               |
+| [Replay model](docs/replay-model.md)                       | What replay proves and what it asks of you            |
+| [Architecture](docs/architecture.md)                       | Process boundaries and design decisions               |
+| [Deployment](docs/deployment.md)                           | Production processes, variables, and ceilings         |
+| [GitHub App setup](docs/github-app-setup.md)               | App registration, permissions, events                 |
+| [Manual validation](docs/github-app-validation.md)         | Protected credential validation procedure             |
+| [Offline evidence example](docs/examples/README.md)        | Verify a complete fixture bundle without running code |
+| [Threat model](docs/threat-model.md)                       | Adversaries, controls, residual risks                 |
+| [Troubleshooting](docs/troubleshooting.md)                 | Outcomes, errors, and recovery                        |
+| [Contributor guide](docs/contributor-guide.md)             | Day-to-day development workflow                       |
 
 ## Current limitations
 

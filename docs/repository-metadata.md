@@ -1,11 +1,7 @@
 # Repository metadata
 
-Suggested GitHub description:
+The public GitHub repository is `kwlck/PatchProof`. Its description and topics are maintained in GitHub settings; this page records the intended positioning for contributors:
 
 > Replayable evidence that a pull-request fix changes the claimed behavior.
 
-Suggested topics:
-
-`github-app`, `pull-request`, `regression-testing`, `reproducible-builds`, `security`, `typescript`, `docker`, `developer-tools`
-
-These are suggestions for a later maintainer-configured repository. This local task does not change a remote repository.
+Relevant topics include `github-app`, `pull-request`, `regression-testing`, `reproducible-builds`, `security`, `typescript`, `docker`, and `developer-tools`.
