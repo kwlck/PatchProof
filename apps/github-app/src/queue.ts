@@ -252,6 +252,10 @@ export class SqliteQueue implements RunQueue {
         ON patchproof_jobs(created_at, id)
         WHERE status IN ('succeeded', 'cancelled')
           AND lease_owner IS NULL AND lease_expires_at IS NULL;
+      CREATE TABLE IF NOT EXISTS patchproof_worker_heartbeat (
+        worker_id TEXT PRIMARY KEY,
+        last_seen TEXT NOT NULL
+      );
     `);
     for (const column of [
       'ALTER TABLE patchproof_jobs ADD COLUMN installation_id INTEGER',
@@ -268,6 +272,32 @@ export class SqliteQueue implements RunQueue {
         // The column already exists in a previously initialized local database.
       }
     }
+  }
+
+  /** A worker only reports readiness after checking its Docker daemon. */
+  public reportHeartbeat(workerId: string): void {
+    if (!workerId || workerId.length > 128) throw new Error('Worker identity is invalid');
+    const seen = nowIso(this.clock);
+    this.database
+      .prepare(
+        `INSERT INTO patchproof_worker_heartbeat(worker_id, last_seen) VALUES (?, ?)
+        ON CONFLICT(worker_id) DO UPDATE SET last_seen = excluded.last_seen`,
+      )
+      .run(workerId, seen);
+    this.database
+      .prepare('DELETE FROM patchproof_worker_heartbeat WHERE last_seen < ?')
+      .run(new Date(this.clock().getTime() - 86_400_000).toISOString());
+  }
+
+  public hasReadyWorker(maxAgeMs = 30_000): boolean {
+    if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs <= 0)
+      throw new Error('Worker readiness age is invalid');
+    const cutoff = new Date(this.clock().getTime() - maxAgeMs).toISOString();
+    return (
+      this.database
+        .prepare('SELECT 1 FROM patchproof_worker_heartbeat WHERE last_seen >= ? LIMIT 1')
+        .get(cutoff) !== undefined
+    );
   }
 
   public enqueue(request: QueueEnqueueRequest, maxAttempts = 3): Promise<QueueJob> {

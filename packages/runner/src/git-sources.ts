@@ -10,6 +10,7 @@ const GIT_TIMEOUT_MS = 60_000;
 export interface GitRevision {
   path: string;
   ref: string;
+  sha: string;
   cleanup(): Promise<void>;
 }
 
@@ -35,8 +36,9 @@ export async function exportGitRevision(
   scratchHint = 'patchproof-rev-',
 ): Promise<GitRevision> {
   const resolvedRepo = repoPath;
+  let sha: string;
   try {
-    await git(resolvedRepo, ['rev-parse', '--verify', `${ref}^{commit}`]);
+    sha = (await git(resolvedRepo, ['rev-parse', '--verify', `${ref}^{commit}`])).trim();
   } catch {
     throw new Error(
       `git revision '${ref}' does not resolve in ${resolvedRepo}; pass a commit, branch, tag, or git:HEAD~1 style ref`,
@@ -54,6 +56,7 @@ export async function exportGitRevision(
   return {
     path: dir,
     ref,
+    sha,
     cleanup: async () => {
       await git(resolvedRepo, ['worktree', 'remove', '--force', dir]).catch(() => undefined);
       await git(resolvedRepo, ['worktree', 'prune']).catch(() => undefined);

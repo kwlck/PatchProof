@@ -1,5 +1,7 @@
 import { mkdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { GitHubApiTransport } from './github-api.js';
 import { SqliteStateStore } from './sqlite.js';
 import { SqliteQueue } from './queue.js';
@@ -12,6 +14,8 @@ import {
 } from './github-auth.js';
 import { parseWorkerOperatorPolicy } from './worker-policy.js';
 import type { OperatorPolicyInput } from '@patchproof/runner';
+
+const exec = promisify(execFile);
 
 let credentials: GitHubAppCredentials | undefined;
 try {
@@ -44,17 +48,33 @@ if (credentials === undefined) {
     requireInstallationId: true,
   });
   const github = new GitHubApiTransport(auth);
+  const workerId = process.env.PATCHPROOF_WORKER_ID ?? `worker-${process.pid}`;
   const worker = new PatchProofWorker({
     queue,
     source: new GitHubSourceAdapter(auth),
     store,
     github,
     outputRoot,
-    workerId: process.env.PATCHPROOF_WORKER_ID ?? `worker-${process.pid}`,
+    workerId,
     operatorPolicy,
     requireFreshSnapshot: true,
   });
   let shutdownRequested = false;
+  const heartbeat = async (): Promise<void> => {
+    try {
+      await exec('docker', ['version', '--format', '{{.Server.Version}}'], {
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+        windowsHide: true,
+      });
+      queue.reportHeartbeat(workerId);
+    } catch {
+      // The last successful heartbeat expires, so readiness becomes false.
+    }
+  };
+  await heartbeat();
+  const heartbeatTimer = setInterval(() => void heartbeat(), 10_000);
+  heartbeatTimer.unref();
   const shutdown = (): void => {
     worker.stop();
     if (shutdownRequested) process.exit(1);
@@ -76,6 +96,7 @@ if (credentials === undefined) {
   try {
     await worker.runForever();
   } finally {
+    clearInterval(heartbeatTimer);
     if (metricsTimer !== undefined) clearInterval(metricsTimer);
     queue.close();
     store.close();

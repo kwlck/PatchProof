@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { lstat, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -392,7 +392,15 @@ export async function runSetup(args: ParsedArgs): Promise<number> {
   }
 
   const demoDir = resolve(typeof demoDirOption === 'string' ? demoDirOption : 'patchproof-demo');
-  await rm(demoDir, { recursive: true, force: true });
+  await mkdir(join(demoDir, '..'), { recursive: true });
+  try {
+    await mkdir(demoDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const stat = await lstat(demoDir);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (await readdir(demoDir)).length > 0)
+      throw new Error(`Demo directory is not empty: ${demoDir}; choose a new --demo-dir`);
+  }
   if (json) {
     try {
       const demo = await runDemo(demoDir);

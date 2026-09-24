@@ -51,6 +51,7 @@ if (secret === undefined || secret.length < 16 || credentials === undefined) {
     },
     cancelPullRequest: async (repository, pullRequest, reason) =>
       queue.cancelPullRequest(repository, pullRequest, reason),
+    ready: () => queue.hasReadyWorker(),
     requireInstallationId: true,
   });
   server.listen(port, () => console.log(`PatchProof GitHub App listening on ${port}`));
