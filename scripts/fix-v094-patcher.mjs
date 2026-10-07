@@ -30,4 +30,8 @@ await transform('packages/core/src/evidence.ts', (source) =>
 );`;
 if (!source.includes(before)) throw new Error('lockfile patch block not found');
 source = source.replace(before, after);
+const interpolationBefore = "await writeFile(bundlePath, \\\`${canonicalize(bundle)}\\\\n\\\`, 'utf8');";
+const interpolationAfter = "await writeFile(bundlePath, \\\`\\${canonicalize(bundle)}\\\\n\\\`, 'utf8');";
+if (!source.includes(interpolationBefore)) throw new Error('regression test interpolation was not found');
+source = source.replace(interpolationBefore, interpolationAfter);
 await writeFile(path, source, 'utf8');
