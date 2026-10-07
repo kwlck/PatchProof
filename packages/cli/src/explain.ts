@@ -34,6 +34,22 @@ export function buildExplainPrompt(bundleText: string): AiMessage[] {
 }
 
 /**
+ * Backward-compatible parser for callers that still handle raw Chat
+ * Completions responses themselves. New commands use requestAiText directly.
+ */
+export function parseExplanation(text: string): string | undefined {
+  let content: unknown;
+  try {
+    const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: unknown } }> };
+    content = parsed.choices?.[0]?.message?.content;
+  } catch {
+    return undefined;
+  }
+  if (typeof content !== 'string' || content.trim().length === 0) return undefined;
+  return content.trim();
+}
+
+/**
  * Optional AI triage, strictly bring your own key. The evidence bundle is
  * fully verified before a bounded excerpt is sent to the configured model.
  */
