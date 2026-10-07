@@ -1,0 +1,52 @@
+name: Apply v0.9.4 hardening
+
+on:
+  push:
+    branches:
+      - codex/harden-v0.9.4
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: codex/harden-v0.9.4
+          fetch-depth: 0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Apply targeted changes
+        run: node scripts/apply-v094.mjs
+      - name: Format
+        run: pnpm format
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm test:e2e
+      - run: pnpm docs:check
+      - run: pnpm package:check
+      - name: Remove one-shot patch machinery
+        run: rm scripts/apply-v094.mjs .github/workflows/apply-v094.yml
+      - name: Commit verified changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git status --short
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet && { echo 'No changes to commit' >&2; exit 1; }
+          git commit -m 'Harden PatchProof for v0.9.4'
+          git push origin HEAD:codex/harden-v0.9.4
