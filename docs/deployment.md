@@ -11,12 +11,17 @@ PATCHPROOF_GITHUB_APP_ID=<numeric GitHub App ID>
 PATCHPROOF_GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----
 PATCHPROOF_SQLITE_PATH=/var/lib/patchproof/patchproof.sqlite
 PATCHPROOF_EVIDENCE_ROOT=/var/lib/patchproof/evidence
-PATCHPROOF_APPROVED_DOCKER_IMAGES=<image>@sha256:<64 hexadecimal characters>
+PATCHPROOF_APPROVED_DOCKER_IMAGES=<scenario-image>@sha256:<64 hexadecimal characters>
+PATCHPROOF_EGRESS_PROXY_IMAGE=<squid-image>@sha256:<64 hexadecimal characters>
 ```
 
 Both processes require `PATCHPROOF_GITHUB_APP_ID` and `PATCHPROOF_GITHUB_APP_PRIVATE_KEY`. No static installation token is read from the environment: each process signs a short-lived JWT with that key and mints its own installation tokens.
 
-The worker also requires `PATCHPROOF_APPROVED_DOCKER_IMAGES` before startup: a comma-separated list of image references pinned by sha256 digest. The worker exits when the variable is absent or any entry lacks a digest pin, so an unpinned image such as `node:24-bookworm-slim` cannot run under it. Repository configurations must select a digest-pinned image from this list.
+The worker requires `PATCHPROOF_APPROVED_DOCKER_IMAGES` before startup: a comma-separated list of image references pinned by sha256 digest. The worker exits when the variable is absent or any entry lacks a digest pin, so an unpinned image such as `node:24-bookworm-slim` cannot run under it. Repository configurations must select a digest-pinned image from this list.
+
+`patchproof setup --app` now tries to make the generated environment app-ready. When Docker is available it pulls the default scenario image and the default Squid egress image once, resolves their immutable repository digests, and writes both `PATCHPROOF_APPROVED_DOCKER_IMAGES` and `PATCHPROOF_EGRESS_PROXY_IMAGE` to the generated private env file. If pinning cannot complete, the wizard still writes credentials but leaves explicit fail-closed instructions; the worker must not be started until immutable image values are configured.
+
+`PATCHPROOF_EGRESS_PROXY_IMAGE` is required only when a repository requests `policy.network: allowlist`, but when present it must always be digest-pinned. Allowlisted scenarios join only a fresh internal Docker network. A separately pinned proxy container is dual-homed to that internal network and the Docker bridge; direct scenario routing to the internet does not exist. Squid enforces exact DNS host ACLs and rejects private/link-local/loopback/non-public destination ranges after resolution. Missing or malformed proxy configuration denies the run instead of silently widening network access.
 
 The worker accepts optional positive-integer ceilings: `PATCHPROOF_MAX_TIMEOUT_MS` (default 120000), `PATCHPROOF_MAX_OUTPUT_BYTES` (16777216), `PATCHPROOF_MAX_MEMORY_MB` (2048), `PATCHPROOF_MAX_CPU_COUNT` (4), `PATCHPROOF_MAX_PIDS` (512), and `PATCHPROOF_PROVISIONING_TIMEOUT_MS` (120000). A repository value above a ceiling is denied at run time, and a malformed value stops the worker at startup. `PATCHPROOF_WORKER_ID` labels lease ownership in SQLite and defaults to `worker-<process id>`.
 
@@ -36,7 +41,7 @@ Operational guidance:
 - run the app as a non-root service account;
 - keep SQLite on durable local storage or replace `ManagedStateStore` and `RunQueue` with transactional adapters;
 - run workers on hosts with a Docker CLI and daemon, with quotas outside the executed container;
-- pin the runner image by digest in production and review image updates;
+- pin scenario and egress-proxy images by digest in production and review image updates;
 - retain evidence bundles according to repository policy and verify them before external storage;
 - publish Check and managed-comment summaries, not unredacted logs.
 
