@@ -26,6 +26,8 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Repair one-shot patcher
+        run: node scripts/fix-v094-patcher.mjs
       - name: Apply targeted changes
         run: node scripts/apply-v094.mjs
       - name: Format
@@ -37,7 +39,7 @@ jobs:
       - run: pnpm docs:check
       - run: pnpm package:check
       - name: Remove one-shot patch machinery
-        run: rm scripts/apply-v094.mjs .github/workflows/apply-v094.yml
+        run: rm scripts/apply-v094.mjs scripts/fix-v094-patcher.mjs .github/workflows/apply-v094.yml
       - name: Commit verified changes
         shell: bash
         run: |
