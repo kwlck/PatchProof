@@ -43,7 +43,7 @@ for (const marker of [
   'PatchProof PASS -',
   'BASE  fail        exit=1',
   'HEAD  pass        exit=0',
-  'Evidence   schema=1 sha256=',
+  'Evidence   schema=2 sha256=',
   'Policy     backend=local network=none trusted-config=base',
   'Replay     patchproof replay patchproof.evidence.json --yes',
 ]) {
@@ -74,9 +74,14 @@ else {
     if (!result.valid || !result.digestValid || !result.artifactsValid)
       failures.push('offline fixture evidence is invalid');
     const bundle = JSON.parse(readFileSync(publishedExample, 'utf8'));
-    const version = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')).version;
-    if (bundle.outcome !== 'PASS' || bundle.product.version !== version)
-      failures.push('offline fixture evidence has the wrong outcome or product version');
+    if (
+      bundle.outcome !== 'PASS' ||
+      bundle.schemaVersion !== 1 ||
+      bundle.product.version !== '0.9.4'
+    )
+      failures.push(
+        'offline fixture evidence no longer matches the published v1 compatibility proof',
+      );
   } catch (error) {
     failures.push(`offline fixture evidence could not be verified: ${commandDiagnostics(error)}`);
   }
@@ -102,7 +107,7 @@ else {
       ],
       { cwd: root, encoding: 'utf8', shell: false, windowsHide: true, maxBuffer: 1_000_000 },
     );
-    for (const marker of ['PatchProof PASS -', 'BASE', 'HEAD', 'Evidence   schema=1', 'Replay'])
+    for (const marker of ['PatchProof PASS -', 'BASE', 'HEAD', 'Evidence   schema=2', 'Replay'])
       if (!report.includes(marker)) failures.push(`CLI report is missing: ${marker}`);
   } catch (error) {
     failures.push(`CLI fixture report did not run: ${commandDiagnostics(error)}`);

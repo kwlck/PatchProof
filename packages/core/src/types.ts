@@ -1,6 +1,8 @@
 export const EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const CURRENT_EVIDENCE_SCHEMA_VERSION = 2 as const;
+export const SUPPORTED_EVIDENCE_SCHEMA_VERSIONS = [1, 2] as const;
 
-export type EvidenceSchemaVersion = typeof EVIDENCE_SCHEMA_VERSION;
+export type EvidenceSchemaVersion = (typeof SUPPORTED_EVIDENCE_SCHEMA_VERSIONS)[number];
 
 export type RunOutcome = 'PASS' | 'FAIL' | 'INCONCLUSIVE' | 'INFRA_ERROR' | 'POLICY_DENIED';
 
@@ -23,12 +25,19 @@ export interface ScenarioSnapshot {
   sha256: string;
 }
 
+/**
+ * Schema v2 stops calling a Git object ID "sha256". Directory snapshots keep
+ * their real SHA-256 tree digest; Git snapshots carry commitOid/objectFormat.
+ * Optional fields preserve an in-memory representation for verified v1 bundles.
+ */
 export interface SourceSnapshot {
   revision: RevisionName;
   ref: string;
-  sha256: string;
   kind: 'git-commit' | 'directory-tree';
   location: string;
+  sha256?: string;
+  commitOid?: string;
+  objectFormat?: 'sha1' | 'sha256';
 }
 
 export interface PolicySnapshot {

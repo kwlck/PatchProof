@@ -3,11 +3,10 @@ import type { PatchProofConfig } from '@patchproof/config';
 /**
  * Limits and floors owned by the process running PatchProof.
  *
- * Repository configuration is untrusted input.  An operator can pass this
- * policy to the runner to keep repository-selected values below a ceiling and
- * to require an immutable, reviewed image.  The empty image allowlist is
- * intentionally useful for local development; production callers should
- * populate it and leave `requireDigestPinnedImages` enabled.
+ * Repository configuration is untrusted input. An operator can pass this
+ * policy to keep repository-selected values below a ceiling, require reviewed
+ * immutable images, and provide the immutable egress proxy used to enforce a
+ * repository network allowlist.
  */
 export interface OperatorPolicy {
   forceDocker: boolean;
@@ -20,6 +19,7 @@ export interface OperatorPolicy {
   requireDigestPinnedImages: boolean;
   requireReadOnlyRoot: boolean;
   provisioningTimeoutMs: number;
+  egressProxyImage?: string;
 }
 
 export type OperatorPolicyInput = Partial<OperatorPolicy>;
@@ -56,6 +56,9 @@ function booleanValue(value: boolean, name: string): boolean {
 }
 
 function mergeOperatorPolicy(input: OperatorPolicyInput): OperatorPolicy {
+  const egressProxyImage = input.egressProxyImage;
+  if (egressProxyImage !== undefined && typeof egressProxyImage !== 'string')
+    throw new TypeError('Operator policy egressProxyImage must be a string');
   return {
     forceDocker: booleanValue(
       input.forceDocker ?? DEFAULT_OPERATOR_POLICY.forceDocker,
@@ -93,6 +96,7 @@ function mergeOperatorPolicy(input: OperatorPolicyInput): OperatorPolicy {
       input.provisioningTimeoutMs ?? DEFAULT_OPERATOR_POLICY.provisioningTimeoutMs,
       'provisioningTimeoutMs',
     ),
+    ...(egressProxyImage === undefined ? {} : { egressProxyImage }),
   };
 }
 
@@ -104,6 +108,27 @@ export function isDigestPinnedImage(image: string): boolean {
   return image.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9._/@:-]*@sha256:[0-9a-f]{64}$/iu.test(image);
 }
 
+/** Exact public DNS host name accepted by the egress proxy; no wildcards or IP literals. */
+export function isAllowedEgressHost(host: string): boolean {
+  if (host.length < 4 || host.length > 253 || host !== host.toLowerCase()) return false;
+  if (host.endsWith('.') || host.includes('*') || host.includes(':')) return false;
+  if (/^\d+(?:\.\d+){3}$/u.test(host)) return false;
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host.endsWith('.home.arpa')
+  )
+    return false;
+  const labels = host.split('.');
+  if (labels.length < 2) return false;
+  return labels.every(
+    (label) =>
+      label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(label),
+  );
+}
+
 function denied(
   policy: PatchProofConfig['policy'],
   operatorPolicy: OperatorPolicy,
@@ -112,11 +137,7 @@ function denied(
   return { allowed: false, policy, operatorPolicy, reason };
 }
 
-/**
- * Apply an operator-owned policy without silently widening any repository
- * request.  A repository value above a ceiling is denied, while immutable
- * image and isolation requirements are also fail-closed.
- */
+/** Apply operator-owned policy without silently widening repository requests. */
 export function applyOperatorPolicy(
   repositoryPolicy: PatchProofConfig['policy'],
   input: OperatorPolicyInput,
@@ -128,18 +149,47 @@ export function applyOperatorPolicy(
       operatorPolicy,
       'Operator-approved Docker images must all be pinned by sha256 digest',
     );
+  if (
+    operatorPolicy.egressProxyImage !== undefined &&
+    !isDigestPinnedImage(operatorPolicy.egressProxyImage)
+  )
+    return denied(
+      repositoryPolicy,
+      operatorPolicy,
+      'Operator egress proxy image must be pinned by sha256 digest',
+    );
   if (operatorPolicy.forceDocker && repositoryPolicy.backend !== 'docker')
     return denied(
       repositoryPolicy,
       operatorPolicy,
       'Operator policy requires the Docker backend; local process execution is not permitted. Install Docker, or run a development check with --allow-unsafe-local and a config that sets policy.allowUnsafeLocal: true',
     );
-  if (repositoryPolicy.network === 'allowlist')
-    return denied(
-      repositoryPolicy,
-      operatorPolicy,
-      'Network allowlists have no enforcing adapter and are refused by the runner',
-    );
+  if (repositoryPolicy.network === 'allowlist') {
+    if (repositoryPolicy.backend !== 'docker')
+      return denied(
+        repositoryPolicy,
+        operatorPolicy,
+        'Network allowlists require the Docker backend',
+      );
+    if (operatorPolicy.egressProxyImage === undefined)
+      return denied(
+        repositoryPolicy,
+        operatorPolicy,
+        'Network allowlists require PATCHPROOF_EGRESS_PROXY_IMAGE pinned by sha256 digest',
+      );
+    if (repositoryPolicy.allowedHosts.length === 0)
+      return denied(
+        repositoryPolicy,
+        operatorPolicy,
+        'Network allowlist must contain at least one host',
+      );
+    if (repositoryPolicy.allowedHosts.some((host) => !isAllowedEgressHost(host)))
+      return denied(
+        repositoryPolicy,
+        operatorPolicy,
+        'Network allowlist hosts must be exact lowercase public DNS names without wildcards or IP literals',
+      );
+  }
   if (repositoryPolicy.timeoutMs > operatorPolicy.maxTimeoutMs)
     return denied(
       repositoryPolicy,

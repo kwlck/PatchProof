@@ -143,12 +143,13 @@ export async function sourceIdentity(
         ...(process.env.SystemRoot === undefined ? {} : { SystemRoot: process.env.SystemRoot }),
         GIT_CONFIG_NOSYSTEM: '1',
         GIT_TERMINAL_PROMPT: '0',
-        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
         LC_ALL: 'C',
       },
     });
     const ref = result.stdout.trim();
-    if (/^[0-9a-f]{40}$/i.test(ref)) return { sha256: ref, kind: 'git-commit', ref };
+    if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(ref))
+      return { sha256: ref, kind: 'git-commit', ref };
   } catch {
     // A directory fixture is a supported local source and uses its deterministic tree hash.
   }

@@ -16,6 +16,8 @@ export interface ExecutionSpec {
   signal?: AbortSignal;
   /** Operator-owned provisioning budget, separate from scenario timeout. */
   provisioningTimeoutMs?: number;
+  /** Digest-pinned operator image used only by the enforcing allowlist backend. */
+  egressProxyImage?: string;
 }
 
 export interface BackendExecution {

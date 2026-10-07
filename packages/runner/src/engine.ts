@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { canonicalize, decidePolicy, sha256, type PolicyDecision } from '@patchproof/core';
 import { assertSafeRelativePath, type PatchProofConfig } from '@patchproof/config';
+import { AllowlistDockerBackend } from './allowlist-docker.js';
 import { DockerBackend } from './docker.js';
 import { LocalProcessBackend } from './process.js';
 import { applyOperatorPolicy, resolveOperatorPolicy, type OperatorPolicyInput } from './policy.js';
@@ -42,7 +43,8 @@ export function chooseBackend(
   options: TwoRevisionOptions,
 ): ExecutionBackend {
   const backend = options.backendOverride ?? config.policy.backend;
-  return backend === 'local' ? new LocalProcessBackend() : new DockerBackend();
+  if (backend === 'local') return new LocalProcessBackend();
+  return config.policy.network === 'allowlist' ? new AllowlistDockerBackend() : new DockerBackend();
 }
 
 function scenarioEnvironmentFor(
@@ -75,10 +77,6 @@ function launcherSummary(environment: Record<string, string>): {
 export async function runTwoRevisions(
   options: TwoRevisionOptions,
 ): Promise<TwoRevisionRun | PolicyDeniedRun> {
-  const operatorPolicy =
-    options.operatorPolicy === undefined
-      ? undefined
-      : resolveOperatorPolicy(options.operatorPolicy);
   // Select the effective backend before applying operator constraints. This
   // prevents a Docker override from bypassing image and isolation checks that
   // would otherwise inspect only the repository-declared backend.
@@ -87,6 +85,27 @@ export async function runTwoRevisions(
     ...options.config.policy,
     backend: selectedBackend,
   };
+
+  // Standalone CLI runs may opt into the same enforcing proxy through an
+  // operator-owned environment variable. Supplying a repository allowlist
+  // implicitly activates operator policy so a missing/unpinned proxy fails closed.
+  const configuredProxyImage =
+    options.operatorPolicy?.egressProxyImage ?? process.env.PATCHPROOF_EGRESS_PROXY_IMAGE;
+  const operatorInput: OperatorPolicyInput | undefined =
+    options.operatorPolicy === undefined
+      ? effectiveRepositoryPolicy.network === 'allowlist'
+        ? {
+            forceDocker: true,
+            ...(configuredProxyImage === undefined
+              ? {}
+              : { egressProxyImage: configuredProxyImage }),
+          }
+        : undefined
+      : {
+          ...options.operatorPolicy,
+          ...(configuredProxyImage === undefined ? {} : { egressProxyImage: configuredProxyImage }),
+        };
+  const operatorPolicy = resolveOperatorPolicy(operatorInput);
   const operatorDecision =
     operatorPolicy === undefined
       ? undefined
@@ -119,15 +138,6 @@ export async function runTwoRevisions(
     trustedConfig: options.trustedConfig === true,
   });
   if (!decision.allowed) return { policy: decision, reason: decision.reason ?? 'Execution denied' };
-  if (configuredPolicy.network === 'allowlist') {
-    const policy = {
-      allowed: false,
-      outcome: 'POLICY_DENIED' as const,
-      reason:
-        'Network allowlists require an operator-provided enforcing adapter; egress was not enabled',
-    };
-    return { policy, reason: policy.reason };
-  }
 
   const basePath = resolve(options.basePath);
   const headPath = resolve(options.headPath);
@@ -194,7 +204,12 @@ export async function runTwoRevisions(
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         ...(operatorPolicy === undefined
           ? {}
-          : { provisioningTimeoutMs: operatorPolicy.provisioningTimeoutMs }),
+          : {
+              provisioningTimeoutMs: operatorPolicy.provisioningTimeoutMs,
+              ...(operatorPolicy.egressProxyImage === undefined
+                ? {}
+                : { egressProxyImage: operatorPolicy.egressProxyImage }),
+            }),
       };
       const execution = await backendInstance.run(spec);
       const dependencyLock = await hashKnownLockfile(workspace);
@@ -210,7 +225,12 @@ export async function runTwoRevisions(
             : { status: 'present' as const, ...dependencyLock },
       };
     };
-    const backendInstance = chooseBackend(options.config, options);
+    const backendInstance: ExecutionBackend =
+      backend === 'local'
+        ? new LocalProcessBackend()
+        : configuredPolicy.network === 'allowlist'
+          ? new AllowlistDockerBackend()
+          : new DockerBackend();
     const base = await runRevision('base', baseWork, baseSource);
     const head = await runRevision('head', headWork, headSource);
     // The finally block below is awaited before this promise resolves, so the returned evidence can state cleanup succeeded.
@@ -232,4 +252,4 @@ export function isPolicyDeniedRun(
   return 'policy' in value && 'reason' in value;
 }
 
-export const RUNNER_VERSION = '0.1.0';
+export const RUNNER_VERSION = '0.2.0';
