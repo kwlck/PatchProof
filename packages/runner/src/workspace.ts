@@ -38,6 +38,9 @@ export const KNOWN_LOCKFILES = [
   'package-lock.json',
   'yarn.lock',
   'npm-shrinkwrap.json',
+  'uv.lock',
+  'poetry.lock',
+  'Pipfile.lock',
 ] as const;
 
 export type KnownLockfileName = (typeof KNOWN_LOCKFILES)[number];

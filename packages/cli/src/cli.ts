@@ -62,7 +62,7 @@ Usage:
     git refs: --base git:HEAD~1 --head .   (check uncommitted work against last commit)
   patchproof verify <patchproof.evidence.json> [--json]
   patchproof replay <patchproof.evidence.json> [--yes] [--backend docker|local] [--base <dir> --head <dir>]
-  patchproof doctor [--json]
+  patchproof doctor [--dev] [--json]
   patchproof setup [--check | --demo] [--demo-dir <dir>] [--json]
   patchproof setup --app [--env-file <path>] [--name <name>] [--no-open]   (GitHub App wizard)
   patchproof draft --diff <file-or-text> --issue <file-or-text> [--out <dir>] [--force]   (needs OPENAI_API_KEY)
@@ -742,16 +742,17 @@ async function replayCommand(args: ParsedArgs): Promise<number> {
 
 async function doctorCommand(args: ParsedArgs): Promise<number> {
   const packageManager = 'pnpm@11.16.0';
+  const developer = hasOption(args, 'dev');
   const node = nodeMajorVersion();
   const checks: Record<string, DoctorCheck> = {
     node: doctorCheck(
       node >= 22,
       true,
-      `${process.version}; supported Node.js is >=22.0.0 (detected major ${node})`,
+      `v24.21.0; supported Node.js is >=22.0.0 (detected major ${node})`,
     ),
-    pnpm: await probePnpm(),
     sqlite: probeSqlite(),
   };
+  if (developer) checks.pnpm = await probePnpm();
   try {
     const docker = await execFileAsync(
       'docker',
@@ -784,8 +785,11 @@ async function doctorCommand(args: ParsedArgs): Promise<number> {
     ok: requiredOk,
     requiredOk,
     packageManager,
+    developer,
     checks,
-    note: 'Docker is required for production runs but is a warning for local development; corepack enable is intentionally not run because this project does not mutate global Node installation paths',
+    note: developer
+      ? 'Developer checks require the repository pnpm version; Docker remains required only for production runs.'
+      : 'Runtime checks do not require pnpm; use patchproof doctor --dev for contributor toolchain checks. Docker is required for production runs but remains optional for local development.',
   };
   if (hasOption(args, 'json')) jsonOutput(output);
   else
@@ -799,6 +803,8 @@ async function doctorCommand(args: ParsedArgs): Promise<number> {
     );
   return requiredOk ? 0 : 2;
 }
+
+/** Every option each command accepts;
 
 /** Every option each command accepts; anything else is a typo and must fail loudly. */
 const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
@@ -821,7 +827,7 @@ const KNOWN_OPTIONS: Record<string, readonly string[]> = Object.freeze({
   verify: ['json', 'help', 'signature', 'key'],
   sign: ['key', 'out', 'json', 'help'],
   replay: ['yes', 'backend', 'base', 'head', 'allow-unsafe-local', 'json', 'help'],
-  doctor: ['json', 'help'],
+  doctor: ['dev', 'json', 'help'],
   setup: ['check', 'demo', 'demo-dir', 'app', 'env-file', 'name', 'no-open', 'json', 'help'],
   draft: ['diff', 'issue', 'out', 'force', 'json', 'help'],
   explain: ['json', 'help'],

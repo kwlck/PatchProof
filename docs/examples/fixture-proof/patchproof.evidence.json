@@ -51,7 +51,10 @@
       "command": ["node", "scenario.mjs"],
       "cwd": ".",
       "durationMs": 29,
-      "environment": { "CI": "1", "PATCHPROOF_REVISION": "base" },
+      "environment": {
+        "CI": "1",
+        "PATCHPROOF_REVISION": "base"
+      },
       "exitCode": 1,
       "launcherEnvironment": {
         "keys": ["PATH"],
@@ -75,7 +78,9 @@
       "timedOut": false,
       "toolchain": {
         "arch": "x64",
-        "dependencyLock": { "status": "not-detected" },
+        "dependencyLock": {
+          "status": "not-detected"
+        },
         "node": "v24.19.0",
         "platform": "linux",
         "runner": "@patchproof/runner/0.1.0"
@@ -85,7 +90,10 @@
       "command": ["node", "scenario.mjs"],
       "cwd": ".",
       "durationMs": 29,
-      "environment": { "CI": "1", "PATCHPROOF_REVISION": "head" },
+      "environment": {
+        "CI": "1",
+        "PATCHPROOF_REVISION": "head"
+      },
       "exitCode": 0,
       "launcherEnvironment": {
         "keys": ["PATH"],
@@ -109,7 +117,9 @@
       "timedOut": false,
       "toolchain": {
         "arch": "x64",
-        "dependencyLock": { "status": "not-detected" },
+        "dependencyLock": {
+          "status": "not-detected"
+        },
         "node": "v24.19.0",
         "platform": "linux",
         "runner": "@patchproof/runner/0.1.0"
@@ -118,7 +128,7 @@
   },
   "integrity": {
     "algorithm": "sha256",
-    "canonicalSha256": "99599a650e2620c4f8a8c81c5eef2957f6c85b50702b9f16532cadde40588f4e",
+    "canonicalSha256": "7618f19120b02c3ec8e68669dd5cc3bde69e25d2cf34b7e4bb1c7ab74872577c",
     "signer": null
   },
   "outcome": "PASS",
@@ -137,18 +147,28 @@
     "trustedConfigRevision": "base",
     "unsafeLocalProcess": true
   },
-  "product": { "name": "PatchProof", "version": "0.9.3" },
+  "product": {
+    "name": "PatchProof",
+    "version": "0.9.4"
+  },
   "replay": {
     "baseLocation": "base",
     "headLocation": "head",
-    "recordedEnvironment": { "arch": "x64", "node": "v24.19.0", "platform": "linux" },
+    "recordedEnvironment": {
+      "arch": "x64",
+      "node": "v24.19.0",
+      "platform": "linux"
+    },
     "requiresExplicitConfirmation": true,
     "supported": true
   },
   "scenario": {
     "command": ["node", "scenario.mjs"],
     "cwd": ".",
-    "expectedFailure": { "exitCode": 1, "reasonPattern": "EXPECTED_BUG" },
+    "expectedFailure": {
+      "exitCode": 1,
+      "reasonPattern": "EXPECTED_BUG"
+    },
     "file": "scenario.mjs",
     "id": "parser-regression",
     "name": "Parser rejects the old malformed token and accepts the fixed token",

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.9.4 - 2026-10-07
+
+- Make SQLite schema upgrades inspect existing columns and propagate genuine migration failures instead of swallowing every ALTER TABLE error.
+- Isolate GitHub source fetches from host global Git configuration and keep credentials out of argv.
+- Align local-backend diagnostics with the post-0.9.2 policy behavior.
+- Record Python lockfiles (uv, Poetry, and Pipenv) in dependency evidence and accept them during verification.
+- Enforce outputBytes as one shared stdout/stderr budget.
+- Make patchproof doctor a runtime check by default; contributor pnpm validation moves behind --dev.
+- Refresh Docker launcher security commentary and add regression coverage for the hardening changes.
+
 ## 0.9.3 - 2026-09-24
 
 - Protect existing files in `init`, `setup --demo`, and evidence output paths; each default run now writes a separate bundle.

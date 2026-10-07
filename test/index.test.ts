@@ -17,3 +17,4 @@ import './server.test.ts';
 import './explain.test.ts';
 import './signature.test.ts';
 import './cli-flows.test.ts';
+import './v094-regressions.test.ts';
