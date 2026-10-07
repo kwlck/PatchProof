@@ -61,6 +61,10 @@ export class GitHubSourceAdapter implements SourceAdapter {
       'base64',
     )}`;
     await mkdir(root, { recursive: true, mode: 0o700 });
+    // Source repositories are untrusted. Keep Git on a deliberately tiny host
+    // environment and disable both system and user-level configuration so a
+    // worker account cannot inherit aliases, credential helpers, hooks paths,
+    // proxies, or other behavior from the host Git installation.
     const environment: NodeJS.ProcessEnv = {
       ...(process.env.PATH === undefined ? {} : { PATH: process.env.PATH }),
       ...(process.env.SystemRoot === undefined ? {} : { SystemRoot: process.env.SystemRoot }),
@@ -68,6 +72,8 @@ export class GitHubSourceAdapter implements SourceAdapter {
       ...(process.env.TMP === undefined ? {} : { TMP: process.env.TMP }),
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
+      LC_ALL: 'C',
     };
     const runGit = async (arguments_: string[], authenticated = false): Promise<string> => {
       const gitArguments =
