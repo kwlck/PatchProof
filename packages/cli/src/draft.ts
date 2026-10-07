@@ -3,9 +3,15 @@ import { constants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { loadConfig, ConfigValidationError, formatDiagnostics } from '@patchproof/config';
 import { hasOption, option, type ParsedArgs } from './args.js';
+import {
+  aiTimeoutFromEnvironment,
+  DEFAULT_AI_ENDPOINT,
+  DEFAULT_AI_MODEL,
+  requestAiText,
+  type AiMessage,
+  type FetchLike,
+} from './ai.js';
 
-const DEFAULT_MODEL = 'gpt-4o-mini';
-const DEFAULT_ENDPOINT = 'https://api.openai.com/v1/chat/completions';
 const MAX_INPUT_CHARS = 32_000;
 
 function jsonOutput(value: unknown): void {
@@ -17,15 +23,11 @@ function bound(value: string): string {
 }
 
 /** Builds the chat messages that turn a fix diff plus a bug report into a draft scenario. */
-export function buildDraftPrompt(
-  diff: string,
-  issue: string,
-): Array<{ role: string; content: string }> {
+export function buildDraftPrompt(diff: string, issue: string): AiMessage[] {
   const system = [
     'You draft PatchProof reproduction scenarios.',
     'PatchProof replays a trusted scenario against a base and a head revision and certifies that it fails on base and passes on head.',
-    'Return ONLY a JSON object with exactly two string fields:',
-    '{"config":"<.patchproof.yml contents>","scenario":"<scenario.mjs contents>"}',
+    'Return a JSON object with exactly two string fields: config and scenario.',
     'Rules for config: version: 1; scenario.id and scenario.name describe the bug; scenario.command runs the scenario with node; scenario.file names the scenario file; expectedFailure.exitCode is 1; policy.backend is local with allowUnsafeLocal: true so the draft runs without Docker; network: none.',
     'Rules for scenario: a single self-contained Node ESM file that reproduces the reported bug with no network access and no dependencies; it must exit 1 with an EXPECTED_BUG marker when the bug is present and exit 0 when the fix from the diff is applied.',
     'Never include secrets, credentials, or real host paths.',
@@ -50,8 +52,6 @@ export function buildDraftPrompt(
 /** Extracts the drafted files from a model response that may wrap them in prose or fences. */
 export function parseDraftResponse(text: string): { config: string; scenario: string } | undefined {
   const candidates: string[] = [text];
-  // Fence extraction by index scans only: a regex over uncontrolled model
-  // output can backtrack polynomially on adversarial repetition.
   const opener = text.indexOf('```');
   if (opener >= 0) {
     const lineEnd = text.indexOf('\n', opener + 3);
@@ -88,48 +88,10 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-type FetchLike = (
-  input: string,
-  init: unknown,
-) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
-
-async function requestDraft(
-  messages: Array<{ role: string; content: string }>,
-  apiKey: string,
-  model: string,
-  endpoint: string,
-  fetchImpl: FetchLike,
-): Promise<string> {
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model, messages, temperature: 0.2 }),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(
-      `Draft request failed (${response.status}); check OPENAI_API_KEY and model access`,
-    );
-  }
-  let content: unknown;
-  try {
-    const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: unknown } }> };
-    content = parsed.choices?.[0]?.message?.content;
-  } catch {
-    throw new Error('Draft response was not valid JSON');
-  }
-  if (typeof content !== 'string' || content.length === 0)
-    throw new Error('Draft response contained no message content');
-  return content;
-}
-
 /**
- * Optional AI assistance, strictly bring your own key: without
- * OPENAI_API_KEY the command explains how to proceed by hand and changes
- * nothing. The request carries only the user supplied diff and report.
+ * Optional AI assistance, strictly bring your own key. Only the explicitly
+ * supplied bug report and diff are sent; repository files are not discovered
+ * or uploaded implicitly.
  */
 export async function runDraft(
   args: ParsedArgs,
@@ -154,8 +116,7 @@ export async function runDraft(
   }
   const readInput = async (value: string): Promise<string> => {
     try {
-      const content = await (await import('node:fs/promises')).readFile(value, 'utf8');
-      return content;
+      return await (await import('node:fs/promises')).readFile(value, 'utf8');
     } catch {
       return value;
     }
@@ -164,17 +125,31 @@ export async function runDraft(
     readInput(diffText),
     readInput(issueText),
   ]);
-  const model = process.env.PATCHPROOF_DRAFT_MODEL ?? DEFAULT_MODEL;
-  const endpoint = process.env.OPENAI_BASE_URL ?? DEFAULT_ENDPOINT;
+  const model = process.env.PATCHPROOF_DRAFT_MODEL ?? DEFAULT_AI_MODEL;
+  const endpoint = process.env.OPENAI_BASE_URL ?? DEFAULT_AI_ENDPOINT;
   let content: string;
   try {
-    content = await requestDraft(
-      buildDraftPrompt(diffContent, issueContent),
+    content = await requestAiText({
       apiKey,
       model,
       endpoint,
+      messages: buildDraftPrompt(diffContent, issueContent),
       fetchImpl,
-    );
+      timeoutMs: aiTimeoutFromEnvironment(),
+      label: 'Draft',
+      jsonSchema: {
+        name: 'patchproof_draft',
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['config', 'scenario'],
+          properties: {
+            config: { type: 'string' },
+            scenario: { type: 'string' },
+          },
+        },
+      },
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (json) jsonOutput({ ok: false, error: message });
