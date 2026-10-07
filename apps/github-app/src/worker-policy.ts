@@ -2,7 +2,7 @@ import { isDigestPinnedImage, type OperatorPolicyInput } from '@patchproof/runne
 
 /**
  * The worker is a production entry point, so its runner policy is owned by
- * the operator rather than by repository configuration.  Keep these values
+ * the operator rather than by repository configuration. Keep these values
  * deliberately conservative; operators can raise them explicitly, subject
  * to the strict positive-integer parser below.
  */
@@ -17,6 +17,7 @@ export const DEFAULT_WORKER_OPERATOR_LIMITS = Object.freeze({
 
 export const WORKER_OPERATOR_ENV = Object.freeze({
   approvedDockerImages: 'PATCHPROOF_APPROVED_DOCKER_IMAGES',
+  egressProxyImage: 'PATCHPROOF_EGRESS_PROXY_IMAGE',
   maxTimeoutMs: 'PATCHPROOF_MAX_TIMEOUT_MS',
   maxOutputBytes: 'PATCHPROOF_MAX_OUTPUT_BYTES',
   maxMemoryMb: 'PATCHPROOF_MAX_MEMORY_MB',
@@ -32,10 +33,6 @@ export class WorkerPolicyConfigurationError extends Error {
   }
 }
 
-/**
- * Upper bounds keep an operator typo from silently disabling exactly the
- * ceilings that back workload isolation.
- */
 const OPERATOR_LIMIT_MAXIMA = Object.freeze({
   maxTimeoutMs: 3_600_000,
   maxOutputBytes: 1_073_741_824,
@@ -59,8 +56,6 @@ function boundedInteger(
 function positiveInteger(environment: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const raw = environment[name];
   if (raw === undefined) return fallback;
-  // Do not silently normalize signs, decimals, whitespace, or exponential
-  // notation: malformed operator input must fail closed at startup.
   if (!/^[1-9][0-9]*$/u.test(raw)) throw new WorkerPolicyConfigurationError();
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) throw new WorkerPolicyConfigurationError();
@@ -79,19 +74,29 @@ function approvedImages(environment: NodeJS.ProcessEnv): readonly string[] {
   return Object.freeze([...new Set(images)]);
 }
 
+function optionalPinnedImage(environment: NodeJS.ProcessEnv, name: string): string | undefined {
+  const raw = environment[name];
+  if (raw === undefined || raw.length === 0) return undefined;
+  if (!isDigestPinnedImage(raw)) throw new WorkerPolicyConfigurationError();
+  return raw;
+}
+
 /**
- * Parse the production worker's immutable Docker policy.  The returned
- * values contain no credentials or user-controlled error text.
+ * Parse the production worker's immutable Docker policy. The egress proxy is
+ * optional until a repository requests network: allowlist; that request then
+ * fails closed unless PATCHPROOF_EGRESS_PROXY_IMAGE is configured and pinned.
  */
 export function parseWorkerOperatorPolicy(
   environment: NodeJS.ProcessEnv = process.env,
 ): OperatorPolicyInput {
   const limits = DEFAULT_WORKER_OPERATOR_LIMITS;
+  const egressProxyImage = optionalPinnedImage(environment, WORKER_OPERATOR_ENV.egressProxyImage);
   return {
     forceDocker: true,
     requireDigestPinnedImages: true,
     requireReadOnlyRoot: true,
     approvedDockerImages: approvedImages(environment),
+    ...(egressProxyImage === undefined ? {} : { egressProxyImage }),
     maxTimeoutMs: boundedInteger(
       environment,
       WORKER_OPERATOR_ENV.maxTimeoutMs,
