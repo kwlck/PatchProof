@@ -27,7 +27,8 @@ export function buildDraftPrompt(diff: string, issue: string): AiMessage[] {
   const system = [
     'You draft PatchProof reproduction scenarios.',
     'PatchProof replays a trusted scenario against a base and a head revision and certifies that it fails on base and passes on head.',
-    'Return a JSON object with exactly two string fields: config and scenario.',
+    'Return ONLY a JSON object with exactly two string fields:',
+    '{"config":"<.patchproof.yml contents>","scenario":"<scenario.mjs contents>"}',
     'Rules for config: version: 1; scenario.id and scenario.name describe the bug; scenario.command runs the scenario with node; scenario.file names the scenario file; expectedFailure.exitCode is 1; policy.backend is local with allowUnsafeLocal: true so the draft runs without Docker; network: none.',
     'Rules for scenario: a single self-contained Node ESM file that reproduces the reported bug with no network access and no dependencies; it must exit 1 with an EXPECTED_BUG marker when the bug is present and exit 0 when the fix from the diff is applied.',
     'Never include secrets, credentials, or real host paths.',
