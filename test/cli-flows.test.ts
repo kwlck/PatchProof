@@ -197,8 +197,10 @@ test('git run uses base config and records dirty head bytes instead of HEAD SHA'
   const evidence = JSON.parse(await readFile(join(output, 'patchproof.evidence.json'), 'utf8'));
   assert.equal(evidence.outcome, 'PASS');
   assert.equal(evidence.scenario.name, 'Reproduce the claimed bug');
-  assert.equal(evidence.sources.base.sha256, commit);
+  assert.equal(evidence.sources.base.commitOid, commit);
+  assert.equal(evidence.sources.base.objectFormat, 'sha1');
   assert.equal(evidence.sources.base.kind, 'git-commit');
+  assert.equal(evidence.sources.base.sha256, undefined);
   assert.equal(evidence.sources.head.kind, 'directory-tree');
   assert.notEqual(evidence.sources.head.sha256, commit);
 });
