@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { applySqliteColumnMigrations } from './sqlite-migrations.js';
 
 export type QueueJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
@@ -257,21 +258,43 @@ export class SqliteQueue implements RunQueue {
         last_seen TEXT NOT NULL
       );
     `);
-    for (const column of [
-      'ALTER TABLE patchproof_jobs ADD COLUMN installation_id INTEGER',
-      'ALTER TABLE patchproof_jobs ADD COLUMN head_repository TEXT',
-      'ALTER TABLE patchproof_jobs ADD COLUMN fork INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE patchproof_jobs ADD COLUMN evidence_path TEXT',
-      'ALTER TABLE patchproof_jobs ADD COLUMN outcome TEXT',
-      'ALTER TABLE patchproof_jobs ADD COLUMN failure_notified INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE patchproof_jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0',
-    ]) {
-      try {
-        this.database.exec(column);
-      } catch {
-        // The column already exists in a previously initialized local database.
-      }
-    }
+    applySqliteColumnMigrations(this.database, [
+      {
+        table: 'patchproof_jobs',
+        column: 'installation_id',
+        sql: 'ALTER TABLE patchproof_jobs ADD COLUMN installation_id INTEGER',
+      },
+      {
+        table: 'patchproof_jobs',
+        column: 'head_repository',
+        sql: 'ALTER TABLE patchproof_jobs ADD COLUMN head_repository TEXT',
+      },
+      {
+        table: 'patchproof_jobs',
+        column: 'fork',
+        sql: 'ALTER TABLE patchproof_jobs ADD COLUMN fork INTEGER NOT NULL DEFAULT 0',
+      },
+      {
+        table: 'patchproof_jobs',
+        column: 'evidence_path',
+        sql: 'ALTER TABLE patchproof_jobs ADD COLUMN evidence_path TEXT',
+      },
+      {
+        table: 'patchproof_jobs',
+        column: 'outcome',
+        sql: 'ALTER TABLE patchproof_jobs ADD COLUMN outcome TEXT',
+      },
+      {
+        table: 'patchproof_jobs',
+        column: 'failure_notified',
+        sql: 'ALTER TABLE patchproof_jobs ADD COLUMN failure_notified INTEGER NOT NULL DEFAULT 0',
+      },
+      {
+        table: 'patchproof_jobs',
+        column: 'lease_generation',
+        sql: 'ALTER TABLE patchproof_jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0',
+      },
+    ]);
   }
 
   /** A worker only reports readiness after checking its Docker daemon. */

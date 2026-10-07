@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { chmodSync, statSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
+import { applySqliteColumnMigrations } from './sqlite-migrations.js';
 import type {
   DeliveryClaim,
   ManagedRunState,
@@ -241,25 +242,59 @@ export class SqliteStateStore implements ManagedStateStore {
         PRIMARY KEY (repository, pull_request)
       );
       `);
-      for (const column of [
-        "ALTER TABLE deliveries ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
-        'ALTER TABLE deliveries ADD COLUMN claimed_at TEXT',
-        'ALTER TABLE deliveries ADD COLUMN completed_at TEXT',
-        'ALTER TABLE deliveries ADD COLUMN last_error TEXT',
-        'ALTER TABLE runs ADD COLUMN app_id INTEGER',
-        'ALTER TABLE managed_checks ADD COLUMN app_id INTEGER',
-        'ALTER TABLE managed_comments ADD COLUMN app_id INTEGER',
-        'ALTER TABLE publication_claims ADD COLUMN app_id INTEGER',
-        'ALTER TABLE publication_claims ADD COLUMN renewed_at TEXT',
-        'ALTER TABLE publication_claims ADD COLUMN expires_at TEXT',
-        'ALTER TABLE publication_claims ADD COLUMN lease_version INTEGER NOT NULL DEFAULT 1',
-      ]) {
-        try {
-          this.database.exec(column);
-        } catch {
-          // Existing databases already have the migration column.
-        }
-      }
+      applySqliteColumnMigrations(this.database, [
+        {
+          table: 'deliveries',
+          column: 'status',
+          sql: "ALTER TABLE deliveries ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
+        },
+        {
+          table: 'deliveries',
+          column: 'claimed_at',
+          sql: 'ALTER TABLE deliveries ADD COLUMN claimed_at TEXT',
+        },
+        {
+          table: 'deliveries',
+          column: 'completed_at',
+          sql: 'ALTER TABLE deliveries ADD COLUMN completed_at TEXT',
+        },
+        {
+          table: 'deliveries',
+          column: 'last_error',
+          sql: 'ALTER TABLE deliveries ADD COLUMN last_error TEXT',
+        },
+        { table: 'runs', column: 'app_id', sql: 'ALTER TABLE runs ADD COLUMN app_id INTEGER' },
+        {
+          table: 'managed_checks',
+          column: 'app_id',
+          sql: 'ALTER TABLE managed_checks ADD COLUMN app_id INTEGER',
+        },
+        {
+          table: 'managed_comments',
+          column: 'app_id',
+          sql: 'ALTER TABLE managed_comments ADD COLUMN app_id INTEGER',
+        },
+        {
+          table: 'publication_claims',
+          column: 'app_id',
+          sql: 'ALTER TABLE publication_claims ADD COLUMN app_id INTEGER',
+        },
+        {
+          table: 'publication_claims',
+          column: 'renewed_at',
+          sql: 'ALTER TABLE publication_claims ADD COLUMN renewed_at TEXT',
+        },
+        {
+          table: 'publication_claims',
+          column: 'expires_at',
+          sql: 'ALTER TABLE publication_claims ADD COLUMN expires_at TEXT',
+        },
+        {
+          table: 'publication_claims',
+          column: 'lease_version',
+          sql: 'ALTER TABLE publication_claims ADD COLUMN lease_version INTEGER NOT NULL DEFAULT 1',
+        },
+      ]);
       // Legacy claim rows may contain SQLite's space-form UTC datetime. Normalize
       // them in JavaScript so Date.parse never interprets that text as local
       // time (and make the migration idempotent). Missing expiry values inherit

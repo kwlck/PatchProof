@@ -195,7 +195,7 @@ function launcherSpec(
     workspace: process.cwd(),
     cwd: '.',
     command,
-    // Scenario values are already explicit --env arguments in command. They
+    // Scenario values are already isolated in the private --env-file argument. They
     // never enter the host process environment used to launch Docker.
     environment: {},
     launcherEnvironment,

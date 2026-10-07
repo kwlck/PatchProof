@@ -600,6 +600,9 @@ function validateToolchain(
     'package-lock.json',
     'yarn.lock',
     'npm-shrinkwrap.json',
+    'uv.lock',
+    'poetry.lock',
+    'Pipfile.lock',
   ]);
   if (dependencyLockStatus !== 'present' && dependencyLockStatus !== 'not-detected')
     errors.push(`${path}.dependencyLock.status is unsupported`);

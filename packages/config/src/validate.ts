@@ -411,7 +411,7 @@ export function validateConfigValue(value: unknown): {
       level: 'warning',
       path: 'policy',
       message:
-        'Local backend is denied unless allowUnsafeLocal is explicitly true and the CLI receives --allow-unsafe-local',
+        'Local backend is denied unless allowUnsafeLocal is explicitly true; --allow-unsafe-local is only required when overriding a Docker config',
     });
   if (config.policy.network === 'allowlist' && config.policy.backend === 'local')
     diagnostics.push({

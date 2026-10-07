@@ -11,7 +11,7 @@
 | `runs list/show/compare`               | List verified local runs, show one bundle, or compare two; `--root <dir>` selects another history root.                                                                         |
 | `verify <bundle>`                      | Verify schema, canonical digest, artifact integrity, and completeness without running code.                                                                                     |
 | `replay <bundle>`                      | Show a replay plan; add `--yes --base <dir> --head <dir>` to execute it.                                                                                                        |
-| `doctor`                               | Report Node, pnpm, Docker, and local SQLite capability.                                                                                                                         |
+| `doctor [--dev]`                       | Report runtime Node, Docker, and local SQLite capability; `--dev` also requires the repository pnpm version.                                                                    |
 | `setup`                                | Report the environment, optionally set up Docker with confirmation, or run a fail-to-pass demo with `--demo`. `--app` registers GitHub App credentials. See `--help` for flags. |
 
 Run exit codes are `0` PASS, `1` FAIL, `2` INCONCLUSIVE or invalid input, `3` POLICY_DENIED, and `4` INFRA_ERROR. `verify` returns `0` only for a valid bundle and `2` otherwise.

@@ -65,6 +65,11 @@ function newOutputState(): OutputState {
   return { parts: [], storedBytes: 0, redactedBytes: 0, truncated: false };
 }
 
+function sharedStreamLimit(target: OutputState, other: OutputState, totalLimit: number): number {
+  const remaining = Math.max(0, totalLimit - target.storedBytes - other.storedBytes);
+  return target.storedBytes + remaining;
+}
+
 export class LocalProcessBackend implements ExecutionBackend {
   public readonly kind = 'local' as const;
 
@@ -153,12 +158,26 @@ export class LocalProcessBackend implements ExecutionBackend {
         if (spec.signal?.aborted) requestTermination('cancel');
         child.stdout?.on('data', (chunk: Buffer) => {
           if (outputLimitHit) return;
-          if (appendChunk(stdout, stdoutDecoder.write(chunk), stdoutRedactor, spec.outputBytes))
+          if (
+            appendChunk(
+              stdout,
+              stdoutDecoder.write(chunk),
+              stdoutRedactor,
+              sharedStreamLimit(stdout, stderr, spec.outputBytes),
+            )
+          )
             requestTermination('output');
         });
         child.stderr?.on('data', (chunk: Buffer) => {
           if (outputLimitHit) return;
-          if (appendChunk(stderr, stderrDecoder.write(chunk), stderrRedactor, spec.outputBytes))
+          if (
+            appendChunk(
+              stderr,
+              stderrDecoder.write(chunk),
+              stderrRedactor,
+              sharedStreamLimit(stderr, stdout, spec.outputBytes),
+            )
+          )
             requestTermination('output');
         });
         child.once('error', (error: Error) => finish({ exitCode: null, error: error.message }));
@@ -180,20 +199,40 @@ export class LocalProcessBackend implements ExecutionBackend {
     );
 
     if (!outputLimitHit) {
-      outputLimitHit = appendChunk(stdout, stdoutDecoder.end(), stdoutRedactor, spec.outputBytes);
+      outputLimitHit = appendChunk(
+        stdout,
+        stdoutDecoder.end(),
+        stdoutRedactor,
+        sharedStreamLimit(stdout, stderr, spec.outputBytes),
+      );
     } else {
       stdoutDecoder.end();
     }
     const stdoutTail = stdoutRedactor.finish();
-    if (!outputLimitHit) outputLimitHit = appendRedacted(stdout, stdoutTail, spec.outputBytes);
+    if (!outputLimitHit)
+      outputLimitHit = appendRedacted(
+        stdout,
+        stdoutTail,
+        sharedStreamLimit(stdout, stderr, spec.outputBytes),
+      );
 
     if (!outputLimitHit) {
-      outputLimitHit = appendChunk(stderr, stderrDecoder.end(), stderrRedactor, spec.outputBytes);
+      outputLimitHit = appendChunk(
+        stderr,
+        stderrDecoder.end(),
+        stderrRedactor,
+        sharedStreamLimit(stderr, stdout, spec.outputBytes),
+      );
     } else {
       stderrDecoder.end();
     }
     const stderrTail = stderrRedactor.finish();
-    if (!outputLimitHit) outputLimitHit = appendRedacted(stderr, stderrTail, spec.outputBytes);
+    if (!outputLimitHit)
+      outputLimitHit = appendRedacted(
+        stderr,
+        stderrTail,
+        sharedStreamLimit(stderr, stdout, spec.outputBytes),
+      );
 
     const error = timedOut
       ? `Execution exceeded ${spec.timeoutMs} ms`
