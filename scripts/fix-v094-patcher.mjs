@@ -34,4 +34,8 @@ const interpolationBefore = "await writeFile(bundlePath, \\\`${canonicalize(bund
 const interpolationAfter = "await writeFile(bundlePath, \\\`\\${canonicalize(bundle)}\\\\n\\\`, 'utf8');";
 if (!source.includes(interpolationBefore)) throw new Error('regression test interpolation was not found');
 source = source.replace(interpolationBefore, interpolationAfter);
+const migrationImportBefore = "const migrationHelper = `import { DatabaseSync } from 'node:sqlite';";
+const migrationImportAfter = "const migrationHelper = `import type { DatabaseSync } from 'node:sqlite';";
+if (!source.includes(migrationImportBefore)) throw new Error('migration helper import was not found');
+source = source.replace(migrationImportBefore, migrationImportAfter);
 await writeFile(path, source, 'utf8');
