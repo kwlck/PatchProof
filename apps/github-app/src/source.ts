@@ -19,8 +19,8 @@ export interface SourceAdapter {
 function assertSourceInput(repository: string, sha: string): void {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository))
     throw new Error('Source repository must be owner/name');
-  if (!/^[0-9a-f]{40}$/iu.test(sha))
-    throw new Error('Source revision must be a 40-character Git SHA');
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(sha))
+    throw new Error('Source revision must be a 40- or 64-character Git object ID');
 }
 
 export class GitHubSourceAdapter implements SourceAdapter {
