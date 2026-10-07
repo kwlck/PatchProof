@@ -2,6 +2,7 @@ import { mkdir, writeFile, readFile, link, rm, lstat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import {
+  CURRENT_EVIDENCE_SCHEMA_VERSION,
   canonicalize,
   classifyOutcomeGuarded,
   createIntegrity,
@@ -170,6 +171,36 @@ function policySnapshot(
   };
 }
 
+function schemaV2Source(
+  source: SourceSnapshot,
+  revision: 'base' | 'head',
+): SourceSnapshot {
+  const location = revision;
+  if (source.kind === 'git-commit') {
+    const oid = source.commitOid ?? source.sha256 ?? source.ref;
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(oid))
+      throw new Error(`Cannot emit evidence: ${revision} Git source has an invalid object ID`);
+    return {
+      revision,
+      ref: oid,
+      kind: 'git-commit',
+      location,
+      commitOid: oid,
+      objectFormat: oid.length === 40 ? 'sha1' : 'sha256',
+    };
+  }
+  const digest = source.sha256;
+  if (digest === undefined || !/^[0-9a-f]{64}$/iu.test(digest))
+    throw new Error(`Cannot emit evidence: ${revision} directory source has no SHA-256 digest`);
+  return {
+    revision,
+    ref: source.ref,
+    kind: 'directory-tree',
+    location,
+    sha256: digest,
+  };
+}
+
 export async function writeEvidenceBundle(
   options: BundleBuildOptions,
 ): Promise<{ bundle: EvidenceBundle; bundlePath: string }> {
@@ -263,6 +294,7 @@ export async function writeEvidenceBundle(
       sha256: sha256(options.configResult.sourcePath),
       kind: 'directory-tree' as const,
       location: dirname(options.configResult.sourcePath),
+      revision: 'base' as const,
     };
   const headSource = options.headSource ??
     run?.head.source ?? {
@@ -270,6 +302,7 @@ export async function writeEvidenceBundle(
       sha256: sha256(options.configResult.sourcePath),
       kind: 'directory-tree' as const,
       location: dirname(options.configResult.sourcePath),
+      revision: 'head' as const,
     };
   const completenessChecks = {
     schema: true,
@@ -303,8 +336,6 @@ export async function writeEvidenceBundle(
       complete,
     });
   } catch (error) {
-    // A hostile or pathological configured pattern must degrade to an honest
-    // INCONCLUSIVE bundle instead of blocking the writer or the worker.
     classification = {
       outcome: 'INCONCLUSIVE',
       verdict: 'Evidence is incomplete; no fix claim is made.',
@@ -335,8 +366,8 @@ export async function writeEvidenceBundle(
       }),
     );
   const withoutIntegrity: Omit<EvidenceBundle, 'integrity'> = {
-    schemaVersion: 1,
-    product: { name: 'PatchProof', version: '0.9.4' },
+    schemaVersion: CURRENT_EVIDENCE_SCHEMA_VERSION,
+    product: { name: 'PatchProof', version: '0.10.0' },
     bundleId: options.bundleId ?? randomUUID(),
     createdAt: new Date().toISOString(),
     outcome: classification.outcome,
@@ -352,20 +383,8 @@ export async function writeEvidenceBundle(
       sha256: scenarioSha,
     },
     sources: {
-      base: {
-        revision: 'base',
-        ref: baseSource.ref,
-        sha256: baseSource.sha256,
-        kind: baseSource.kind,
-        location: 'base',
-      },
-      head: {
-        revision: 'head',
-        ref: headSource.ref,
-        sha256: headSource.sha256,
-        kind: headSource.kind,
-        location: 'head',
-      },
+      base: schemaV2Source(baseSource, 'base'),
+      head: schemaV2Source(headSource, 'head'),
     },
     policy: policySnapshot(options.config, options.backend, options.fork, denialReason),
     executions: { base: baseEvidence, head: headEvidence },
@@ -387,8 +406,6 @@ export async function writeEvidenceBundle(
     ...withoutIntegrity,
     integrity: createIntegrity(withoutIntegrity),
   };
-  // A complete temporary file is published atomically; a concurrent run
-  // cannot replace evidence that appeared after the preflight check.
   const temporaryPath = `${bundlePath}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, `${canonicalize(bundle)}\n`, {
