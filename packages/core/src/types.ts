@@ -1,4 +1,5 @@
-export const EVIDENCE_SCHEMA_VERSION = 2 as const;
+export const EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const CURRENT_EVIDENCE_SCHEMA_VERSION = 2 as const;
 export const SUPPORTED_EVIDENCE_SCHEMA_VERSIONS = [1, 2] as const;
 
 export type EvidenceSchemaVersion = (typeof SUPPORTED_EVIDENCE_SCHEMA_VERSIONS)[number];
