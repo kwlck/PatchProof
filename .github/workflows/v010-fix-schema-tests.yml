@@ -1,0 +1,66 @@
+name: v0.10 schema compatibility fix
+
+on:
+  push:
+    branches: [codex/v0.10-core]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/v0.10-core
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Update schema v2 expectations while retaining v1 fixture
+        shell: python
+        run: |
+          from pathlib import Path
+
+          docs = Path('scripts/docs-check.mjs')
+          text = docs.read_text()
+          text = text.replace("'Evidence   schema=1 sha256='", "'Evidence   schema=2 sha256='")
+          old = """    const version = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')).version;\n    if (bundle.outcome !== 'PASS' || bundle.product.version !== version)\n      failures.push('offline fixture evidence has the wrong outcome or product version');\n"""
+          new = """    if (\n      bundle.outcome !== 'PASS' ||\n      bundle.schemaVersion !== 1 ||\n      bundle.product.version !== '0.9.4'\n    )\n      failures.push('offline fixture evidence no longer matches the published v1 compatibility proof');\n"""
+          if old not in text:
+              raise SystemExit('docs fixture assertion target not found')
+          text = text.replace(old, new)
+          text = text.replace("'Evidence   schema=1'", "'Evidence   schema=2'")
+          docs.write_text(text)
+
+          terminal = Path('docs/examples/terminal-pass.txt')
+          text = terminal.read_text()
+          if 'Evidence   schema=1 ' not in text:
+              raise SystemExit('terminal schema marker not found')
+          terminal.write_text(text.replace('Evidence   schema=1 ', 'Evidence   schema=2 '))
+
+          flows = Path('test/cli-flows.test.ts')
+          text = flows.read_text()
+          old = """  assert.equal(evidence.sources.base.sha256, commit);\n  assert.equal(evidence.sources.base.kind, 'git-commit');\n  assert.equal(evidence.sources.head.kind, 'directory-tree');\n  assert.notEqual(evidence.sources.head.sha256, commit);\n"""
+          new = """  assert.equal(evidence.sources.base.commitOid, commit);\n  assert.equal(evidence.sources.base.objectFormat, 'sha1');\n  assert.equal(evidence.sources.base.kind, 'git-commit');\n  assert.equal(evidence.sources.base.sha256, undefined);\n  assert.equal(evidence.sources.head.kind, 'directory-tree');\n  assert.notEqual(evidence.sources.head.sha256, commit);\n"""
+          if old not in text:
+              raise SystemExit('CLI flow source assertion target not found')
+          flows.write_text(text.replace(old, new))
+      - run: pnpm prettier --write scripts/docs-check.mjs docs/examples/terminal-pass.txt test/cli-flows.test.ts
+      - run: pnpm test
+      - run: pnpm docs:check
+      - name: Commit compatibility fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add scripts/docs-check.mjs docs/examples/terminal-pass.txt test/cli-flows.test.ts
+          git commit -m "Align docs and CLI tests with evidence schema v2"
+          git push origin HEAD:codex/v0.10-core
