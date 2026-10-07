@@ -285,22 +285,28 @@ export async function writeEvidenceBundle(
   headEvidence.stdout.artifactId = headStdout.id;
   headEvidence.stderr.artifactId = headStderr.id;
   const artifacts = [baseStdout, baseStderr, headStdout, headStderr];
-  const baseSource = options.baseSource ??
-    run?.base.source ?? {
-      ref: 'base',
-      sha256: sha256(options.configResult.sourcePath),
-      kind: 'directory-tree' as const,
-      location: dirname(options.configResult.sourcePath),
-      revision: 'base' as const,
-    };
-  const headSource = options.headSource ??
-    run?.head.source ?? {
-      ref: 'head',
-      sha256: sha256(options.configResult.sourcePath),
-      kind: 'directory-tree' as const,
-      location: dirname(options.configResult.sourcePath),
-      revision: 'head' as const,
-    };
+  const baseSource: SourceSnapshot =
+    options.baseSource ??
+    (run?.base.source === undefined
+      ? {
+          ref: 'base',
+          sha256: sha256(options.configResult.sourcePath),
+          kind: 'directory-tree' as const,
+          location: dirname(options.configResult.sourcePath),
+          revision: 'base' as const,
+        }
+      : { ...run.base.source, revision: 'base' as const });
+  const headSource: SourceSnapshot =
+    options.headSource ??
+    (run?.head.source === undefined
+      ? {
+          ref: 'head',
+          sha256: sha256(options.configResult.sourcePath),
+          kind: 'directory-tree' as const,
+          location: dirname(options.configResult.sourcePath),
+          revision: 'head' as const,
+        }
+      : { ...run.head.source, revision: 'head' as const });
   const completenessChecks = {
     schema: true,
     trustedScenario: true,

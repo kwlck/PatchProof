@@ -31,8 +31,12 @@ function generatedName(prefix: string): string {
   return `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 24)}`;
 }
 
-function controlEnvironment(spec: ExecutionSpec): NodeJS.ProcessEnv {
-  return dockerLauncherEnvironment(spec.launcherEnvironment);
+function controlEnvironment(spec: ExecutionSpec): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(dockerLauncherEnvironment(spec.launcherEnvironment)).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
+  );
 }
 
 async function dockerControl(
