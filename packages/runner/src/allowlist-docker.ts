@@ -39,6 +39,7 @@ async function dockerControl(
   spec: ExecutionSpec,
   args: string[],
   timeoutMs = DEFAULT_CONTROL_TIMEOUT_MS,
+  respectSignal = true,
 ): Promise<{ stdout: string; stderr: string }> {
   try {
     return await execFileAsync('docker', args, {
@@ -47,7 +48,7 @@ async function dockerControl(
       timeout: Math.max(1, timeoutMs),
       maxBuffer: 4 * 1024 * 1024,
       env: controlEnvironment(spec),
-      ...(spec.signal === undefined ? {} : { signal: spec.signal }),
+      ...(respectSignal && spec.signal !== undefined ? { signal: spec.signal } : {}),
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message.split('\n')[0] : String(error);
@@ -155,7 +156,7 @@ function scenarioCommand(
   envFile: string,
 ): string[] {
   validateWorkspace(spec.workspace);
-  const args = [
+  return [
     'docker',
     'run',
     '--pull',
@@ -210,12 +211,11 @@ function scenarioCommand(
     spec.policy.dockerImage,
     ...spec.command,
   ];
-  return args;
 }
 
 async function removeResource(spec: ExecutionSpec, args: string[]): Promise<string | undefined> {
   try {
-    await dockerControl(spec, args, CLEANUP_TIMEOUT_MS);
+    await dockerControl(spec, args, CLEANUP_TIMEOUT_MS, false);
     return undefined;
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
@@ -251,7 +251,16 @@ export class AllowlistDockerBackend implements ExecutionBackend {
     if (spec.command.length === 0)
       return infrastructureExecution(startedAt, started, 'Docker scenario command is empty');
 
-    const stateRoot = await mkdtemp(join(tmpdir(), 'patchproof-egress-'));
+    let stateRoot: string;
+    try {
+      stateRoot = await mkdtemp(join(tmpdir(), 'patchproof-egress-'));
+    } catch (error) {
+      return infrastructureExecution(
+        startedAt,
+        started,
+        `Docker allowlist state setup failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     const networkName = generatedName('pp-net');
     const proxyName = generatedName('pp-proxy');
     const scenarioName = generatedName(`pp-${spec.revision}`);
@@ -259,95 +268,96 @@ export class AllowlistDockerBackend implements ExecutionBackend {
     const squidConfig = join(stateRoot, 'squid.conf');
     let networkCreated = false;
     let proxyCreated = false;
-    let scenarioResult: BackendExecution | undefined;
+    let result = infrastructureExecution(startedAt, started, 'Docker allowlist execution did not start');
     const cleanupErrors: string[] = [];
 
     try {
-      if (spec.signal?.aborted)
-        return { ...infrastructureExecution(startedAt, started, 'Execution cancelled'), cancelled: true };
-      await writeScenarioEnvironment(envFile, spec.environment);
-      await writeFile(squidConfig, renderSquidAllowlist(spec.policy.allowedHosts), {
-        encoding: 'utf8',
-        mode: 0o600,
-        flag: 'wx',
-      });
-      await Promise.all([
-        provisionImage(spec, spec.policy.dockerImage),
-        provisionImage(spec, spec.egressProxyImage),
-      ]);
+      if (spec.signal?.aborted) {
+        result = { ...infrastructureExecution(startedAt, started, 'Execution cancelled'), cancelled: true };
+      } else {
+        await writeScenarioEnvironment(envFile, spec.environment);
+        await writeFile(squidConfig, renderSquidAllowlist(spec.policy.allowedHosts), {
+          encoding: 'utf8',
+          mode: 0o600,
+          flag: 'wx',
+        });
+        await Promise.all([
+          provisionImage(spec, spec.policy.dockerImage),
+          provisionImage(spec, spec.egressProxyImage),
+        ]);
 
-      await dockerControl(spec, ['network', 'create', '--internal', networkName]);
-      networkCreated = true;
+        await dockerControl(spec, ['network', 'create', '--internal', networkName]);
+        networkCreated = true;
+        await dockerControl(spec, [
+          'run',
+          '--detach',
+          '--pull',
+          'never',
+          '--name',
+          proxyName,
+          '--network',
+          'bridge',
+          '--read-only',
+          '--security-opt',
+          'no-new-privileges:true',
+          '--pids-limit',
+          '128',
+          '--memory',
+          '256m',
+          '--memory-swap',
+          '256m',
+          '--tmpfs',
+          '/tmp:rw,noexec,nosuid,size=16m',
+          '--tmpfs',
+          '/run:rw,noexec,nosuid,size=8m',
+          '--tmpfs',
+          '/var/log/squid:rw,noexec,nosuid,size=16m',
+          '--tmpfs',
+          '/var/spool/squid:rw,noexec,nosuid,size=32m',
+          '--mount',
+          `type=bind,src=${squidConfig},dst=/etc/squid/squid.conf,readonly`,
+          spec.egressProxyImage,
+        ]);
+        proxyCreated = true;
+        await dockerControl(spec, [
+          'network',
+          'connect',
+          '--alias',
+          PROXY_HOST,
+          networkName,
+          proxyName,
+        ]);
+        const proxyState = await dockerControl(spec, [
+          'inspect',
+          '--format',
+          '{{.State.Running}}',
+          proxyName,
+        ]);
+        if (proxyState.stdout.trim() !== 'true')
+          throw new Error('Egress proxy exited during startup');
 
-      await dockerControl(spec, [
-        'run',
-        '--detach',
-        '--pull',
-        'never',
-        '--name',
-        proxyName,
-        '--network',
-        'bridge',
-        '--read-only',
-        '--security-opt',
-        'no-new-privileges:true',
-        '--pids-limit',
-        '128',
-        '--memory',
-        '256m',
-        '--memory-swap',
-        '256m',
-        '--tmpfs',
-        '/tmp:rw,noexec,nosuid,size=16m',
-        '--tmpfs',
-        '/run:rw,noexec,nosuid,size=8m',
-        '--tmpfs',
-        '/var/log/squid:rw,noexec,nosuid,size=16m',
-        '--tmpfs',
-        '/var/spool/squid:rw,noexec,nosuid,size=32m',
-        '--mount',
-        `type=bind,src=${squidConfig},dst=/etc/squid/squid.conf,readonly`,
-        spec.egressProxyImage,
-      ]);
-      proxyCreated = true;
-      await dockerControl(spec, [
-        'network',
-        'connect',
-        '--alias',
-        PROXY_HOST,
-        networkName,
-        proxyName,
-      ]);
-      const proxyState = await dockerControl(spec, [
-        'inspect',
-        '--format',
-        '{{.State.Running}}',
-        proxyName,
-      ]);
-      if (proxyState.stdout.trim() !== 'true')
-        throw new Error('Egress proxy exited during startup');
-
-      const command = scenarioCommand(spec, networkName, scenarioName, envFile);
-      scenarioResult = await this.processBackend.run({
-        ...spec,
-        workspace: process.cwd(),
-        cwd: '.',
-        command,
-        environment: {},
-        launcherEnvironment: controlEnvironment(spec),
-      });
-      return {
-        ...scenarioResult,
-        startedAt,
-        durationMs: Math.max(0, Math.round(performance.now() - started)),
-      };
+        const command = scenarioCommand(spec, networkName, scenarioName, envFile);
+        const scenario = await this.processBackend.run({
+          ...spec,
+          workspace: process.cwd(),
+          cwd: '.',
+          command,
+          environment: {},
+          launcherEnvironment: controlEnvironment(spec),
+        });
+        result = {
+          ...scenario,
+          startedAt,
+          durationMs: Math.max(0, Math.round(performance.now() - started)),
+        };
+      }
     } catch (error) {
-      scenarioResult = infrastructureExecution(
+      result = infrastructureExecution(
         startedAt,
         started,
         `Docker allowlist infrastructure failure: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return scenarioResult;
+      if (spec.signal?.aborted) result.cancelled = true;
     } finally {
       const scenarioCleanup = await removeResource(spec, ['container', 'rm', '-f', scenarioName]);
       if (scenarioCleanup !== undefined && !scenarioCleanup.includes('No such container'))
@@ -361,10 +371,16 @@ export class AllowlistDockerBackend implements ExecutionBackend {
         if (networkCleanup !== undefined) cleanupErrors.push(networkCleanup);
       }
       await rm(stateRoot, { recursive: true, force: true }).catch(() => undefined);
-      if (cleanupErrors.length > 0 && scenarioResult !== undefined) {
-        scenarioResult.exitCode = null;
-        scenarioResult.error = `${scenarioResult.error === undefined ? '' : `${scenarioResult.error}; `}INFRA_ERROR: allowlist cleanup failed: ${cleanupErrors.join('; ')}`;
-      }
     }
+
+    if (cleanupErrors.length > 0) {
+      result.exitCode = null;
+      result.error = `${result.error === undefined ? '' : `${result.error}; `}INFRA_ERROR: allowlist cleanup failed: ${cleanupErrors.join('; ')}`;
+    }
+    return {
+      ...result,
+      startedAt,
+      durationMs: Math.max(0, Math.round(performance.now() - started)),
+    };
   }
 }
