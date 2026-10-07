@@ -171,10 +171,7 @@ function policySnapshot(
   };
 }
 
-function schemaV2Source(
-  source: SourceSnapshot,
-  revision: 'base' | 'head',
-): SourceSnapshot {
+function schemaV2Source(source: SourceSnapshot, revision: 'base' | 'head'): SourceSnapshot {
   const location = revision;
   if (source.kind === 'git-commit') {
     const oid = source.commitOid ?? source.sha256 ?? source.ref;

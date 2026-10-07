@@ -88,9 +88,7 @@ function normalizeV2Source(
   const common = ['revision', 'ref', 'kind', 'location'] as const;
   exactKeys(
     value,
-    kind === 'git-commit'
-      ? [...common, 'commitOid', 'objectFormat']
-      : [...common, 'sha256'],
+    kind === 'git-commit' ? [...common, 'commitOid', 'objectFormat'] : [...common, 'sha256'],
     path,
     errors,
   );
@@ -169,7 +167,8 @@ export async function verifyEvidenceBundle(bundlePath: string): Promise<Verifica
   } catch {
     return verifyLegacyEvidenceBundle(bundlePath);
   }
-  if (!isRecord(parsed) || parsed.schemaVersion !== 2) return verifyLegacyEvidenceBundle(bundlePath);
+  if (!isRecord(parsed) || parsed.schemaVersion !== 2)
+    return verifyLegacyEvidenceBundle(bundlePath);
 
   const errors = duplicateJsonKeys(source).map(
     (key) => `Evidence JSON contains a duplicate object key: ${JSON.stringify(key)}`,
@@ -189,7 +188,11 @@ export async function verifyEvidenceBundle(bundlePath: string): Promise<Verifica
   }
   const base = normalizeV2Source(sources.base, 'base', errors);
   const head = normalizeV2Source(sources.head, 'head', errors);
-  if (base === undefined || head === undefined || errors.some((error) => error.includes('duplicate object key')))
+  if (
+    base === undefined ||
+    head === undefined ||
+    errors.some((error) => error.includes('duplicate object key'))
+  )
     return failure(errors, digestValid);
 
   const normalized = {

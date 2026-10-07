@@ -10,11 +10,7 @@ import {
   type EvidenceBundle,
 } from '@patchproof/core';
 import type { PatchProofConfig } from '@patchproof/config';
-import {
-  applyOperatorPolicy,
-  isAllowedEgressHost,
-  renderSquidAllowlist,
-} from '@patchproof/runner';
+import { applyOperatorPolicy, isAllowedEgressHost, renderSquidAllowlist } from '@patchproof/runner';
 import {
   parseWorkerOperatorPolicy,
   WorkerPolicyConfigurationError,
@@ -44,7 +40,13 @@ function repositoryPolicy(): PatchProofConfig['policy'] {
 test('v0.10 allowlist accepts only exact public DNS hosts', () => {
   assert.equal(isAllowedEgressHost('api.github.com'), true);
   assert.equal(isAllowedEgressHost('registry.npmjs.org'), true);
-  for (const host of ['*.github.com', '127.0.0.1', 'localhost', 'metadata.google.internal', 'EXAMPLE.com'])
+  for (const host of [
+    '*.github.com',
+    '127.0.0.1',
+    'localhost',
+    'metadata.google.internal',
+    'EXAMPLE.com',
+  ])
     assert.equal(isAllowedEgressHost(host), false, host);
 
   const squid = renderSquidAllowlist(['registry.npmjs.org', 'api.github.com']);

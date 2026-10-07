@@ -133,7 +133,11 @@ export function renderSquidAllowlist(hosts: readonly string[]): string {
   ].join('\n');
 }
 
-function infrastructureExecution(startedAt: string, started: number, error: string): BackendExecution {
+function infrastructureExecution(
+  startedAt: string,
+  started: number,
+  error: string,
+): BackendExecution {
   return {
     exitCode: null,
     timedOut: false,
@@ -241,7 +245,11 @@ export class AllowlistDockerBackend implements ExecutionBackend {
     const startedAt = new Date().toISOString();
     const started = performance.now();
     if (spec.policy.network !== 'allowlist')
-      return infrastructureExecution(startedAt, started, 'Allowlist backend requires network: allowlist');
+      return infrastructureExecution(
+        startedAt,
+        started,
+        'Allowlist backend requires network: allowlist',
+      );
     if (spec.egressProxyImage === undefined || !isDigestPinnedImage(spec.egressProxyImage))
       return infrastructureExecution(
         startedAt,
@@ -268,12 +276,19 @@ export class AllowlistDockerBackend implements ExecutionBackend {
     const squidConfig = join(stateRoot, 'squid.conf');
     let networkCreated = false;
     let proxyCreated = false;
-    let result = infrastructureExecution(startedAt, started, 'Docker allowlist execution did not start');
+    let result = infrastructureExecution(
+      startedAt,
+      started,
+      'Docker allowlist execution did not start',
+    );
     const cleanupErrors: string[] = [];
 
     try {
       if (spec.signal?.aborted) {
-        result = { ...infrastructureExecution(startedAt, started, 'Execution cancelled'), cancelled: true };
+        result = {
+          ...infrastructureExecution(startedAt, started, 'Execution cancelled'),
+          cancelled: true,
+        };
       } else {
         await writeScenarioEnvironment(envFile, spec.environment);
         await writeFile(squidConfig, renderSquidAllowlist(spec.policy.allowedHosts), {

@@ -211,8 +211,7 @@ export function renderEnvFile(
 
 async function resolveRuntimeImages(): Promise<AppRuntimeImages> {
   const scenarioSource = process.env.PATCHPROOF_SETUP_DOCKER_IMAGE ?? DEFAULT_SCENARIO_IMAGE;
-  const proxySource =
-    process.env.PATCHPROOF_SETUP_EGRESS_PROXY_IMAGE ?? DEFAULT_EGRESS_PROXY_IMAGE;
+  const proxySource = process.env.PATCHPROOF_SETUP_EGRESS_PROXY_IMAGE ?? DEFAULT_EGRESS_PROXY_IMAGE;
   const [scenario, egressProxy] = await Promise.all([
     resolveDockerImageDigest(scenarioSource),
     resolveDockerImageDigest(proxySource),

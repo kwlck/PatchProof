@@ -125,9 +125,7 @@ export function isAllowedEgressHost(host: string): boolean {
   if (labels.length < 2) return false;
   return labels.every(
     (label) =>
-      label.length > 0 &&
-      label.length <= 63 &&
-      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(label),
+      label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(label),
   );
 }
 
@@ -180,7 +178,11 @@ export function applyOperatorPolicy(
         'Network allowlists require PATCHPROOF_EGRESS_PROXY_IMAGE pinned by sha256 digest',
       );
     if (repositoryPolicy.allowedHosts.length === 0)
-      return denied(repositoryPolicy, operatorPolicy, 'Network allowlist must contain at least one host');
+      return denied(
+        repositoryPolicy,
+        operatorPolicy,
+        'Network allowlist must contain at least one host',
+      );
     if (repositoryPolicy.allowedHosts.some((host) => !isAllowedEgressHost(host)))
       return denied(
         repositoryPolicy,

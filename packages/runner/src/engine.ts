@@ -96,7 +96,9 @@ export async function runTwoRevisions(
       ? effectiveRepositoryPolicy.network === 'allowlist'
         ? {
             forceDocker: true,
-            ...(configuredProxyImage === undefined ? {} : { egressProxyImage: configuredProxyImage }),
+            ...(configuredProxyImage === undefined
+              ? {}
+              : { egressProxyImage: configuredProxyImage }),
           }
         : undefined
       : {
