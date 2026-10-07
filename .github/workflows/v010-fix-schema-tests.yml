@@ -52,7 +52,7 @@ jobs:
           if old not in text:
               raise SystemExit('CLI flow source assertion target not found')
           flows.write_text(text.replace(old, new))
-      - run: pnpm prettier --write scripts/docs-check.mjs docs/examples/terminal-pass.txt test/cli-flows.test.ts
+      - run: pnpm prettier --write scripts/docs-check.mjs test/cli-flows.test.ts
       - run: pnpm test
       - run: pnpm docs:check
       - name: Commit compatibility fixes
