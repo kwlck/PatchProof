@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.10.0 - 2026-10-07
+
+- Make `patchproof setup --app` resolve the scenario and egress-proxy Docker images to immutable repository digests and write app-ready worker environment values, while keeping the worker fail-closed when pinning cannot complete.
+- Add enforced Docker network allowlists through an internal-only scenario network and a digest-pinned Squid proxy with exact public-host ACLs plus private, loopback, link-local, reserved, and rebinding-resistant destination checks.
+- Write evidence schema v2 with explicit Git `commitOid` and `objectFormat` fields, retain verification compatibility for schema v1 bundles, and support both SHA-1 and SHA-256 Git object IDs.
+- Consolidate optional AI `draft` and `explain` requests behind one bounded BYOK client, add structured JSON-schema draft output, request timeouts, and a separate `PATCHPROOF_EXPLAIN_MODEL` setting.
+- Add regression coverage and operator/deployment documentation for the v0.10.0 security and compatibility changes.
+
 ## 0.9.4 - 2026-10-07
 
 - Make SQLite schema upgrades inspect existing columns and propagate genuine migration failures instead of swallowing every ALTER TABLE error.
@@ -33,7 +41,7 @@
 
 ## 0.9.0 - 2026-08-25
 
-- Added git backed sources: `--base git:HEAD --head .` materializes revisions through detached worktrees, so checking an uncommitted fix in any repository is one command with zero folder juggling. Any ref works (`git:main`, `git:<sha>`, `git:HEAD~1`), scratch worktrees are cleaned up on success and failure, and `--git-repo` selects the repository.
+- Added git backed sources: `--base git:HEAD --head .` materializes revisions through detached worktrees, so checking a fix in any repository is one command with zero folder juggling. Any ref works (`git:main`, `git:<sha>`, `git:HEAD~1`), scratch worktrees are cleaned up on success and failure, and `--git-repo` selects the repository.
 - `patchproof init` now scaffolds the full skeleton for non git projects: `base/` and `head/` folders plus a ready to edit scenario in both.
 - Rewrote the README usage guide around the two paths (git repository and scaffold) with a plain words verdict table and a tighter command cheat sheet.
 
@@ -80,4 +88,4 @@
 - Added the `setup` command with an environment check and a self-contained fail-to-pass demo, plus checksum verified one-command installers for POSIX shells and Windows PowerShell.
 - Hardened scenario secrets through a private env file, bounded git identity probing, worker thread regex evaluation with a deadline, and bounded GitHub API failure diagnostics with secondary rate limit replay.
 - Proved the full credentialed GitHub App path live: webhook delivery, durable queue, isolated Docker execution, evidence verification, Check and managed comment publication, and duplicate replay immutability.
-- Docker host allowlists remain intentionally refused until an enforcing operator adapter exists.
+- Docker host allowlists were intentionally refused before v0.10.0; v0.10.0 replaces that limitation with the enforcing proxy-backed adapter described above.
